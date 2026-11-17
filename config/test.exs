@@ -24,7 +24,9 @@ config :cairn,
   # The application's own `Cairn.TrackRecorder` buffers whatever any test's
   # camera tracker casts at it; without this its timer would flush those tracks
   # into whichever sandbox connection happens to be checked out at the time.
-  track_recorder_manual: true
+  track_recorder_manual: true,
+  # `Cairn.Artifacts` and its fetcher (see application.ex).
+  artifacts: false
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.

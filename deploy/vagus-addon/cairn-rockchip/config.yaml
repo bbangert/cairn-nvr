@@ -4,9 +4,9 @@ name: Cairn NVR (Rockchip)
 version: "0.1.8"
 slug: cairn_rockchip
 description: >-
-  Presence-detection NVR for RK3566 boards. Inference runs on the CPU; the
-  RKNN engine is built in, but this add-on cannot supply Rockchip's runtime
-  library yet.
+  Presence-detection NVR for RK3566 boards. Inference runs on the CPU by
+  default; backend: rknn runs it on the NPU with Rockchip's runtime library,
+  which Cairn downloads at first start.
 # aarch64 only: the shipped NIFs, canary and Rockchip vendor libraries are
 # arm64. Pulls are platform-pinned by vagus.
 arch:

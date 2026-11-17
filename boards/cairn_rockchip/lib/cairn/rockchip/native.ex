@@ -46,6 +46,7 @@ defmodule Cairn.Rockchip.Native do
   # specs, which describe the loaded library.
   @dialyzer {:nowarn_function,
              init: 1,
+             init: 2,
              engine_spec: 1,
              open_stream: 3,
              push_frame: 4,
@@ -57,8 +58,15 @@ defmodule Cairn.Rockchip.Native do
              release: 1,
              drain_teardown: 1}
 
+  # The library path rides the call because the NIF cannot read the VM's
+  # environment: `System.put_env/2` writes the BEAM's own copy, which libc's
+  # `getenv` never sees.
   @impl true
-  def init(_config), do: :erlang.nif_error(:nif_not_loaded)
+  def init(config), do: init(config, System.get_env("CAIRN_RKNN_LIBRARY"))
+
+  @doc false
+  @spec init(map(), String.t() | nil) :: {:ok, reference()} | {:error, {atom(), String.t()}}
+  def init(_config, _library), do: :erlang.nif_error(:nif_not_loaded)
 
   @impl true
   def engine_spec(_engine), do: :erlang.nif_error(:nif_not_loaded)

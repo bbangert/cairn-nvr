@@ -492,7 +492,13 @@ plugin detect: profile my-board names no model.rknn artifact for its rknn
 plugin detect: profile my-board runs backend rknn, whose artifact the CPU
   baseline cannot run, but it names no model.onnx — name the model's FP32
   ONNX twin there
+plugin detect: profile my-board runs backend "rknn", which needs librknnrt.so,
+  not downloaded yet: the last fetch failed: <why> — the download is retried
+  until it succeeds; no camera can run on this group before then
 ```
+
+The last is an error only while a camera runs on the group, else a warning;
+before the first attempt it says `the fetch has not been tried`.
 
 And warnings, which do not fail the load:
 
@@ -512,9 +518,9 @@ profile my-board: CPU twin models/gone.onnx does not exist or is not a regular
   the CPU
 ```
 
-The last is raised once per selected profile, for `backend:` and `decoder:`
-alike, from the board's own check of the host. The generic board reports
-nothing unusable and never raises it.
+The `cannot use on this host` warning is raised once per selected profile,
+for `backend:` and `decoder:` alike, from the board's own check of the host.
+The generic board reports nothing unusable and never raises it.
 
 A profile's *files* are checked only for a profile some group actually runs, so
 a board profile for hardware this node does not have costs it nothing. That is

@@ -75,8 +75,9 @@ defmodule Cairn.Rockchip.Board do
   def engine(_backend), do: generic(:engine)
 
   # Every reason that applies, so fixing one does not uncover the next on the
-  # following boot. `CAIRN_RKNN_LIBRARY` unset means the loader's search path,
-  # which cannot be checked from here.
+  # following boot. The base sets `CAIRN_RKNN_LIBRARY` to where it downloads
+  # the library (`artifacts/1`) unless the operator set it first; unset means
+  # the loader's search path, which cannot be checked from here.
   @impl true
   def preflight do
     nif = nif_reason(Native.load_error())
@@ -121,8 +122,29 @@ defmodule Cairn.Rockchip.Board do
     end
   end
 
+  # Rockchip's licence for librknnrt does not permit redistributing it, so no
+  # release carries it: the base downloads it from Rockchip's own repository,
+  # pinned by commit and hash. librknnrt 2.3.2, the version `rknn/sys.rs` is
+  # written against.
+  @rknn_toolkit2_commit "42aa1d426c0a9e0869b6374edba009f7208a1926"
+  @librknnrt_sha256 "d31fc19c85b85f6091b2bd0f6af9d962d5264a4e410bfb536402ec92bac738e8"
+  @librknnrt_size 7_726_232
+
   @impl true
-  def artifacts(_context), do: []
+  def artifacts(_context) do
+    [
+      %{
+        name: "librknnrt.so",
+        url:
+          "https://raw.githubusercontent.com/airockchip/rknn-toolkit2/#{@rknn_toolkit2_commit}" <>
+            "/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so",
+        sha256: @librknnrt_sha256,
+        size: @librknnrt_size,
+        backend: "rknn",
+        env: "CAIRN_RKNN_LIBRARY"
+      }
+    ]
+  end
 
   @impl true
   def profiles_dir, do: nil

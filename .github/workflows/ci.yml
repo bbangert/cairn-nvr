@@ -231,6 +231,7 @@ jobs:
           test/cairn/config_server_test.exs
           test/cairn/config_server_update_test.exs
           test/cairn/config_source_test.exs
+          test/cairn/artifacts_test.exs
 
   audit:
     name: Hex audit · Unused deps

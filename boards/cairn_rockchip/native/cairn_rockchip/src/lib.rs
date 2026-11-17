@@ -7,7 +7,8 @@
 //!
 //! The engine NIFs are `CairnOrt`'s surface over [`rknn::provider`]: same
 //! functions, arities, schedulers, term shapes and `{reason, message}` errors,
-//! because each one wraps the body `cairn-ort` exports. That crate is linked
+//! because each one wraps the body `cairn-ort` exports — but for `init`, which
+//! also takes the runtime's path. That crate is linked
 //! with its own NIF entry off (`default-features = false`), so this library's
 //! `rustler::init!` registers only the functions below and `decoder`'s, and
 //! the resource types rustler collects binary-wide: `decoder`'s two, and
@@ -24,6 +25,7 @@ pub mod probe;
 pub mod rga;
 pub mod rknn;
 
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,16 +37,26 @@ use rustler::{Binary, ResourceArc};
 
 /// Load librknnrt and the artifact, once per VM. DirtyCpu, as `CairnOrt`'s:
 /// `rknn_init` builds the NPU context.
+///
+/// `library` is the VM's `CAIRN_RKNN_LIBRARY`, which this library cannot read
+/// itself ([`rknn::with_runtime`]); `nil` is the loader's search path. The one
+/// argument `CairnOrt`'s `init/1` does not take: `Cairn.Rockchip.Native`'s
+/// `init/1` adds it.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn init(config: RawInitConfig) -> Result<ResourceArc<EngineRef>> {
+fn init(config: RawInitConfig, library: Option<String>) -> Result<ResourceArc<EngineRef>> {
     guarded("init", || {
-        Ok(ResourceArc::new(EngineRef(Arc::new(open_engine(config)?))))
+        Ok(ResourceArc::new(EngineRef(Arc::new(open_engine(
+            config, library,
+        )?))))
     })
 }
 
 /// `init`'s body short of the resource, which needs the BEAM.
-fn open_engine(config: RawInitConfig) -> Result<Engine> {
-    Engine::with_provider(config.resolve()?, &rknn::provider())
+fn open_engine(config: RawInitConfig, library: Option<String>) -> Result<Engine> {
+    let config = config.resolve()?;
+    rknn::with_runtime(library.map(OsString::from), || {
+        Engine::with_provider(config, &rknn::provider())
+    })
 }
 
 #[rustler::nif]
@@ -119,8 +131,8 @@ mod tests {
         }
     }
 
-    fn refusal(config: RawInitConfig) -> cairn_ort::NativeError {
-        match open_engine(config) {
+    fn refusal(config: RawInitConfig, library: Option<&str>) -> cairn_ort::NativeError {
+        match open_engine(config, library.map(String::from)) {
             Ok(_) => panic!("the engine opened"),
             Err(error) => error,
         }
@@ -128,8 +140,8 @@ mod tests {
 
     /// What this library's `rustler::init!` hands the BEAM, from the
     /// inventory it iterates: `CairnOrt`'s engine surface minus
-    /// `cpu_baseline_ms`, none of `CairnOrt`'s own registrations, and the
-    /// decoder's.
+    /// `cpu_baseline_ms` and with the runtime's path on `init`, none of
+    /// `CairnOrt`'s own registrations, and the decoder's.
     #[test]
     fn the_nif_surface_is_the_engine_without_a_baseline_and_the_decoder() {
         let mut nifs: Vec<(String, u32, u32)> = inventory::iter::<rustler::Nif>()
@@ -152,7 +164,7 @@ mod tests {
             ("download", 1, cpu),
             ("drain_teardown", 1, io),
             ("engine_spec", 1, normal),
-            ("init", 1, cpu),
+            ("init", 2, cpu),
             ("open_decoder", 2, io),
             ("open_stream", 3, cpu),
             ("push_frame", 4, cpu),
@@ -168,7 +180,7 @@ mod tests {
     #[test]
     fn a_backend_this_library_does_not_run_is_config_before_any_load() {
         for backend in ["ort", "qnn"] {
-            let error = refusal(raw_config(backend));
+            let error = refusal(raw_config(backend), None);
             assert_eq!(error.reason(), "config", "{backend}");
             assert!(
                 error
@@ -180,14 +192,23 @@ mod tests {
     }
 
     /// The only test here that touches the environment, and `rknn`'s own tests
-    /// never read it (they load stubs through `with_library`).
+    /// never read it (they load stubs through `RknnBackend::with_library`).
+    /// The path `init` is handed wins over the process's variable, which in the
+    /// VM never holds what `Cairn.Artifacts` set; `None` does not consult it
+    /// either, and outside `with_runtime` it is what is read.
     #[test]
     fn a_missing_runtime_is_a_model_load_term() {
         let library = "/does/not/exist/librknnrt.so";
-        std::env::set_var("CAIRN_RKNN_LIBRARY", library);
-        let error = refusal(raw_config("rknn"));
+        let ignored = "/not/this/one/librknnrt.so";
+        std::env::set_var("CAIRN_RKNN_LIBRARY", ignored);
+        let error = refusal(raw_config("rknn"), Some(library));
+        let default = rknn::with_runtime(None, rknn::runtime);
+        let outside = rknn::runtime();
         std::env::remove_var("CAIRN_RKNN_LIBRARY");
+        assert_eq!(default, "librknnrt.so");
+        assert_eq!(outside, ignored);
         assert_eq!(error.reason(), "model_load");
         assert!(error.message().contains(library), "{error:?}");
+        assert!(!error.message().contains(ignored), "{error:?}");
     }
 }

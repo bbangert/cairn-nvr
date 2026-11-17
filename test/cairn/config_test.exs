@@ -13,6 +13,13 @@ defmodule Cairn.ConfigTest do
       do: %{backends: %{"rknn" => "no /dev/rknpu"}, decoders: %{"vaapi" => "no /dev/dri"}}
   end
 
+  # The Rockchip board's preflight when its NIF did not load.
+  defmodule NifBoard do
+    def name, do: "nif"
+    def profiles_dir, do: "test/support/fixtures/profiles/board"
+    def preflight, do: %{backends: %{"rknn" => "the board NIF did not load (:x)"}, decoders: %{}}
+  end
+
   @valid_fixture "test/support/fixtures/configs/valid.yml"
   @groups_fixture "test/support/fixtures/configs/plugin_groups.yml"
 
@@ -1332,6 +1339,50 @@ defmodule Cairn.ConfigTest do
 
       assert {:ok, _config, [^warning]} =
                Config.from_map(profiled_map("bench-vaapi"), board: BenchBoard)
+    end
+
+    @untried %{"rknn" => [%{name: "librknnrt.so", failure: nil}]}
+
+    defp unfetched(reason) do
+      "plugin det: profile rk-test runs backend \"rknn\", which needs librknnrt.so, " <>
+        "not downloaded yet: #{reason} — the download is retried until it succeeds; " <>
+        "no camera can run on this group before then"
+    end
+
+    test "a missing board artifact is an error for a group cameras run on" do
+      message = unfetched("the fetch has not been tried")
+      assert {:error, [^message]} = Config.from_map(profiled_map(), artifacts: @untried)
+
+      failed = %{"rknn" => [%{name: "librknnrt.so", failure: "could not connect: :nxdomain"}]}
+      message = unfetched("the last fetch failed: could not connect: :nxdomain")
+      assert {:error, [^message]} = Config.from_map(profiled_map(), artifacts: failed)
+
+      restarting = %{"rknn" => [%{name: "librknnrt.so", failure: :restarting}]}
+
+      message =
+        "plugin det: profile rk-test runs backend \"rknn\", which needs librknnrt.so, " <>
+          "whose status is unknown: the artifact store is restarting — the config reloads " <>
+          "once it is back; no camera can run on this group before then"
+
+      assert {:error, [^message]} = Config.from_map(profiled_map(), artifacts: restarting)
+
+      # Another backend's artifact is nobody's concern here.
+      assert {:ok, _config, []} =
+               Config.from_map(profiled_map(), artifacts: %{"qnn" => @untried["rknn"]})
+    end
+
+    test "for a group no camera runs on it warns, beside the board's own warning" do
+      map = Map.put(profiled_map(), "cameras", [])
+      message = unfetched("the fetch has not been tried")
+      assert {:ok, _config, [^message]} = Config.from_map(map, artifacts: @untried)
+
+      # A NIF that did not load is reported though the download would not fix it.
+      preflight =
+        "plugin det: profile rk-test names backend \"rknn\", which the nif board provides " <>
+          "but cannot use on this host: the board NIF did not load (:x)"
+
+      assert {:ok, _config, [^message, ^preflight]} =
+               Config.from_map(map, board: NifBoard, artifacts: @untried)
     end
 
     test "the board's profiles load after the shipped ones and before profile_dirs" do

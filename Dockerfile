@@ -5,7 +5,8 @@
 #              bind); linux/amd64 is the x86 smoke build (sw decode, ORT CPU;
 #              qnn refuses loudly)
 #   rockchip — linux/arm64 only, the RK3566 add-on: sw or MPP decode, ORT
-#              CPU or the RKNN engine NIF (librknnrt is not in the image);
+#              CPU or the RKNN engine NIF (librknnrt is not in the image:
+#              the release downloads it at first start, pinned by sha256);
 #              the MPP and librga userspace that `decoder: rkmpp` and the
 #              probe binary's `--rk-probe` load is carried
 # Rust artifacts and the Rockchip libraries cross-compile on the build host
@@ -172,8 +173,9 @@ EOS
 # ---------------------------------------------------------------------------
 # Rockchip vendor userspace (CAIRN_BOARD=rockchip), cross-built from pinned
 # source: MPP (hardware video codec API; Apache-2.0 + MIT) and librga (RGA 2D
-# engine API; Apache-2.0). librknnrt is not built, fetched or copied: its
-# licence does not permit redistribution.
+# engine API; Apache-2.0). librknnrt is not built, fetched or copied here:
+# its licence does not permit redistribution, so `Cairn.Artifacts` downloads
+# it on the board at run time.
 FROM --platform=$BUILDPLATFORM debian:${DEBIAN_TAG}-slim AS rockchip-libs
 ARG TARGETARCH
 
