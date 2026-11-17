@@ -519,6 +519,19 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
       assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
     end
 
+    test "published without a broadcast ends the stream at its next frame" do
+      server = start_listener()
+      {sock, body} = open_stream(server)
+
+      # What a restarted server does: a snapshot, and no `config_changed`.
+      key = Server.snapshot_key(Server)
+      :persistent_term.put(key, %{Server.snapshot() | ha_token: "rotated"})
+      send(handler(server), {:disk_alert, %{after_rotation: true}})
+
+      body = recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+      refute body =~ "after_rotation"
+    end
+
     test "that keeps the token leaves the stream open" do
       server = start_listener()
       {sock, body} = open_stream(server)
@@ -531,27 +544,36 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
     end
   end
 
-  # A client that reads nothing parks the handler in a socket write (small
-  # buffers on both ends, frames far larger than both); everything sent while
-  # it is parked queues. Once the client reads again, the handler finishes the
-  # write and finds the backlog before its next receive.
+  # A client that reads nothing parks the handler in a socket write: small
+  # buffers on both ends and frames far larger than both — more than one,
+  # because the port driver queues the first whole and it is the next write
+  # that waits. The flood is sent only once the handler is parked, so it all
+  # queues; when the client reads again the handler finishes the write and
+  # finds the backlog before its next receive.
   test "a client too slow for its backlog has the stream ended" do
     server = start_listener(thousand_island_options: [transport_options: [sndbuf: 4_096]])
     {sock, body} = open_stream(server, recbuf: 4_096)
     pid = handler(server)
+
     big = String.duplicate("x", 1_000_000)
-
     for n <- 1..3, do: send(pid, {:disk_alert, %{n: n, pad: big}})
-    for _ <- 1..1_100, do: send(pid, :noise)
-
-    assert eventually(fn -> queue_len(pid) > 1_050 end)
+    send(pid, :noise)
+    assert eventually(fn -> parked_in_write?(pid) end)
 
     log =
       capture_log(fn ->
+        for _ <- 1..1_100, do: send(pid, :noise)
         assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
       end)
 
     assert log =~ "reads too slowly"
+  end
+
+  # The loop's own `receive` matches any message, so a waiting process with a
+  # non-empty queue is in someone else's selective receive: the socket write.
+  defp parked_in_write?(pid) do
+    info = Process.info(pid, [:status, :message_queue_len])
+    info[:status] == :waiting and info[:message_queue_len] > 0
   end
 
   defp start_listener(opts \\ []) do
@@ -586,11 +608,6 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
   defp handler(server) do
     {:ok, [pid]} = ThousandIsland.connection_pids(server)
     pid
-  end
-
-  defp queue_len(pid) do
-    {:message_queue_len, len} = Process.info(pid, :message_queue_len)
-    len
   end
 
   defp frame?(body, id, detail) do

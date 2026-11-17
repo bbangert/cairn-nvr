@@ -16,12 +16,20 @@ defmodule CairnWeb.Api.EventStreamController do
     * the connection process receives an exit signal — the listener shutting
       down, or the `CairnWeb.Api.StreamLimiter` registry holding its slot
       going down;
-    * a config change (`Cairn.Config.topic/0`) leaves `integrations.token`
-      other than the token the request was authenticated with (rotated or
-      removed) — checked once more straight after subscribing, where a
-      mismatch answers 401 instead of opening the stream;
+    * `integrations.token` is other than the token the request was
+      authenticated with (rotated or removed). Checked on a config change
+      (`Cairn.Config.topic/0`), straight after subscribing (a mismatch answers
+      401 instead of opening the stream) and before every frame and heartbeat,
+      so a stream whose writes go through outlives its token by at most one
+      heartbeat interval even when nothing is broadcast;
     * more than `@max_backlog` messages are waiting in the mailbox, i.e. the
       client reads slower than events arrive. It reconnects and re-reads state.
+
+  While a write is blocked on a client that reads nothing, nothing else in
+  the loop runs — no token check, no backlog bound, no exit signal — until
+  the transport's send timeout (30 s by default) fails the write and ends the
+  stream. Bandit's adapter gives a plug no handle on the socket to cut that
+  short.
 
   Over HTTP/1 the connection closes with the stream, and with that 401
   (`connection: close`).
@@ -93,7 +101,7 @@ defmodule CairnWeb.Api.EventStreamController do
     else
       receive do
         :heartbeat ->
-          case chunk(conn, ": ping\n\n") do
+          case write(conn, ": ping\n\n") do
             {:ok, conn} ->
               schedule_heartbeat()
               loop(conn)
@@ -102,8 +110,9 @@ defmodule CairnWeb.Api.EventStreamController do
               conn
           end
 
-        # Any server's diff: the re-check reads the singleton's snapshot, not
-        # the diff, so another server's broadcast only costs a term read.
+        # Ends an idle stream promptly instead of at the next heartbeat. Any
+        # server's diff: the re-check reads the singleton's snapshot, not the
+        # diff, so another server's broadcast only costs a term read.
         {:config_changed, _diff} ->
           if authorized?(conn), do: loop(conn), else: conn
 
@@ -138,6 +147,12 @@ defmodule CairnWeb.Api.EventStreamController do
     len > @max_backlog
   end
 
+  # Before every write, not only on `config_changed`: the server publishes a
+  # new snapshot before it broadcasts, and a restarted one broadcasts nothing.
+  defp write(conn, data) do
+    if authorized?(conn), do: chunk(conn, data), else: {:error, :unauthorized}
+  end
+
   # The snapshot rather than `Server.ha_token/0`: a call would block the
   # stream for as long as a save holds the server. It leads `get/1` during an
   # apply, so a stream can end slightly before the new token is answered.
@@ -157,7 +172,7 @@ defmodule CairnWeb.Api.EventStreamController do
   defp continue(conn, :error), do: loop(conn)
 
   defp continue(conn, {:ok, frame}) do
-    case chunk(conn, frame) do
+    case write(conn, frame) do
       {:ok, conn} -> loop(conn)
       {:error, _reason} -> conn
     end
