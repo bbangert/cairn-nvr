@@ -6,7 +6,8 @@
 #              qnn refuses loudly)
 #   rockchip — linux/arm64 only, the RK3566 add-on: sw decode, ORT CPU or
 #              the RKNN engine NIF (librknnrt is not in the image); the MPP
-#              and librga userspace is carried, and nothing loads it yet
+#              and librga userspace is carried; only the probe binary's
+#              `--rk-probe` loads MPP yet, and nothing loads librga
 # Rust artifacts and the Rockchip libraries cross-compile on the build host
 # (D-C3); the only compile under emulation is the BEAM release, because BEAM
 # bytecode is arch-neutral and ERTS comes from the arm64 hexpm image.
@@ -284,10 +285,12 @@ done > /opt/rockchip/licenses/drm-uapi-headers-NOTICE
 # A pin bump that reshapes a header must not quietly drop its notice.
 [ "$(grep -c 'Permission is hereby granted' /opt/rockchip/licenses/drm-uapi-headers-NOTICE)" = 5 ]
 
-# The board NIF will bind these exact names: the ones C callers write
-# (imcheck, wrapbuffer_handle, mpp_buffer_get_fd) are macros or C++-mangled
-# overloads, and importbuffer_fd has mangled overloads beside the extern "C"
-# one, so only an exact unmangled match counts.
+# The board crate binds these exact names — the MPP list is every symbol
+# boards/cairn_rockchip/native/cairn_rockchip/src/mpp/sys.rs loads, the RGA
+# one what a later binding will. The ones C callers write (imcheck,
+# wrapbuffer_handle, mpp_buffer_get_fd, mpp_buffer_group_get_internal) are
+# macros or C++-mangled overloads, and importbuffer_fd has mangled overloads
+# beside the extern "C" one, so only an exact unmangled match counts.
 need() {
   lib=$1
   shift
@@ -297,7 +300,15 @@ need() {
   done
 }
 need /opt/rockchip/lib/librga.so.2 imcheck_t wrapbuffer_handle_t importbuffer_fd
-need /opt/rockchip/lib/librockchip_mpp.so.1 mpp_buffer_get_fd_with_caller
+need /opt/rockchip/lib/librockchip_mpp.so.1 \
+  mpp_create mpp_init mpp_destroy \
+  mpp_packet_init mpp_packet_set_pts mpp_packet_set_eos mpp_packet_deinit \
+  mpp_frame_get_width mpp_frame_get_height mpp_frame_get_hor_stride \
+  mpp_frame_get_ver_stride mpp_frame_get_errinfo mpp_frame_get_discard \
+  mpp_frame_get_eos mpp_frame_get_info_change mpp_frame_get_fmt \
+  mpp_frame_get_pts mpp_frame_get_buf_size mpp_frame_get_buffer mpp_frame_deinit \
+  mpp_buffer_get_fd_with_caller mpp_buffer_group_get mpp_buffer_group_put \
+  mpp_buffer_group_clear mpp_buffer_group_limit_config
 EOS
 
 # FP32 YOLOX release exports (Apache-2.0, bytes as Megvii published them):
