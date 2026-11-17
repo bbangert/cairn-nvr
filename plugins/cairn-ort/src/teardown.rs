@@ -1,14 +1,17 @@
 //! Where a collected resource handle is actually dropped.
 //!
 //! A destructor runs on whichever thread released the last reference, and for a
-//! collected term that is a normal scheduler. What is dropped is a libav decoder
-//! — driver and device teardown on the hardware paths — and, for the last engine
-//! handle, an ORT session release that on QNN gives back an HTP context: work
-//! bounded by nothing this crate controls. Calling `close_stream` does not avoid
-//! it, since nothing stops the BEAM from collecting a term.
+//! collected term that is a normal scheduler. What is dropped is a stream's
+//! state and, for the last engine handle, the model session — an ORT session
+//! release that on QNN gives back an HTP context, or `rknn_destroy` in the board
+//! library hosting this engine: work bounded by nothing this crate controls.
+//! Calling `close_stream` does not avoid it, since nothing stops the BEAM from
+//! collecting a term.
 //!
 //! One thread, not one per drop: a supervisor restarting every camera at once
-//! queues N teardowns rather than spawning N threads onto a busy box.
+//! queues N teardowns rather than spawning N threads onto a busy box. One per
+//! NIF library, though: each cdylib links its own copy of this module's statics,
+//! so [`drain`] waits on the queue of the library it is called through.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, SendError, Sender};
@@ -24,7 +27,7 @@ type Discarded = Box<dyn Send + 'static>;
 /// [`catch_unwind`] the way it wraps a NIF body, so an unwind out of this
 /// function reaches C and aborts the node — hence every drop, the two inline
 /// fallbacks included, goes through [`drop_swallowing_panics`].
-pub fn defer<T: Send + 'static>(value: T) {
+pub(crate) fn defer<T: Send + 'static>(value: T) {
     defer_to(queue(), value)
 }
 

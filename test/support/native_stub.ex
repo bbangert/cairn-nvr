@@ -58,6 +58,10 @@ defmodule Cairn.NativeStub do
     end
   end
 
+  # Drain calls the release board's real modules, never a stub.
+  @impl true
+  def drain_teardown(_timeout_ms), do: true
+
   @doc "The key every stub here reads its answers out of."
   def control, do: @control
 

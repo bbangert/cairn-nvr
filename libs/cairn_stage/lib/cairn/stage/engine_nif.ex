@@ -39,4 +39,6 @@ defmodule Cairn.Stage.EngineNif do
   @callback push_frame(reference(), binary(), frame_meta(), {integer(), integer()}) ::
               {:ok, {[map()], [String.t()]}} | {:error, {atom(), String.t()}}
   @callback close_stream(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
+  # True when every native drop deferred so far finished inside the bound.
+  @callback drain_teardown(timeout_ms :: non_neg_integer()) :: boolean()
 end

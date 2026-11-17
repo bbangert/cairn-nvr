@@ -37,4 +37,6 @@ defmodule Cairn.Stage.DecoderNif do
   @callback decode_au(reference(), binary(), integer(), boolean()) ::
               {:ok, {boolean(), decoded_frame() | nil}} | {:error, {atom(), String.t()}}
   @callback close_decoder(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
+  # True when every native drop deferred so far finished inside the bound.
+  @callback drain_teardown(timeout_ms :: non_neg_integer()) :: boolean()
 end

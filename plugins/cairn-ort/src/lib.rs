@@ -6,6 +6,12 @@
 //! (its input spec) crosses to the decode side as plain terms
 //! (`engine_spec`).
 //!
+//! The NIF entry is the `nif` feature (default on). A board library hosts
+//! this same engine over its own backend ([`Engine::with_provider`]) by
+//! linking this crate with the feature off and wrapping the public bodies
+//! below in NIFs of its own, so both libraries share one implementation and
+//! one term vocabulary.
+//!
 //! Failures are values, because the catching is narrower than it looks: rustler
 //! unwinds a NIF body into an error term, but not a resource destructor
 //! (`teardown`), and nothing catches an abort or a C++ exception out of ORT.
@@ -25,16 +31,18 @@ mod engine;
 mod error;
 mod observation;
 mod stream;
-mod teardown;
+pub mod teardown;
 
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rustler::{Binary, Env, NifMap, Resource, ResourceArc};
+#[cfg(feature = "nif")]
+use rustler::{Binary, ResourceArc};
+use rustler::{Env, NifMap, Resource};
 
-use cairn_detect::infer::InputSize;
+use cairn_detect::infer::{InputSize, InputSpec};
 use cairn_detect::motion::MotionVerdict;
 
 pub use config::{RawInitConfig, RawQnnOptions, RawStreamParams};
@@ -77,6 +85,12 @@ impl StreamRef {
             engine,
             state: Mutex::new(Some(stream)),
         }
+    }
+
+    /// `open_stream`'s body: claim `stream_id` on `engine` and open its stream.
+    pub fn open(engine: &Arc<Engine>, stream_id: String, params: RawStreamParams) -> Result<Self> {
+        let stream = Stream::open(Arc::clone(engine), stream_id, params.resolve()?)?;
+        Ok(Self::new(Arc::clone(engine), stream))
     }
 
     /// The instant is read after the lock, not before: it dates the detection
@@ -164,6 +178,27 @@ pub struct RawFrameMeta {
     motion: Option<RawMotionVerdict>,
 }
 
+impl RawFrameMeta {
+    /// The frame `push_frame` hands the stream, over the payload's bytes.
+    pub fn frame(self, rgb: &[u8], time_base: (i32, i32)) -> Frame<'_> {
+        Frame {
+            rgb,
+            content: InputSize {
+                w: self.width,
+                h: self.height,
+            },
+            orig: InputSize {
+                w: self.orig_width,
+                h: self.orig_height,
+            },
+            pts: self.pts,
+            time_base,
+            observed_at_ms: self.observed_at_ms,
+            motion: self.motion.map(MotionVerdict::from),
+        }
+    }
+}
+
 /// The engine's resolved input spec as plain terms — what the decode half is
 /// built from, since no resource can cross between two NIF libraries. The
 /// spellings round-trip through `cairn-detect`'s own `wire` helpers, so the
@@ -182,10 +217,24 @@ pub struct RawInputSpec {
     resize_pad: u8,
 }
 
+impl From<InputSpec> for RawInputSpec {
+    fn from(spec: InputSpec) -> Self {
+        let (resize, resize_pad) = spec.resize.wire();
+        Self {
+            width: spec.size.w,
+            height: spec.size.h,
+            encoding: spec.encoding.wire_name().to_string(),
+            resize: resize.to_string(),
+            resize_pad,
+        }
+    }
+}
+
 /// Load the backend and model, once per VM.
 ///
 /// DirtyCpu rather than DirtyIo: reading the artifact is the small half and
 /// building the session is the rest — on QNN a multi-second HTP graph compile.
+#[cfg(feature = "nif")]
 #[rustler::nif(schedule = "DirtyCpu")]
 fn init(config: RawInitConfig) -> Result<ResourceArc<EngineRef>> {
     guarded("init", || {
@@ -197,22 +246,16 @@ fn init(config: RawInitConfig) -> Result<ResourceArc<EngineRef>> {
 /// The engine's resolved input spec, for the host to hand to the decode
 /// library's `open_decoder` — one source of truth for what both halves are
 /// built for, restated as terms because that is all that can cross.
+#[cfg(feature = "nif")]
 #[rustler::nif]
 fn engine_spec(engine: ResourceArc<EngineRef>) -> RawInputSpec {
-    let spec = engine.0.input_spec;
-    let (resize, resize_pad) = spec.resize.wire();
-    RawInputSpec {
-        width: spec.size.w,
-        height: spec.size.h,
-        encoding: spec.encoding.wire_name().to_string(),
-        resize: resize.to_string(),
-        resize_pad,
-    }
+    engine.0.input_spec.into()
 }
 
 /// Open one stream on this engine, claiming its stream id: one stream per
 /// camera, because two would each hold their own gate state while emitting
 /// under one id.
+#[cfg(feature = "nif")]
 #[rustler::nif(schedule = "DirtyCpu")]
 fn open_stream(
     engine: ResourceArc<EngineRef>,
@@ -220,11 +263,9 @@ fn open_stream(
     params: RawStreamParams,
 ) -> Result<ResourceArc<StreamRef>> {
     guarded("open_stream", || {
-        let stream = Stream::open(Arc::clone(&engine.0), stream_id, params.resolve()?)?;
-        Ok(ResourceArc::new(StreamRef::new(
-            Arc::clone(&engine.0),
-            stream,
-        )))
+        Ok(ResourceArc::new(StreamRef::open(
+            &engine.0, stream_id, params,
+        )?))
     })
 }
 
@@ -233,6 +274,7 @@ fn open_stream(
 /// `ended_tracks` is always empty, and is here only because the shape is the
 /// host's: nothing below mints an identity (`plugin.hello` says
 /// `object_tracking: false`), so `Cairn.Tracker` ends tracks.
+#[cfg(feature = "nif")]
 #[rustler::nif(schedule = "DirtyCpu")]
 fn push_frame(
     stream: ResourceArc<StreamRef>,
@@ -241,30 +283,19 @@ fn push_frame(
     time_base: (i32, i32),
 ) -> Result<(Vec<FrameObservations>, Vec<String>)> {
     guarded("push_frame", || {
-        let frame = Frame {
-            rgb: payload.as_slice(),
-            content: InputSize {
-                w: meta.width,
-                h: meta.height,
-            },
-            orig: InputSize {
-                w: meta.orig_width,
-                h: meta.orig_height,
-            },
-            pts: meta.pts,
-            time_base,
-            observed_at_ms: meta.observed_at_ms,
-            motion: meta.motion.map(MotionVerdict::from),
-        };
-        let frames = stream.push(frame)?;
-        Ok((frames, Vec::new()))
+        Ok((
+            stream.push(meta.frame(payload.as_slice(), time_base))?,
+            Vec::new(),
+        ))
     })
 }
 
 /// The CPU-side model-pass baseline `Cairn.Native.Health` compares an
 /// accelerator's own latency against. A second, CPU-side model load — not
-/// the accelerator's session — so it costs one; the host calls it once, at
-/// engine init.
+/// the accelerator's session — so it costs one. The host does not call it: it
+/// measures through the backend's canary binary's `--cpu-baseline` in a
+/// subprocess, for the reason in `engine::cpu_baseline_ms`.
+#[cfg(feature = "nif")]
 #[rustler::nif(schedule = "DirtyCpu")]
 fn cpu_baseline_ms(config: RawInitConfig, passes: usize) -> Result<f64> {
     guarded("cpu_baseline_ms", || {
@@ -276,6 +307,7 @@ fn cpu_baseline_ms(config: RawInitConfig, passes: usize) -> Result<f64> {
 ///
 /// `{:ok, false}` for an already-closed stream: the host closing a stream it has
 /// also dropped the last reference to is a race it should not have to win.
+#[cfg(feature = "nif")]
 #[rustler::nif(schedule = "DirtyIo")]
 fn close_stream(stream: ResourceArc<StreamRef>) -> Result<bool> {
     guarded("close_stream", || Ok(stream.close()))
@@ -312,11 +344,13 @@ fn panic_message(payload: &Box<dyn Any + Send>) -> &str {
 /// and fastrpc hang on QCS6490. `true` means drained; `false` means the
 /// timeout passed with drops still running, and the caller halts into the
 /// race knowingly.
+#[cfg(feature = "nif")]
 #[rustler::nif(schedule = "DirtyIo")]
 fn drain_teardown(timeout_ms: u64) -> bool {
     teardown::drain(std::time::Duration::from_millis(timeout_ms))
 }
 
+#[cfg(feature = "nif")]
 rustler::init!("Elixir.CairnOrt");
 
 #[cfg(test)]
@@ -349,6 +383,39 @@ mod tests {
                 .reason(),
             "closed"
         );
+    }
+
+    /// What `rustler::init!` hands the BEAM: every `#[rustler::nif]` in the
+    /// binary, from the inventory it iterates. A board crate linking this one
+    /// with the feature off sees none of these in its own list.
+    #[cfg(feature = "nif")]
+    #[test]
+    fn the_nif_surface_is_cairn_orts_seven_functions() {
+        let mut nifs: Vec<(String, u32, u32)> =
+            rustler::codegen_runtime::inventory::iter::<rustler::Nif>()
+                .map(|nif| {
+                    // SAFETY: `name` is the macro's NUL-terminated literal.
+                    let name = unsafe { std::ffi::CStr::from_ptr(nif.name) };
+                    (name.to_str().unwrap().to_string(), nif.arity, nif.flags)
+                })
+                .collect();
+        nifs.sort();
+        let (normal, cpu, io) = (
+            rustler::SchedulerFlags::Normal as u32,
+            rustler::SchedulerFlags::DirtyCpu as u32,
+            rustler::SchedulerFlags::DirtyIo as u32,
+        );
+        let expected = [
+            ("close_stream", 1, io),
+            ("cpu_baseline_ms", 2, cpu),
+            ("drain_teardown", 1, io),
+            ("engine_spec", 1, normal),
+            ("init", 1, cpu),
+            ("open_stream", 3, cpu),
+            ("push_frame", 4, cpu),
+        ]
+        .map(|(name, arity, flags)| (name.to_string(), arity, flags));
+        assert_eq!(nifs, expected);
     }
 
     #[test]

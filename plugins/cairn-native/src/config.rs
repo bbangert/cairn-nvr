@@ -89,9 +89,9 @@ impl RawDecoderParams {
                     .map_err(|error| NativeError::Config(crate::error::chain(&error)))?,
                 resize: ResizePolicy::from_wire(&self.resize, self.resize_pad)
                     .map_err(|error| NativeError::Config(crate::error::chain(&error)))?,
-                // Neither is read on the decode side, which packs no tensor:
-                // the uint8-IO spike is binary-only and no quant spec crosses
-                // the NIF wire, and neither does a layout.
+                // Neither is read on the decode side, which packs no tensor,
+                // so neither crosses the NIF wire: a quant spec and a layout
+                // are the engine's own.
                 input_quant: None,
                 layout: TensorLayout::Nchw,
             },
