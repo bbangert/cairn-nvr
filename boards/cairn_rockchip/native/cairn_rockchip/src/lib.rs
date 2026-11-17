@@ -1,20 +1,22 @@
 //! The Rockchip board library's native half: one cdylib the BEAM loads as
 //! `Cairn.Rockchip.Native`; the [`rknn`] backend; the [`mpp`] decoder binding
 //! and the [`rga`] scaler, which blits into [`dma`] buffers held in a
-//! [`pool`] (no NIF reaches any of these four yet); and the probe binary that
+//! [`pool`], all four driven by the `decoder` NIFs; and the probe binary that
 //! runs `cairn-detect`'s CLI with that backend registered, or for
 //! `--rk-probe` the decode-and-scale [`probe`].
 //!
-//! The NIFs are `CairnOrt`'s engine surface over [`rknn::provider`]: same
+//! The engine NIFs are `CairnOrt`'s surface over [`rknn::provider`]: same
 //! functions, arities, schedulers, term shapes and `{reason, message}` errors,
 //! because each one wraps the body `cairn-ort` exports. That crate is linked
 //! with its own NIF entry off (`default-features = false`), so this library's
-//! `rustler::init!` registers only the functions below — and, since rustler
-//! collects resource types binary-wide, `cairn-ort`'s `EngineRef` and
-//! `StreamRef` with their deferred-teardown destructors.
+//! `rustler::init!` registers only the functions below and `decoder`'s, and
+//! the resource types rustler collects binary-wide: `decoder`'s two, and
+//! `cairn-ort`'s `EngineRef` and `StreamRef` with their deferred-teardown
+//! destructors.
 //!
 //! No `cpu_baseline_ms`: the host measures the CPU baseline in a subprocess.
 
+mod decoder;
 pub mod dma;
 pub mod mpp;
 pub mod pool;
@@ -90,7 +92,7 @@ fn drain_teardown(timeout_ms: u64) -> bool {
     cairn_ort::teardown::drain(Duration::from_millis(timeout_ms))
 }
 
-rustler::init!("Elixir.Cairn.Rockchip.Native");
+rustler::init!("Elixir.Cairn.Rockchip.Native", load = decoder::load);
 
 #[cfg(test)]
 mod tests {
@@ -125,10 +127,11 @@ mod tests {
     }
 
     /// What this library's `rustler::init!` hands the BEAM, from the
-    /// inventory it iterates: `CairnOrt`'s surface minus `cpu_baseline_ms`,
-    /// and none of `CairnOrt`'s own registrations.
+    /// inventory it iterates: `CairnOrt`'s engine surface minus
+    /// `cpu_baseline_ms`, none of `CairnOrt`'s own registrations, and the
+    /// decoder's.
     #[test]
-    fn the_nif_surface_is_the_engine_without_a_baseline() {
+    fn the_nif_surface_is_the_engine_without_a_baseline_and_the_decoder() {
         let mut nifs: Vec<(String, u32, u32)> = inventory::iter::<rustler::Nif>()
             .map(|nif| {
                 // SAFETY: `name` is the macro's NUL-terminated literal.
@@ -143,18 +146,23 @@ mod tests {
             SchedulerFlags::DirtyIo as u32,
         );
         let expected = [
+            ("close_decoder", 1, io),
             ("close_stream", 1, io),
+            ("decode_au", 4, io),
+            ("download", 1, cpu),
             ("drain_teardown", 1, io),
             ("engine_spec", 1, normal),
             ("init", 1, cpu),
+            ("open_decoder", 2, io),
             ("open_stream", 3, cpu),
             ("push_frame", 4, cpu),
+            ("release", 1, io),
         ]
         .map(|(name, arity, flags)| (name.to_string(), arity, flags));
         assert_eq!(nifs, expected);
-        // `EngineRef` and `StreamRef`, defined in `cairn-ort` and registered
-        // by this library's load.
-        assert_eq!(inventory::iter::<ResourceRegistration>().count(), 2);
+        // `cairn-ort`'s `EngineRef` and `StreamRef` and the decoder's
+        // `DecoderRef` and `LeaseRef`, all registered by this library's load.
+        assert_eq!(inventory::iter::<ResourceRegistration>().count(), 4);
     }
 
     #[test]

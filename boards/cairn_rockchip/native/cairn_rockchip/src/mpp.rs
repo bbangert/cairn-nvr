@@ -422,8 +422,9 @@ impl MppDecoder {
 /// Handed out only with a buffer.
 ///
 /// Dropping one may drop the context's last holder, which resets and
-/// destroys it, joining MPP's threads: it **blocks**. No holder can tell which
-/// drop is the last, so a NIF hands every frame to a teardown thread to drop.
+/// destroys it, joining MPP's threads: it **blocks**. Only a holder that also
+/// holds the decoder knows its drop is not the last, as `decode_au` does; any
+/// other hands the frame to a teardown thread to drop.
 pub struct Frame {
     context: Arc<Context>,
     frame: sys::Frame,
@@ -476,6 +477,12 @@ impl Frame {
             && fmt & (sys::FRAME_FBC_MASK | sys::FRAME_TILE_FLAG) == 0
     }
 
+    /// Whether the stream signals full-range YUV. Unspecified (no VUI) counts
+    /// as limited, which is how the software path's swscale converts it.
+    pub fn is_full_range(&self) -> bool {
+        self.get(self.context.library.frame_get_color_range) == sys::RANGE_FULL
+    }
+
     /// The picture's dma-buf. MPP owns the descriptor: it is valid only while
     /// this frame lives, and is not to be closed.
     pub fn fd(&self) -> RawFd {
@@ -492,8 +499,9 @@ impl Drop for Frame {
     }
 }
 
+// `pub(crate)`: the decoder's tests drive `MppDecoder` through these stubs.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::ffi::c_char;
@@ -504,16 +512,17 @@ mod tests {
     static STUBS: Mutex<()> = Mutex::new(());
     static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static FRAMES: Mutex<VecDeque<StubFrame>> = Mutex::new(VecDeque::new());
-    static PUT_CODE: AtomicI32 = AtomicI32::new(0);
+    pub(crate) static PUT_CODE: AtomicI32 = AtomicI32::new(0);
     static INIT_CODE: AtomicI32 = AtomicI32::new(0);
     static LIMIT_CODE: AtomicI32 = AtomicI32::new(0);
     static API_SIZE: AtomicU32 = AtomicU32::new(184);
 
     #[derive(Clone, Copy, Default)]
-    struct StubFrame {
+    pub(crate) struct StubFrame {
         geometry: Geometry,
         pts: i64,
         fmt: u32,
+        range: u32,
         info_change: u32,
         errinfo: u32,
         discard: u32,
@@ -531,11 +540,15 @@ mod tests {
         }
     }
 
-    fn picture(pts: i64) -> StubFrame {
+    pub(crate) fn picture(pts: i64) -> StubFrame {
         let geometry = geometry(1920, 1080, 3_133_440);
         edit(StubFrame::default(), |f| {
             (f.geometry, f.pts, f.buffer) = (geometry, pts, 0x7000)
         })
+    }
+
+    pub(crate) fn full_range(pts: i64) -> StubFrame {
+        edit(picture(pts), |f| f.range = sys::RANGE_FULL)
     }
 
     fn info(width: u32, height: u32, buf_size: usize) -> StubFrame {
@@ -558,11 +571,11 @@ mod tests {
     }
 
     /// The calls since the last read, space-separated.
-    fn calls() -> String {
+    pub(crate) fn calls() -> String {
         std::mem::take(&mut *CALLS.lock().unwrap()).join(" ")
     }
 
-    fn stubs() -> MutexGuard<'static, ()> {
+    pub(crate) fn stubs() -> MutexGuard<'static, ()> {
         let guard = STUBS.lock().unwrap_or_else(|p| p.into_inner());
         CALLS.lock().unwrap().clear();
         FRAMES.lock().unwrap().clear();
@@ -573,7 +586,7 @@ mod tests {
         guard
     }
 
-    fn queue(frames: &[StubFrame]) {
+    pub(crate) fn queue(frames: &[StubFrame]) {
         FRAMES.lock().unwrap().extend(frames);
     }
 
@@ -698,6 +711,7 @@ mod tests {
         get_eos -> u32: |f| f.eos;
         get_info_change -> u32: |f| f.info_change;
         get_fmt -> u32: |f| f.fmt;
+        get_color_range -> u32: |f| f.range;
         get_pts -> i64: |f| f.pts;
         get_buffer -> sys::Buffer: |f| ptr::without_provenance_mut(f.buffer);
     }
@@ -741,7 +755,7 @@ mod tests {
         LIMIT_CODE.load(SeqCst)
     }
 
-    fn library() -> sys::Library {
+    pub(crate) fn library() -> sys::Library {
         sys::Library {
             create: stub_create,
             init: stub_init,
@@ -759,6 +773,7 @@ mod tests {
             frame_get_eos: get_eos,
             frame_get_info_change: get_info_change,
             frame_get_fmt: get_fmt,
+            frame_get_color_range: get_color_range,
             frame_get_pts: get_pts,
             frame_get_buf_size: get_buf_size,
             frame_get_buffer: get_buffer,
@@ -947,6 +962,17 @@ mod tests {
                 !decoder.next_frame().unwrap().unwrap().is_nv12(),
                 "{fmt:#x}"
             );
+        }
+    }
+
+    #[test]
+    fn only_the_jpeg_range_is_full_and_unspecified_is_limited() {
+        let _guard = stubs();
+        let mut decoder = open();
+        for (range, full) in [(0, false), (1, false), (2, true)] {
+            queue(&[edit(picture(0), |f| f.range = range)]);
+            let frame = decoder.next_frame().unwrap().unwrap();
+            assert_eq!(frame.is_full_range(), full, "range {range}");
         }
     }
 

@@ -49,7 +49,7 @@ defmodule Cairn.Native do
   # dynamic. The nowarn covers the specs, which describe the loaded library.
   @dialyzer {:nowarn_function, open_decoder: 2, decode_au: 4, close_decoder: 1, drain_teardown: 1}
 
-  @type decoded_frame :: Cairn.Stage.DecoderNif.decoded_frame()
+  @type decoded_frame :: Cairn.Stage.DecoderNif.rgb_frame()
   @type motion_verdict :: Cairn.Stage.FrameMeta.motion_verdict()
 
   @doc """

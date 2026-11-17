@@ -308,6 +308,7 @@ need /opt/rockchip/lib/librockchip_mpp.so.1 \
   mpp_frame_get_width mpp_frame_get_height mpp_frame_get_hor_stride \
   mpp_frame_get_ver_stride mpp_frame_get_errinfo mpp_frame_get_discard \
   mpp_frame_get_eos mpp_frame_get_info_change mpp_frame_get_fmt \
+  mpp_frame_get_color_range \
   mpp_frame_get_pts mpp_frame_get_buf_size mpp_frame_get_buffer mpp_frame_deinit \
   mpp_buffer_get_fd_with_caller mpp_buffer_group_get mpp_buffer_group_put \
   mpp_buffer_group_clear mpp_buffer_group_limit_config
