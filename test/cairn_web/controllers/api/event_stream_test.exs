@@ -351,12 +351,19 @@ defmodule CairnWeb.Api.EventStreamTest do
 end
 
 defmodule CairnWeb.Api.EventStreamEndpointTest do
-  # async: false — drives the global Cairn.CameraStatus and its PubSub topic
+  # async: false — drives the global Cairn.CameraStatus and its PubSub topic,
+  # the application's Config.Server and its fixture file, and the limiter
   use CairnWeb.ConnCase, async: false
 
+  import ExUnit.CaptureLog
+
+  alias Cairn.Config.Server
+  alias CairnWeb.Api.EventStreamController
   alias CairnWeb.Api.StreamLimiter
 
   @token "test-ha-token"
+  @fixture "test/support/fixtures/configs/valid.yml"
+  @end_of_body "\r\n0\r\n\r\n"
 
   # Goes through a real listener because the test adapter reports
   # `{:plug_conn, :sent}` to the conn's owner, while a real adapter sends it to
@@ -366,15 +373,206 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
     id = "sse_#{System.unique_integer([:positive])}"
     on_exit(fn -> Cairn.CameraStatus.delete(id) end)
 
-    server =
-      start_supervised!(
-        {Bandit, plug: CairnWeb.Endpoint, port: 0, ip: :loopback, startup_log: false}
-      )
-
-    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    server = start_listener()
     slots = StreamLimiter.count()
+    {sock, body} = open_stream(server)
 
-    {:ok, sock} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+    Cairn.CameraStatus.put(id, %{
+      plugin_status: %{"state" => "degraded", "detail" => "cpu fallback"}
+    })
+
+    # Through the frame's blank line: TCP may split it anywhere.
+    body = recv_until(sock, body, &frame?(&1, id, "cpu fallback"))
+
+    assert body =~ "event: camera_status\n"
+    assert body =~ ~s("plugin_status":{)
+    assert body =~ ~s("state":"degraded")
+
+    # A second frame proves the stream outlived the first: a refute on the
+    # bytes read so far cannot see an end that has not arrived yet.
+    Cairn.CameraStatus.put(id, %{plugin_status: %{"state" => "ok", "detail" => "npu back"}})
+    body = recv_until(sock, body, &frame?(&1, id, "npu back"))
+    refute body =~ @end_of_body
+
+    :ok = :gen_tcp.close(sock)
+
+    # The client is gone; the next write fails and the handler releases.
+    assert eventually(fn ->
+             Cairn.CameraStatus.put(id, %{status: :running})
+             StreamLimiter.count() == slots
+           end)
+  end
+
+  test "an open stream does not hold up the listener's shutdown" do
+    server = start_listener()
+    slots = StreamLimiter.count()
+    {_sock, _body} = open_stream(server)
+    assert StreamLimiter.count() == slots + 1
+
+    {micros, :ok} = :timer.tc(fn -> stop_supervised(:listener) end)
+
+    # Far under the listener's 15 s shutdown_timeout, after which the handler
+    # would be killed instead.
+    assert micros < 3_000_000
+    assert eventually(fn -> StreamLimiter.count() == slots end)
+  end
+
+  test "a handler killed outright frees its slot" do
+    server = start_listener()
+    slots = StreamLimiter.count()
+    {_sock, _body} = open_stream(server)
+    assert StreamLimiter.count() == slots + 1
+
+    Process.exit(handler(server), :kill)
+
+    assert eventually(fn -> StreamLimiter.count() == slots end)
+  end
+
+  test "the stream past the cap is refused with 503" do
+    server = start_listener()
+    previous = Application.fetch_env(:cairn, :max_sse_connections)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, max} -> Application.put_env(:cairn, :max_sse_connections, max)
+        :error -> Application.delete_env(:cairn, :max_sse_connections)
+      end
+    end)
+
+    Application.put_env(:cairn, :max_sse_connections, StreamLimiter.count() + 1)
+    {_sock, _body} = open_stream(server)
+
+    head = recv_until(request(server), "", &(&1 =~ "\r\n\r\n"))
+    assert head =~ ~r/\AHTTP\/1.1 503 /
+  end
+
+  # The supervisor's restart is logged as an error report.
+  @tag :capture_log
+  test "a limiter restart ends the streams whose slots it dropped" do
+    server = start_listener()
+    {sock, body} = open_stream(server)
+    limiter = Process.whereis(StreamLimiter)
+
+    :ok = Supervisor.stop(limiter, :shutdown)
+
+    assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+    # The name is registered before the successor's tables exist.
+    assert eventually(fn ->
+             Process.whereis(StreamLimiter) not in [nil, limiter] and
+               try do
+                 StreamLimiter.count() == 0
+               rescue
+                 ArgumentError -> false
+               end
+           end)
+  end
+
+  # The window between `ApiAuth` and the stream's subscribe, which no
+  # broadcast will cover: entered directly with the token the plug would have
+  # recorded before a rotation. Opened, the stream would block until the
+  # test timed out.
+  @tag timeout: 5_000
+  test "a stream whose token changed before it subscribed is refused with 401" do
+    conn =
+      build_conn()
+      |> put_private(:cairn_api_token, "rotated-away")
+      |> EventStreamController.stream(%{})
+
+    assert json_response(conn, 401) == %{"error" => "unauthorized"}
+    # It subscribed before it was refused, so its process must not serve again.
+    assert get_resp_header(conn, "connection") == ["close"]
+  end
+
+  describe "a config change" do
+    setup do
+      original = File.read!(@fixture)
+
+      on_exit(fn ->
+        File.write!(@fixture, original)
+        {:ok, _, _} = Server.reload()
+      end)
+
+      %{original: original}
+    end
+
+    test "that rotates the token ends a stream opened with the old one", %{original: original} do
+      server = start_listener()
+      {sock, body} = open_stream(server)
+
+      File.write!(@fixture, String.replace(original, "token: #{@token}", "token: rotated"))
+      {:ok, _, _} = Server.reload()
+
+      assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+      # Not kept alive: the next request on this connection would run in the
+      # process that still holds this stream's subscriptions.
+      assert :gen_tcp.recv(sock, 0, 1_000) == {:error, :closed}
+    end
+
+    test "that removes the token ends the stream", %{original: original} do
+      server = start_listener()
+      {sock, body} = open_stream(server)
+
+      File.write!(@fixture, String.replace(original, "integrations:\n  token: #{@token}\n", ""))
+      {:ok, _, _} = Server.reload()
+      assert Server.ha_token() == nil
+
+      assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+    end
+
+    test "that keeps the token leaves the stream open" do
+      server = start_listener()
+      {sock, body} = open_stream(server)
+
+      {:ok, _, _} = Server.reload()
+      send(handler(server), {:disk_alert, %{after_reload: true}})
+
+      body = recv_until(sock, body, &(&1 =~ ~s("after_reload":true}\n\n)))
+      refute body =~ @end_of_body
+    end
+  end
+
+  # A client that reads nothing parks the handler in a socket write (small
+  # buffers on both ends, frames far larger than both); everything sent while
+  # it is parked queues. Once the client reads again, the handler finishes the
+  # write and finds the backlog before its next receive.
+  test "a client too slow for its backlog has the stream ended" do
+    server = start_listener(thousand_island_options: [transport_options: [sndbuf: 4_096]])
+    {sock, body} = open_stream(server, recbuf: 4_096)
+    pid = handler(server)
+    big = String.duplicate("x", 1_000_000)
+
+    for n <- 1..3, do: send(pid, {:disk_alert, %{n: n, pad: big}})
+    for _ <- 1..1_100, do: send(pid, :noise)
+
+    assert eventually(fn -> queue_len(pid) > 1_050 end)
+
+    log =
+      capture_log(fn ->
+        assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+      end)
+
+    assert log =~ "reads too slowly"
+  end
+
+  defp start_listener(opts \\ []) do
+    start_supervised!(
+      Supervisor.child_spec(
+        {Bandit, [plug: CairnWeb.Endpoint, port: 0, ip: :loopback, startup_log: false] ++ opts},
+        id: :listener
+      )
+    )
+  end
+
+  defp open_stream(server, sock_opts \\ []) do
+    sock = request(server, sock_opts)
+    {sock, recv_until(sock, "", &(&1 =~ ": connected\n\n"))}
+  end
+
+  defp request(server, sock_opts \\ []) do
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    {:ok, sock} =
+      :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false] ++ sock_opts)
 
     :ok =
       :gen_tcp.send(
@@ -382,28 +580,21 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
         "GET /api/stream?access_token=#{@token} HTTP/1.1\r\nhost: localhost\r\n\r\n"
       )
 
-    body = recv_until(sock, "", &(&1 =~ ": connected\n\n"))
+    sock
+  end
 
-    Cairn.CameraStatus.put(id, %{
-      plugin_status: %{"state" => "degraded", "detail" => "cpu fallback"}
-    })
+  defp handler(server) do
+    {:ok, [pid]} = ThousandIsland.connection_pids(server)
+    pid
+  end
 
-    body = recv_until(sock, body, &(&1 =~ ~s("camera_id":"#{id}")))
+  defp queue_len(pid) do
+    {:message_queue_len, len} = Process.info(pid, :message_queue_len)
+    len
+  end
 
-    assert body =~ "event: camera_status\n"
-    assert body =~ ~s("plugin_status":{)
-    assert body =~ ~s("state":"degraded")
-    assert body =~ ~s("detail":"cpu fallback")
-    refute body =~ "\r\n0\r\n\r\n"
-
-    :ok = :gen_tcp.close(sock)
-
-    # Only a failed write ends the handler, and a handler killed at listener
-    # teardown would skip the limiter release in its `after`.
-    assert eventually(fn ->
-             Cairn.CameraStatus.put(id, %{status: :running})
-             StreamLimiter.count() == slots
-           end)
+  defp frame?(body, id, detail) do
+    body =~ ~r/data: \{[^\n]*"camera_id":"#{id}"[^\n]*"detail":"#{detail}"[^\n]*\}\n\n/
   end
 
   defp recv_until(sock, acc, done?) do

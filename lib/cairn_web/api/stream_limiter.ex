@@ -4,57 +4,54 @@ defmodule CairnWeb.Api.StreamLimiter do
 
   Each SSE connection is a process holding a chunked socket subscribed to
   several PubSub topics; without a cap a token holder could open thousands and
-  exhaust file descriptors/memory. Backed by an atomic ETS counter owned by a
-  supervised Agent, mirroring the `WebRTC.Supervisor` `max_children` cap on the
-  WHEP side.
+  exhaust file descriptors/memory. Mirrors the `WebRTC.Supervisor`
+  `max_children` cap on the WHEP side.
+
+  A slot is a `Registry` entry of the process holding the stream, so it is
+  freed when that process dies, however it dies — a counter would leak the
+  slot of a handler killed before its `release/0` ran. `Registry.register/3`
+  links the holder to the registry: if the registry goes down, its entries go
+  with it and each holder gets an exit signal, which ends its stream
+  (`CairnWeb.Api.EventStreamController`).
   """
 
-  use Agent
-
-  @table __MODULE__
+  @key :stream
   @default_max 64
 
-  def start_link(_opts) do
-    Agent.start_link(fn -> init_table() end, name: __MODULE__)
-  end
-
-  defp init_table do
-    :ets.new(@table, [:named_table, :public, :set])
-    :ets.insert(@table, {:count, 0})
-    :ok
-  end
+  def child_spec(_opts), do: Registry.child_spec(keys: :duplicate, name: __MODULE__)
 
   @doc "Configured maximum concurrent SSE connections."
   @spec max() :: pos_integer()
   def max, do: Application.get_env(:cairn, :max_sse_connections, @default_max)
 
   @doc """
-  Atomically claims a slot. Returns `:ok`, or `:error` when the cap is reached
-  (the speculative increment is rolled back).
+  Claims a slot for the calling process. Returns `:ok`, or `:error` when the
+  cap is reached.
   """
   @spec acquire() :: :ok | :error
   def acquire do
-    if :ets.update_counter(@table, :count, 1) <= max() do
+    {:ok, _} = Registry.register(__MODULE__, @key, nil)
+
+    # Two callers racing for the last slot may both be refused, never both let in.
+    if Registry.count(__MODULE__) <= max() do
       :ok
     else
-      :ets.update_counter(@table, :count, -1)
+      release()
       :error
     end
   end
 
-  @doc "Releases a previously-acquired slot."
+  @doc "Releases the calling process's slot."
   @spec release() :: :ok
   def release do
-    :ets.update_counter(@table, :count, {2, -1, 0, 0})
-    :ok
+    Registry.unregister(__MODULE__, @key)
+  rescue
+    # A registry going down takes the slot with it; until its restart
+    # completes, the tables this deletes from may not exist.
+    ArgumentError -> :ok
   end
 
   @doc "Current number of active connections."
   @spec count() :: non_neg_integer()
-  def count do
-    case :ets.lookup(@table, :count) do
-      [{:count, n}] -> n
-      [] -> 0
-    end
-  end
+  def count, do: Registry.count(__MODULE__)
 end
