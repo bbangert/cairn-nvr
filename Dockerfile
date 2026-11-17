@@ -7,7 +7,7 @@
 #   rockchip — linux/arm64 only, the RK3566 add-on: sw decode, ORT CPU or
 #              the RKNN engine NIF (librknnrt is not in the image); the MPP
 #              and librga userspace is carried; only the probe binary's
-#              `--rk-probe` loads MPP yet, and nothing loads librga
+#              `--rk-probe` loads either yet
 # Rust artifacts and the Rockchip libraries cross-compile on the build host
 # (D-C3); the only compile under emulation is the BEAM release, because BEAM
 # bytecode is arch-neutral and ERTS comes from the arm64 hexpm image.
@@ -285,12 +285,12 @@ done > /opt/rockchip/licenses/drm-uapi-headers-NOTICE
 # A pin bump that reshapes a header must not quietly drop its notice.
 [ "$(grep -c 'Permission is hereby granted' /opt/rockchip/licenses/drm-uapi-headers-NOTICE)" = 5 ]
 
-# The board crate binds these exact names — the MPP list is every symbol
-# boards/cairn_rockchip/native/cairn_rockchip/src/mpp/sys.rs loads, the RGA
-# one what a later binding will. The ones C callers write (imcheck,
-# wrapbuffer_handle, mpp_buffer_get_fd, mpp_buffer_group_get_internal) are
-# macros or C++-mangled overloads, and importbuffer_fd has mangled overloads
-# beside the extern "C" one, so only an exact unmangled match counts.
+# The board crate binds these exact names — every symbol that
+# boards/cairn_rockchip/native/cairn_rockchip/src/mpp/sys.rs and
+# src/rga/sys.rs load. Names C callers write, such as wrapbuffer_handle or
+# mpp_buffer_get_fd, are macros, and importbuffer_fd and improcess have
+# C++-mangled overloads beside the extern "C" one, so only an exact
+# unmangled match counts.
 need() {
   lib=$1
   shift
@@ -299,7 +299,9 @@ need() {
       || { echo "$lib does not export $sym" >&2; exit 1; }
   done
 }
-need /opt/rockchip/lib/librga.so.2 imcheck_t wrapbuffer_handle_t importbuffer_fd
+need /opt/rockchip/lib/librga.so.2 \
+  importbuffer_fd releasebuffer_handle wrapbuffer_handle_t \
+  improcess imfill_t imStrError_t querystring
 need /opt/rockchip/lib/librockchip_mpp.so.1 \
   mpp_create mpp_init mpp_destroy \
   mpp_packet_init mpp_packet_set_pts mpp_packet_set_eos mpp_packet_deinit \

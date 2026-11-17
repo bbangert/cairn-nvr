@@ -182,6 +182,7 @@ dependencies = [
  "anyhow",
  "cairn-detect",
  "cairn-ort",
+ "libc",
  "libloading 0.8.9",
  "rustler",
  "serde_json",
