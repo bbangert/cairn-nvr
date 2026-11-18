@@ -194,8 +194,8 @@ mod tests {
     /// The only test here that touches the environment, and `rknn`'s own tests
     /// never read it (they load stubs through `RknnBackend::with_library`).
     /// The path `init` is handed wins over the process's variable, which in the
-    /// VM never holds what `Cairn.Artifacts` set; `None` does not consult it
-    /// either, and outside `with_runtime` it is what is read.
+    /// VM never holds what the base's artifact store set; `None` does not
+    /// consult it either, and outside `with_runtime` it is what is read.
     #[test]
     fn a_missing_runtime_is_a_model_load_term() {
         let library = "/does/not/exist/librknnrt.so";

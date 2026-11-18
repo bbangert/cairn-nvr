@@ -71,7 +71,7 @@ release.
 - The **grid/stride decode is not folded in**: `x, y` are offsets inside the
   anchor's own grid cell and `w, h` are log extents, both relative to the
   cell's stride. Objectness and the class scores *are* sigmoided in the
-  graph. The plugin does the decode (`grid_objectness` in `src/infer.rs`);
+  graph. The plugin does the decode (`grid_objectness` in `src/infer/heads.rs`);
   `verify_models.py` mirrors it.
 - **opset 11** (the 0.1.1rc0 release export). This decides whether per-channel
   weight quantization is available: it emits a `DequantizeLinear` carrying an
@@ -93,9 +93,10 @@ python3 -c "import sys; sys.path.insert(0,'.'); \
 Preprocessing must match the plugin exactly, and **it is per family, resize
 policy included**. The plugin composes it from the resolved profile —
 `InputSpec { size, encoding, resize, .. }` in `plugins/cairn-detect/src/infer/profile.rs`,
-applied by `ResizePolicy::fit` and `pack` in `src/decode.rs`, with the
-per-family channel order and scale in `TensorEncoding::packing`. The scripts
-mirror that table in `quantize_model.PROFILES`:
+applied by `ResizePolicy::fit` in `src/infer/geometry.rs` and `pack` in
+`src/decode.rs`, with the per-family channel order and scale in
+`TensorEncoding::packing`. The scripts mirror that table in
+`quantize_model.PROFILES`:
 
 | layout | channel order | scale | resize |
 |---|---|---|---|
@@ -266,7 +267,7 @@ See `verify_models.py` for the full script. It:
 - asserts input/output names + shapes are identical between FP32 and INT8
 - runs both models on the same 10 held-out frames (disjoint clips from
   calibration; `--frames-dir heldout10`), decodes detections with score >= 0.5 through the layout's
-  own decode path (mirroring `src/infer.rs`, including the yolox grid/stride
+  own decode path (mirroring `src/infer/heads.rs`, including the yolox grid/stride
   decode and `objectness × class_score`), greedy-matches FP32 vs INT8
   detections by same class + IoU > 0.5, and reports per-frame labels/scores
   side by side plus an aggregate match rate and mean absolute score delta on

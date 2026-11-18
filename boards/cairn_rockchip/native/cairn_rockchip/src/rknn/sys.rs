@@ -4,9 +4,10 @@
 //! `offset_of!` assertions. Rockchip's header is not in the repo and is
 //! never to be copied in.
 //!
-//! No board script declares the prototype of `rknn_create_mem_from_fd` or
-//! the value of [`MEM_SYNC_FROM_DEVICE`]; only the probe's `--infer` calls
-//! them.
+//! No board script declares the prototype of `rknn_create_mem_from_fd`, and
+//! `zc.py` passes [`MEM_SYNC_FROM_DEVICE`]'s value only for an output mem;
+//! the probe's `--infer` is the one caller of either here, and ran both on
+//! the board.
 //!
 //! The library is opened with `dlopen` at [`Library::load`], never linked: a
 //! build host has no librknnrt, and a board that lacks it should fail on the
@@ -38,8 +39,8 @@ pub const QUERY_OUTPUT_ATTR: c_int = 2;
 pub const QUERY_SDK_VERSION: c_int = 5;
 pub const QUERY_NATIVE_INPUT_ATTR: c_int = 8;
 
-/// `rknn_mem_sync` directions. `zcin.py` ran to-device on the board;
-/// from-device is the public API's value, not run on a board before.
+/// `rknn_mem_sync` directions. The probe's `--infer --sync` ran both on an
+/// input mem on the board.
 pub const MEM_SYNC_TO_DEVICE: c_int = 1;
 pub const MEM_SYNC_FROM_DEVICE: c_int = 2;
 
@@ -248,7 +249,7 @@ pub struct MemApi {
 /// The entry points this crate calls. The runtime is never unloaded, so they
 /// stay valid for the process: a `dlclose` under whatever threads and exit
 /// handlers a vendor runtime leaves behind risks a crash at exit that would
-/// hide the plugin's own exit status.
+/// hide the probe's own exit status, or take the node down with it.
 pub struct Library {
     pub(super) init: InitFn,
     pub(super) destroy: DestroyFn,
@@ -322,10 +323,11 @@ mod tests {
         assert!(msg.contains("/nonexistent/librknnrt.so"), "{msg}");
     }
 
-    /// A real library that is not the runtime fails on the first symbol
-    /// looked up, by name.
+    /// A real library that is not the runtime fails on the first required
+    /// symbol, by name: the mem entry points are looked up before it, and
+    /// their absence is kept, not raised.
     #[test]
-    fn a_library_without_the_symbols_names_the_first_missing_one() {
+    fn a_library_without_the_symbols_names_the_first_required_one() {
         let msg = load_err("libm.so.6");
         assert!(msg.contains("has no rknn_init"), "{msg}");
     }

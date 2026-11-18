@@ -243,11 +243,13 @@ const QNN_EP: &str = "QNNExecutionProvider";
 /// The one process-wide QNN plugin registration.
 ///
 /// `RegisterExecutionProviderLibrary` is an environment-level call and refuses
-/// a name it already knows, while this process opens up to two sessions that
-/// want it (detector and, later, embedder). First open registers and records
-/// the path; every later open checks it asked for the same library. A failed
-/// registration is also cached — fine here, because a failed `Detector::open`
-/// exits the process while the operator is still watching.
+/// a name it already knows, while a process can open more than one qnn
+/// detector (the VM opens one per engine reload). First open registers and
+/// records the path; every later open checks it asked for the same library.
+/// The result, failure included, is cached for the life of the process. In the
+/// binary a failed open then exits; in the VM a failed registration, or the
+/// first library path, stays in effect for every reload until the node
+/// restarts.
 static QNN_LIBRARY: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
 
 fn register_qnn_library(library: &Path) -> Result<()> {

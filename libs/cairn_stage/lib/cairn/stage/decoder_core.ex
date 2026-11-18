@@ -222,8 +222,9 @@ defmodule Cairn.Stage.DecoderCore do
     end
   end
 
-  # `:closed` never counts: the host closes every handle on an engine reload,
-  # and reloads in a row are an operator editing config.
+  # `:closed` never counts. A decoder answers it only after its own close, and
+  # this core issues that only as it lets the handle go, so no handle it still
+  # holds reports one: the exclusion is a guard nothing reaches today.
   defp fatal(core, guard, reason, message) do
     failed = if reason == :closed, do: core.failed, else: core.failed + 1
 

@@ -16,8 +16,8 @@ jobs:
     name: Compile · Format
     runs-on: ubuntu-latest
     # Elixir gates run as parallel jobs below, each with its own cache key.
-    # The Rust plugin is a separate crate with its own toolchain and its own
-    # gates — see the `cairn-detect` job below.
+    # The Rust crates have their own toolchain and their own gates — see the
+    # `cairn-detect` job below.
 
     steps:
       - uses: actions/checkout@v7
@@ -226,7 +226,7 @@ jobs:
           test/cairn/camera_tracker_recorder_test.exs
           test/cairn/camera_tracker_restore_test.exs
           test/cairn/event_extractor_test.exs
-          test/cairn/reconnect_integration_test.exs
+          test/cairn/pipeline/reconnect_integration_test.exs
           test/cairn/native/
           test/cairn/config_server_test.exs
           test/cairn/config_server_update_test.exs
@@ -496,10 +496,10 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-      # cairn-native and cairn-ort, same gates. Their end-to-end clip tests need model
-      # artifacts CI does not carry, and the harness's sanctioned waiver is the
-      # env var — a test that silently skipped would be indistinguishable from
-      # one that passed, so the waiver has to be explicit here.
+      # cairn-native and cairn-ort, same gates. cairn-native's end-to-end clip
+      # tests need model artifacts CI does not carry, and its sanctioned waiver
+      # is the env var — a test that silently skipped would be indistinguishable
+      # from one that passed, so the waiver has to be explicit here.
       - run: cargo fmt --check
         working-directory: plugins/cairn-native
 

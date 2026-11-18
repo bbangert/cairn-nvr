@@ -4,7 +4,7 @@ Static INT8 quantization of a cairn-detect ONNX model.
 
 Model-agnostic on purpose: the geometry, the input tensor name and the
 preprocessing convention are all read out of the model, the same way the
-plugin reads them (see plugins/cairn-detect/src/infer.rs). Nothing here
+plugin reads them (see plugins/cairn-detect/src/infer/). Nothing here
 installs or imports a model vendor's package — onnx, onnxruntime, numpy and
 Pillow are the whole dependency list, all permissively licensed.
 
@@ -14,7 +14,7 @@ weights are AGPL-3.0 and this repository does not ship or fetch them.
 
 Preprocessing MUST match the inference plugin exactly, which means it depends
 on the model family. The families and their preprocessing are in PROFILES
-below, mirroring ModelProfile in src/infer.rs:
+below, mirroring the ModelProfile rows in src/infer/catalog.rs:
 
   - yolox:            BGR in 0..255, letterboxed (aspect preserved, pad 114)
   - yolov10 / yolov8: RGB scaled to 0..1, stretched to the model's own HxW
@@ -62,14 +62,15 @@ from onnxruntime.quantization.shape_inference import quant_pre_process
 # allocation: 64 Mpx is twice an 8K frame and far past anything a camera emits.
 Image.MAX_IMAGE_PIXELS = 64 * 1024 * 1024
 
-# The FPN strides a yolox head emits anchors for. Mirrors YOLOX_STRIDES in
-# src/infer.rs; the anchor count they imply is what identifies the layout.
+# The FPN strides a yolox head emits anchors for. Mirrors the `YOLOX` profile's
+# strides in src/infer/catalog.rs; the anchor count they imply is what
+# identifies the layout.
 YOLOX_STRIDES = (8, 16, 32)
 
-# The input half of each ModelProfile in src/infer.rs. Encoding and resize
-# policy travel together because they are both properties of how the family
-# was trained, and calibrating under either one wrong measures activation
-# ranges for a model nobody is deploying.
+# The input half of each ModelProfile in src/infer/catalog.rs. Encoding and
+# resize policy travel together because they are both properties of how the
+# family was trained, and calibrating under either one wrong measures
+# activation ranges for a model nobody is deploying.
 #
 # Kept in step with `YOLOX.input` / `YOLOV10.input` / `YOLOV8.input` there.
 # RF-DETR is deliberately absent: its layout is not one `describe` reads and
@@ -102,8 +103,9 @@ def yolox_anchors(width: int, height: int) -> int:
 
 
 def scaled_dim(side: int, ratio: float, limit: int) -> int:
-    """A letterboxed side length. Mirrors `scaled_dim` in src/infer.rs:
-    floor(side * ratio), forced even, clamped into 1..=limit."""
+    """A letterboxed side length. Mirrors `scaled_dim` in
+    src/infer/geometry.rs: floor(side * ratio), forced even, clamped into
+    1..=limit."""
     scaled = max(0, int(math.floor(side * ratio)))
     even = (min(scaled, limit) // 2) * 2
     return max(1, min(limit, max(2, even)))
@@ -112,9 +114,9 @@ def scaled_dim(side: int, ratio: float, limit: int) -> int:
 def content_size(source, width: int, height: int, resize: str):
     """Where a `source`-sized frame lands inside a width x height tensor.
 
-    Mirrors `ResizePolicy::fit` in src/infer.rs. The content always sits at
-    the top-left and the padding lands bottom-right, which is what YOLOX's own
-    `preproc` does (`padded_img[: int(h*r), : int(w*r)] = resized`).
+    Mirrors `ResizePolicy::fit` in src/infer/geometry.rs. The content always
+    sits at the top-left and the padding lands bottom-right, which is what
+    YOLOX's own `preproc` does (`padded_img[: int(h*r), : int(w*r)] = resized`).
     """
     if resize != "letterbox":
         return width, height

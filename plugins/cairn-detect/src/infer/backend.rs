@@ -80,14 +80,15 @@ impl BackendKind {
     ///
     /// Static because profile validation on the Elixir side has to answer the
     /// same questions at config load, with no plugin running and possibly no
-    /// such hardware attached. `Cairn.Board.Generic.backends/0` mirrors all
-    /// three columns of this table: `fused_nms` feeds `Cairn.Config.Profile`'s
-    /// `check_capabilities` rule, `artifact` picks the
-    /// `model:` key a profile is read by, and `dynamic_shapes` is mirrored but
-    /// read by no rule on either side (an `input_size:` disagreeing with a
+    /// such hardware attached. Each board's `backends/0` mirrors the rows of
+    /// this table for the backends it runs (`Cairn.Board.Generic`: `ort` and
+    /// `qnn`; `Cairn.Rockchip.Board`: `ort` and `rknn`): `fused_nms` feeds
+    /// `Cairn.Config.Profile`'s `check_capabilities` rule, `artifact` picks
+    /// the `model:` key a profile is read by, and `dynamic_shapes` is mirrored
+    /// but read by no rule on either side (an `input_size:` disagreeing with a
     /// compiled artifact is a fact about a file the host cannot open — the
-    /// authoring guide carries it instead). Both copies are claims about the
-    /// runtime, not observations of it — see the per-row notes for which are
+    /// authoring guide carries it instead). Every copy is a claim about the
+    /// runtime, not an observation of it — see the per-row notes for which are
     /// established and which are conservative readings.
     pub(super) fn capabilities(self) -> Capabilities {
         match self {

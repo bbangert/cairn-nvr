@@ -227,9 +227,10 @@ venv/bin/python -I parity.py yolox_s_640_i8 yolox
 
 Probes that ran on the Green during bring-up, with the board's `python3` and
 numpy and nothing from the toolkit. Each prints `JSON:`-prefixed records, and
-`results/` holds what they printed; the other lines there (`DONE`,
-`[exit 0]`, `:ok`, a checksum) come from the commands around them. The models
-were trial builds, not the pinned rungs.
+`results/` holds what they printed; the other lines there come from the
+commands around them (`DONE`, `[exit 0]`, `:ok`, a checksum) or, in `m3.log`,
+from librknnrt's stderr and the shell reporting the segfault. The models were trial
+builds, not the pinned rungs.
 
 - `rk.py` is a ctypes harness over librknnrt: `info`, `bench` (200 timed
   calls, then 60 s sustained with NPU load, temperature and free memory
@@ -253,7 +254,8 @@ were trial builds, not the pinned rungs.
   finishing in order, 2.2 s apart, so each waited on a full pipe: read those
   aggregate rates as a floor. The 2560x1920 pair finished together.
 - `syms.py` checks the exported symbols of librknnrt, librga and
-  librockchip_mpp against the calls a board library makes. No log is kept.
+  librockchip_mpp against a list of calls a board library might make, drawn up
+  before one was written. No log is kept.
 - `cpu_ort.py` times ONNX Runtime on the CPU, for the NPU's margin over it.
   It has not been run on the board.
 

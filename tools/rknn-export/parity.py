@@ -5,9 +5,9 @@ KIND: split (airockchip triples) | yolox (N,85 obj*cls) | v8 (4+nc,A) | v8t (A,4
 yolox/split are scored by Acc (also used in-process by convert.py); the rest
 by the trial's per-frame loop below. Acc pools counts over frames, never
 averaging per frame, so a frame with one positive weighs one positive. The
-trial kinds (legacy: v8/v8t/e2e/generic) print per-frame means: n_ref is
-averaged over frames that have a positive, n_sim over all frames, so those two
-lines are not comparable.
+trial kinds (legacy: v8/v8t/e2e/generic) print per-frame means. For v8/v8t,
+n_ref is averaged over frames that have a positive and n_sim over all frames,
+so those two are not comparable; e2e averages both over all frames.
 Positive = FP32 best-class score >= THR; recall = share of those the sim also scores >= THR."""
 import json, os, re, sys
 import numpy as np

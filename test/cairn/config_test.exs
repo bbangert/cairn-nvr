@@ -13,7 +13,7 @@ defmodule Cairn.ConfigTest do
       do: %{backends: %{"qnn" => "no /dev/fastrpc"}, decoders: %{"vaapi" => "no /dev/dri"}}
   end
 
-  # The Rockchip board's preflight when its NIF did not load.
+  # The Rockchip board's NIF-failure reason, on a backend the generic menu has.
   defmodule NifBoard do
     def name, do: "nif"
     def profiles_dir, do: "test/support/fixtures/profiles/board"
@@ -3443,7 +3443,7 @@ defmodule Cairn.ConfigTest do
       assert Config.max_unseen_ms(config, cam_a) == 800
       assert Config.max_unseen_ms(config, cam_b) == 5_000
 
-      # the ports hand the camera tracker windows and tracking as one map
+      # the pipeline owner hands the camera tracker windows and tracking as one map
       assert Config.policy(config, cam_a) == %{
                pre: 5,
                post: 10,

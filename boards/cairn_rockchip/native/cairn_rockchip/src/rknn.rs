@@ -11,8 +11,9 @@
 //! is the proof of the runtime.
 //!
 //! The steps [`Backend::run`] is made of, and the input mems
-//! ([`RknnBackend::bind_input`]), are public for the probe's `--infer`;
-//! nothing in the NIF calls them.
+//! ([`RknnBackend::bind_input`]), are public for the probe's `--infer`, which
+//! times them one by one; the NIF reaches the steps only through
+//! [`Backend::run`] and never binds an input mem.
 //!
 //! The artifact folds its normalisation and quantisation in, so it takes the
 //! frame's own bytes ([`InputElement::U8Pixels`]), NHWC; the runtime hands

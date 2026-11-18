@@ -17,9 +17,9 @@ name: Container
 #    settings → packages).
 #
 # Actions are pinned to commit SHAs: the publish job holds the registry
-# token, and a mutable tag there would be the one unpinned link in an
-# otherwise sha256-pinned supply chain (Dockerfile artifacts, fastrpc
-# commit).
+# token, and that holds its steps to the standard of the Dockerfile's
+# sha256-pinned downloads and fastrpc commit. (The Dockerfile's base images
+# are pulled by tag.)
 
 on:
   pull_request:

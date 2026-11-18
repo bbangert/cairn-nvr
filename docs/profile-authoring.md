@@ -161,8 +161,8 @@ with detection configured on the node (N — the count of configured
 cameras, never the runtime detection toggle) and resolves the first rung
 whose budget covers N at the tier's floor rate. A small fleet gets the
 most accurate model the board can afford; a growing one walks down the
-ladder; nobody configures a model, ever. `qcs6490-tier1.yml` is the
-shipped worked example.
+ladder; nobody configures a model, ever. Each board's release ships one:
+`qcs6490-tier1.yml` in the generic release, `rk3566-tier1.yml` in Rockchip's.
 
 ```yaml
 tier: 1                        # required — the floor rate is the tier's
@@ -204,8 +204,8 @@ The rules, each refused or warned at load:
   were measured on. A fleet on substreams at a different rate shifts the
   effective rates; the budgets assume 15.
 * **`supported_cameras:` is a claim and a bound.** It is the camera count
-  the file stands behind (measured, soak-checked provenance in the file's
-  comments), and a fleet past it is refused at load even when a rung's
+  the file stands behind (its comments say on what: a boundary measurement,
+  a soak), and a fleet past it is refused at load even when a rung's
   budget would cover it — capacity arithmetic does not extend a claim
   nobody verified.
 * **The Apache-complete invariant (D-L2).** Rungs marked `pack:` name
@@ -292,9 +292,12 @@ if that is all there is". The distinction is worth the refusal on a board: on
 QCS6490 the ASIC decodes the whole fleet for about 2% CPU where software decode
 costs several times that per camera — decode is the term this knob controls;
 the scale/convert after it is paid on both paths — and before this a profile
-naming `v4l2` on a box without it just quietly ran the software decoder. The external plugin still falls back instead of
-refusing, because there its refusal would be a process exit into a restart loop;
-that half goes away with the plugin path itself.
+naming `v4l2` on a box without it just quietly ran the software decoder. On
+RK3566 that fallback would not even carry the fleet: software decode of one
+15 fps substream ran at the edge of keeping up on the HA Green. A board that
+knows its devices also says so at
+config load: the Rockchip board warns when a profile names `rkmpp` and
+`/dev/mpp_service`, `/dev/rga` or `/dev/dma_heap/system` is missing.
 
 `labels:` is indexed positionally, so the file has to match the family's class
 space: 80 lines for yolox and the Ultralytics families, 91 for rfdetr, which
@@ -315,12 +318,12 @@ runs the gates, the parity harness and the accuracy work, and it never gets a
 measured band, because nothing ships there and a number from it would describe
 hardware no deployment has. That is why `generic-ort.yml` — a migration alias
 rather than a hardware class — keeps a declared `[5, 5]` and is expected to keep
-it. Measured bands come from the RK3576 and RK3566 profiles, each on its own
-board, with the cpufreq governor pinned and recorded (see
-`docs/npu-backends.md` on why an unpinned governor makes a plausible-looking
-wrong number). The QCS6490 has no band to measure any more: its ladder file
-derives the rate per rung, and what it owes measurement instead is each
-rung's `engine_budget` (D-L6).
+it. Neither board file has a band to measure: both are ladders, which derive
+the rate per rung, and what a ladder owes measurement instead is each rung's
+`engine_budget` (D-L6). A measurement records the cpufreq governor it ran
+under: on QCS6490 the default one makes a plausible-looking wrong number
+(`docs/npu-backends.md`), and RK3566's budgets were taken under the governors
+as found.
 
 `sample_fps` is optional, and **the band validates it, the band never emits
 it** (D-P4): leave `sample_fps:` unset and no `--sample-fps` flag is written
@@ -451,7 +454,7 @@ Two rules come out of it, both from `docs/npu-backends.md`:
    FP16 is not a way around it. The backend opens INT8 artifacts only and
    refuses an FP16 build at load; the FP16 results above come from the
    bench harness, where FP16 also ran about three times slower than INT8
-   end to end on the two models timed both ways (yolox_s, yolox_tiny).
+   end to end (yolox_s at 640: 310 ms a frame against 101).
    `tools/rknn-export/README.md` in the source tree has the measurements.
 
 Both rules need a family to read. A profile that leaves `model_profile:` unset
@@ -473,11 +476,13 @@ contexts of one model do overlap on the RK3566
 profile can ask for: if an rk3566 budget looks achievable only by overlapping
 inferences, it is not achievable.
 
-**A fixed-geometry artifact pins `input_size:` and nothing here can check
-it.** Both NPU backends compile the model at one input geometry, so an
-`input_size:` that disagrees with the compiled artifact is wrong in a way the
-host cannot detect: it cannot open an `.rknn` to look. Set it to the geometry
-you converted at. On `ort` the same field means something looser — RF-DETR
+**A fixed-geometry artifact pins `input_size:` and config load cannot
+check it.** Both NPU backends compile the model at one input geometry, so an
+`input_size:` that disagrees with the compiled artifact is wrong in a way
+config load cannot detect: it cannot open an `.rknn` to look. The engine can:
+its probe-load refuses a model whose own shape contradicts the size it was
+given, after the config has loaded, and no camera detects. Set it
+to the geometry you converted at. On `ort` the same field means something looser — RF-DETR
 exports leave their spatial axes dynamic, which is why `rfdetr` needs an
 explicit `--input-size` and why the plugin refuses to guess one.
 
@@ -580,10 +585,13 @@ channel to refuse one at runtime.
 
 ## Contributing a board profile
 
-**A new board needs no code change.** Write the file, drop it in a
+**A profile needs no code change** when the release's board already offers
+the decoder and backend it names. Write the file, drop it in a
 `profile_dirs:` directory, restart or hit Reload. Everything the file names is
 already in the code: if it loads, every value in it is one cairn implements. If
-it does not load, the error says which value is not.
+it does not load, the error says which value is not. A SoC whose decoder or
+NPU runtime the code does not have needs a board library first — RK3566
+needed `boards/cairn_rockchip` — and `docs/architecture.md` says what one is.
 
 The path into the repo is the same file: if the board is one others will meet,
 open a PR adding it to `priv/profiles/` or its board's own directory — that is
@@ -601,7 +609,8 @@ about whether the code can run it. Follow what the shipped ones do:
   it came from) and mark the file DRAFT while any NON-pack budget is
   provisional — the test suite refuses a shipped ladder without the notes
   (D-L6; pack rungs keep provisional notes until their packs ship).
-  `qcs6490-tier1.yml` is the worked example.
+  `rk3566-tier1.yml` is the worked example: both budgets measured, each
+  note naming its runs.
 
 Changing a *shipped* profile is a behaviour change for everyone running that
 board. Adding a comment or correcting a band is cheap; changing a stage set

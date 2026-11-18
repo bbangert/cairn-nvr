@@ -79,7 +79,7 @@ defmodule Cairn.CairnOrtStub do
 
     case control(:cpu_baseline_ms, nil) do
       fun when is_function(fun, 2) -> fun.(config, passes)
-      # a plausible CPU p50 for a nano detector: what a real board measures here
+      # an arbitrary CPU p50: the host measures through the canary, never here
       nil -> {:ok, 45.0}
       result -> result
     end

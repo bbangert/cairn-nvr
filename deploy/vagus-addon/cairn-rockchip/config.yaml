@@ -23,7 +23,7 @@ init: false
 # mapping).
 host_network: true
 # MPP picks its codec table by matching /proc/device-tree/compatible; without
-# it MPP registers no codec and the RKNN runtime fails to init.
+# it MPP registers no codec. RKNN opens either way.
 devicetree: true
 devices:
   # The hardware video decoder (MPP).

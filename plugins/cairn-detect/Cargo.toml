@@ -32,17 +32,17 @@ khronos-egl = { version = "=6.0.0", features = ["dynamic"], optional = true }
 glow = { version = "=0.18.0", optional = true }
 
 [features]
-# Board (aarch64) builds: dlopen libonnxruntime.so at runtime (`ORT_DYLIB_PATH`)
-# instead of statically linking ort's downloaded x86 archive. What ships to the
-# board is then the exact base ORT the QNN spike proved against the plugin EP
-# (`tools/qnn-spike/README.md`'s version triple), and cross-linking needs no
-# ORT libs at all. Dev and CI builds stay on the default static link — the QNN
-# code paths compile either way.
+# Container builds, both arches: dlopen libonnxruntime.so at runtime
+# (`ORT_DYLIB_PATH`) instead of statically linking ort's downloaded archive.
+# What ships to the board is then the exact base ORT the QNN spike proved
+# against the plugin EP (`tools/qnn-spike/README.md`'s version triple), and
+# cross-linking needs no ORT libs at all. Dev builds and the CI gates stay on
+# the default static link — the QNN code paths compile either way.
 ort-load-dynamic = ["ort/load-dynamic"]
 # The GPU NV12 scaler (`glscale`), for boards whose decoder hands back system
-# memory (v4l2m2m — see `hwdecode`'s module doc). Off by default: CI and x86
-# dev builds have no GPU to exercise it against, and the module's only
-# consumers are aarch64 board builds.
+# memory (v4l2m2m — see `hwdecode`'s module doc). Off by default, and off in the
+# container builds (`tools/container/build-rust-aarch64.sh` says why): CI and
+# x86 dev builds have no GPU to exercise it against.
 gles = ["dep:khronos-egl", "dep:glow"]
 
 [profile.release]

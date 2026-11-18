@@ -56,7 +56,7 @@ without an adequate HTP detection (11%, against the 10% allowance).
 | yolov8n-qdq-a16 | 0.995 FAIL | 0.989 | 0.995 |
 
 (Values are the person-window median per-frame ratio, HTP vs the same
-artifact on the CPU EP, misses counted as zeros. a8 rungs read 3–18% hot on the HTP — the EP's
+artifact on the CPU EP, misses counted as zeros. a8 rungs read up to 18% hot on the HTP — the EP's
 8-bit sigmoid qparam vs the graph's pinned 1/256; floors tuned on a16
 are conservative on a8.)
 

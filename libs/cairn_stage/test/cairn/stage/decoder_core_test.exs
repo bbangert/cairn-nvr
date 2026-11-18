@@ -159,7 +159,7 @@ defmodule Cairn.Stage.DecoderCoreTest do
 
     core = declare(core(), g) |> feed_all.(0..1, {:poisoned, "bad"})
     Process.delete(:decode)
-    core = core |> feed!(g, 2) |> feed_all.(3..5, {:closed, "reload"})
+    core = core |> feed!(g, 2) |> feed_all.(3..5, {:closed, "closed"})
     core = feed_all.(core, 6..7, {:poisoned, "bad"})
     assert core.decoder == :closed
     refute_received {:refused, _}

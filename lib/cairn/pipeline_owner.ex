@@ -442,9 +442,11 @@ defmodule Cairn.PipelineOwner do
 
   defp stop_pipeline(state) do
     Process.demonitor(state.pipeline_ref, [:flush])
-    # force?: a wedged element must not block the rebuild path; the pipeline
-    # holds no OS resources, so a hard kill leaks nothing. The stale-registry
-    # wait lives in `start_pipeline/2`, where it also covers the crash path.
+    # force?: a wedged element must not block the rebuild path. What the
+    # pipeline holds natively (decoder handles, inference streams, sockets) is
+    # released by resource destructors and resource guards when its processes
+    # die, so a hard kill leaks nothing. The stale-registry wait lives in
+    # `start_pipeline/2`, where it also covers the crash path.
     Membrane.Pipeline.terminate(state.pipeline, timeout: 5_000, force?: true)
     %{state | pipeline: nil, pipeline_ref: nil}
   end

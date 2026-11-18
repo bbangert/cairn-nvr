@@ -39,13 +39,11 @@ defmodule Cairn.Config do
   # that was parked there and to nothing else. Both constants live in
   # `Cairn.Tracker`; they are a pair, and neither is config.
   @default_max_unseen_ms 3_000
-  # How many tracks one camera may hold live at once. The tracker lives in that
-  # camera's own `Cairn.CameraTracker` and a plugin picks its own track ids, so
-  # this is what stops one camera's plugin from growing that process without
-  # bound — the per-camera split keeps the memory off its neighbours, and this
-  # keeps it off the node. Large
-  # enough for a crowded scene at 64 objects per frame; small enough that a
-  # hostile plugin cannot mint its way out of memory.
+  # How many tracks one camera may hold live at once. The tracker is that
+  # camera's `Membrane.MOTTracker` element and mints every identity itself, so
+  # this is what bounds it — the per-camera split keeps the memory off its
+  # neighbours, and this keeps it off the node. Large enough for a crowded
+  # scene at the engine's 32 detections per frame.
   @default_max_live_tracks 128
   # How long an object must hold still, in *media* time, before it counts as
   # stationary. Long enough that someone standing at a door or a car waiting
@@ -926,7 +924,7 @@ defmodule Cairn.Config do
   # detection toggle, which must not re-resolve anything (capacity sizes for
   # the configured fleet; no flapping). A source may pass `fleet_count:` to
   # hold N above that count; the option can only raise N, never lower it —
-  # see where it is read below. Runs before `resolve_profiles/2` so the
+  # see where it is read below. Runs before `resolve_profiles/4` so the
   # structs it lowers are the ones the groups get, and only for profiles some
   # CAMERA detects on — not merely ones a group names: a spare group defined
   # but used by no camera runs nothing, and resolving its ladder against a
@@ -943,7 +941,7 @@ defmodule Cairn.Config do
   # restart-class comparison (D-L5).
   defp resolve_ladders(config, acc, opts) do
     # Group name → profile name; groups still hold name strings here
-    # (`resolve_profiles/2` runs after this pass).
+    # (`resolve_profiles/4` runs after this pass).
     by_group =
       Map.new(config.plugin_groups, fn
         %PluginGroup{name: group, profile: profile} when is_binary(profile) -> {group, profile}
@@ -1058,9 +1056,10 @@ defmodule Cairn.Config do
     # supported_cameras, and the Apache-complete invariant guarantees the
     # largest non-pack budget covers the claim, so for n inside it a rung
     # always fits. Kept against arithmetic drift rather than reachability.
-    # Budgets increase down the list, so the last candidate is the largest;
-    # D-L2 guarantees candidates is non-empty (a non-pack rung always is one).
-    {largest, _index} = List.last(candidates)
+    # `max_by`, not the last candidate: an installed pack rung can budget more
+    # than the non-pack rung below it. D-L2 guarantees candidates is non-empty
+    # (a non-pack rung always is one).
+    {largest, _index} = Enum.max_by(candidates, fn {rung, _index} -> rung.engine_budget end)
     floor_rate = Profile.effective_rate(floor.floor_fps)
 
     "profile #{profile.name}: no ladder rung covers #{n} cameras at tier " <>
@@ -1633,8 +1632,8 @@ defmodule Cairn.Config do
     Enum.reduce(dups, acc, &add_error(&2, "duplicate camera id: #{&1}"))
   end
 
-  # Group names and camera ids share the `plugin-{name}.log` namespace, so
-  # they must not collide.
+  # Group names and camera ids share no namespace. The collision check stays
+  # because dropping it would accept configs earlier releases refuse.
   defp validate_plugins(acc, config) do
     camera_ids = MapSet.new(config.cameras, & &1.id)
     # Names are keys of the plugins: mapping, so they are unique by
@@ -1678,11 +1677,11 @@ defmodule Cairn.Config do
   # above an hour a track outlives the epoch it belongs to. The live-track cap
   # is bounded only against nonsense — 1 is legal and means a scene of one
   # track plus an eviction per new object, which is an operator's choice to
-  # make; 10_000 is where it stops being a bound worth having, given a plugin
-  # may send 64 objects per line (`Cairn.PluginProtocol`). The stillness
-  # threshold is bounded the same way from above — beyond an hour it can never
-  # fire inside an epoch — and from below at a second, under which detector
-  # jitter, not the object, decides whether something is stationary.
+  # make; 10_000 is where it stops being a bound worth having, given the
+  # engine emits at most 32 detections per frame (`MAX_DETS`, infer/mod.rs). The
+  # stillness threshold is bounded the same way from above — beyond an hour it
+  # can never fire inside an epoch — and from below at a second, under which
+  # detector jitter, not the object, decides whether something is stationary.
   defp validate_tracking(acc, config) do
     acc
     |> validate_tracking_key(config, :max_unseen_ms, 100, 3_600_000)

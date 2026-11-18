@@ -947,9 +947,10 @@ fn iou(a: &ModelBox, b: &ModelBox) -> f64 {
 ///
 /// **What this declines is "a box the host would refuse", and nothing
 /// narrower.** The condition is the arithmetic below and only that: `w` or `h`
-/// rounds to 0, which `validate_det` on the host rejects outright since it
-/// requires `w > 0 and h > 0`. A box lying wholly in the letterbox pad clamps
-/// to a line and so satisfies it — that is the instance worth knowing about,
+/// rounds to 0, which the host rejects on both paths — the ndjson codec's
+/// `validate_det` and the in-VM `Cairn.Native.Observations` each require
+/// `w > 0 and h > 0`. A box lying wholly in the letterbox pad clamps to a
+/// line and so satisfies it — that is the instance worth knowing about,
 /// and the reason [`finish`] runs this ahead of [`nms`] — but it is not the
 /// only one. A box wholly outside the frame clamps to a line too, pad or no pad:
 /// reachable under [`super::geometry::ResizePolicy::Stretch`], where there is no
@@ -986,14 +987,16 @@ fn wire_bbox(bbox: NormBox) -> Option<[f64; 4]> {
 fn det_from(bbox: NormBox, score: f64, evidence: bool, label: String) -> Option<Det> {
     let bbox = wire_bbox(bbox)?;
     Some(Det {
-        // `--labels` is arbitrary user text and the host refuses a label it
-        // cannot print; shaping it here keeps the detection instead.
+        // `--labels` is arbitrary user text. The ndjson codec refuses a label
+        // it cannot print and the in-VM path relies on this call instead of
+        // checking; shaping it here keeps the detection either way.
         label: crate::emit::shape_label(&label),
-        // Same reason as `wire_bbox`'s clamp: the host's `validate_det`
-        // requires a 0..1 score and drops the whole detection otherwise, so a
-        // corrupt or badly-quantized export emitting 3.7 would lose a real
-        // detection rather than report an odd number. Non-finite scores are
-        // already rejected upstream, which is what makes `clamp` total here.
+        // The ndjson codec's `validate_det` requires a 0..1 score and drops the
+        // whole detection otherwise, and the in-VM path relies on this clamp
+        // instead of checking, so a corrupt or badly-quantized export emitting
+        // 3.7 reports an odd number rather than losing a real detection.
+        // Non-finite scores are already rejected upstream, which is what makes
+        // `clamp` total here.
         score: round_to(score.clamp(0.0, 1.0), 3),
         bbox,
         // A box the model found in the frame in hand. The other kind is minted
@@ -1311,9 +1314,9 @@ mod tests {
 
     #[test]
     fn an_out_of_range_score_is_clamped_rather_than_dropped_by_the_host() {
-        // The host's `validate_det` requires a 0..1 score and drops the whole
-        // detection otherwise, which is the one failure mode this module
-        // exists to prevent — same reason the bbox is clamped and the label
+        // The ndjson codec's `validate_det` requires a 0..1 score and drops the
+        // whole detection otherwise, and the in-VM path does not check but
+        // relies on this clamp — same reason the bbox is clamped and the label
         // shaped. A badly-quantized export emitting 3.7 is a real detection
         // reported oddly, not a detection to lose.
         let dets = v8(
@@ -2490,9 +2493,10 @@ mod tests {
         // Nothing else in this module reaches `shape_label`: every other test
         // decodes under names that are already clean, so the call is invisible
         // to all of them including the composed-tail ones. `--labels` is
-        // arbitrary user text and the host refuses a detection whose label it
-        // cannot print, so a dropped call here loses real detections with
-        // every other gate green.
+        // arbitrary user text: the ndjson codec refuses a detection whose label
+        // it cannot print, and the in-VM path does not check, so a dropped call
+        // here loses real detections or passes unprintable labels with every
+        // other gate green.
         let raw = "ca\u{7}r\n";
         let det = det_from(
             Projection::stretch(SQUARE).unproject(model_box(0.0, 0.0, 64.0, 64.0)),
@@ -3154,8 +3158,8 @@ mod tests {
     fn a_box_lying_wholly_in_the_letterbox_pad_is_dropped_not_emitted_flat() {
         // A box below the content area un-projects to a normalized `y` past
         // 1.0 — rows of frame that never held a pixel. Both corners clamp to
-        // 1.0, so `h` is exactly 0 and the host refuses the whole detection:
-        // `validate_det` requires `w > 0 and h > 0`. Emitting it anyway is not
+        // 1.0, so `h` is exactly 0 and the host refuses the whole detection on
+        // both paths: each requires `w > 0 and h > 0`. Emitting it anyway is not
         // merely useless — it consumes a `MAX_DETS` slot *ahead of*
         // `top_dets`'s truncate, so a pad-only ghost can displace a real
         // detection that would otherwise have been reported.
@@ -3244,11 +3248,12 @@ mod tests {
 
     #[test]
     fn an_anchor_with_nothing_to_choose_between_argmaxes_to_the_last_class() {
-        // `argmax` is `max_by`, which returns the *last* of several equal
-        // maxima. So an anchor whose class scores are all equal — every
-        // untouched anchor of a sparse tensor — comes out as the *highest*
-        // class id, not class 0. Which floor then drops it is decided by that
-        // last class, and reading it the intuitive way gets the wrong one.
+        // `argmax` keeps `max_by`'s rule that a tie goes to the *last* of
+        // several equal maxima. So an anchor whose class scores are all
+        // equal — every untouched anchor of a sparse tensor — comes out as the
+        // *highest* class id, not class 0. Which floor then drops it is
+        // decided by that last class, and reading it the intuitive way gets
+        // the wrong one.
         assert_eq!(
             argmax(NonZeroUsize::new(NC).unwrap(), |_| 0.0),
             (NC - 1, 0.0)

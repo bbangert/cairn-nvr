@@ -1,16 +1,16 @@
 defmodule Cairn.Native.Config do
   @moduledoc """
-  The two term shapes `cairn-native` decodes — per-VM model config for `init/1`
-  and per-stream scene config for `open_stream/3` — and the argv the same model
-  config becomes for the canary.
+  The two term shapes the engine library decodes — per-VM model config for
+  `CairnOrt.init/1` and per-stream scene config for `CairnOrt.open_stream/3` —
+  and the argv the same model config becomes for the canary.
 
   Every key has to be present in the term: rustler's `NifMap` decode fails on a
   missing one rather than defaulting it, so an absent value is spelled `nil`.
 
   Nothing here knows what a profile is: a hardware profile renders itself into
-  this vocabulary (`Cairn.Config.Profile.native_config/1`), the same fields it
-  renders as plugin argv, and callers that have no profile write the vocabulary
-  themselves (`backend: "qnn"`, `input_size: "640x352"`).
+  this vocabulary (`Cairn.Config.Profile.native_config/1`), and callers that
+  have no profile write the vocabulary themselves (`backend: "qnn"`,
+  `input_size: "640x352"`).
   """
 
   @model_defaults %{
@@ -52,8 +52,8 @@ defmodule Cairn.Native.Config do
     allow_label_mismatch: :boolean,
     embedder_model: {:optional, :string},
     decoder: :string,
-    # The crate's own range (`SAMPLE_FPS` in config.rs), checked twice because its
-    # check is on the far side of a decode that raises.
+    # The range `Cairn.Stage.SampleGate.new/1` requires and clap gives the
+    # canary's `--sample-fps`. No NIF reads this key.
     sample_fps: {:integer, 1..30},
     # The FP32 ONNX file `Cairn.Native.Host` measures the CPU baseline on when
     # the CPU cannot run `model`. Host-side only: the NIFs' map decode ignores
@@ -79,7 +79,7 @@ defmodule Cairn.Native.Config do
   @type t :: map()
 
   @doc """
-  A model config in the shape `Cairn.Native.init/1` decodes.
+  A model config in the shape `CairnOrt.init/1` decodes.
 
   An unknown key is an error: a misspelled `--backend` that silently kept the
   default would run every camera on the CPU and report nothing wrong.
@@ -107,7 +107,7 @@ defmodule Cairn.Native.Config do
   @spec default(:decoder | :backend) :: String.t()
   def default(key) when key in [:decoder, :backend], do: Map.fetch!(@model_defaults, key)
 
-  @doc "One stream's scene config, in the shape `Cairn.Native.open_stream/3` decodes."
+  @doc "One stream's scene config, in the shape `CairnOrt.open_stream/3` decodes."
   @spec stream_params(map() | keyword()) :: {:ok, t()} | {:error, String.t()}
   def stream_params(params) when is_map(params) or is_list(params) do
     given = Map.new(params)

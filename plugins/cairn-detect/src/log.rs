@@ -3,8 +3,8 @@
 //! In production stderr is a pipe or a redirect — `run_erl`, a journal socket,
 //! `> log 2>&1` — and writing to one from the frame path goes wrong two ways: a
 //! reader that is gone makes `eprintln!` panic on `EPIPE`, and one that is alive
-//! and not draining fills the pipe and blocks the write. In `cairn-native` the
-//! per-frame stages run under the shared model lock, so the first poisons a
+//! and not draining fills the pipe and blocks the write. In `cairn-ort` the
+//! per-frame model pass runs under the shared model lock, so the first poisons a
 //! session nothing recovers and the second stalls detection on every camera —
 //! which the host's health check, inferring from latency, reads as a wedged
 //! accelerator.
@@ -208,7 +208,7 @@ mod tests {
         (sink, permits, written)
     }
 
-    /// In `cairn-native` the caller is holding the shared model lock, so what it
+    /// In `cairn-ort` the caller is holding the shared model lock, so what it
     /// waits for, every camera waits for.
     #[test]
     fn handing_over_a_line_does_not_wait_for_the_writer() {

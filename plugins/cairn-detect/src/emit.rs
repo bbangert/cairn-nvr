@@ -1,4 +1,4 @@
-//! Protocol v1 ndjson writer (see `docs/plugin-contract.md`).
+//! Protocol v1 ndjson writer (see `docs/archive/plugin-contract.md`).
 //!
 //! Every line this module produces is a self-describing envelope —
 //! `{"spec":"cairn.plugin","version":1,"type":...}` — and stdout carries
@@ -23,8 +23,8 @@ use crate::note;
 /// Cairn drops any line longer than this, so a too-long line is a lost
 /// sample rather than a soft error — we shed detections to stay under it.
 ///
-/// This is the contract's framing bound (`docs/plugin-contract.md` §Framing):
-/// both host ports open the plugin with `{:line, 65_536}`.
+/// This is the contract's framing bound (`docs/archive/plugin-contract.md`
+/// §Framing): both host ports open the plugin with `{:line, 65_536}`.
 pub const MAX_LINE_BYTES: usize = 65_536;
 
 /// The host's `|pts| <= 2^62` bound. `av_rescale_q` saturates to `i64::MIN`
@@ -319,7 +319,7 @@ fn log_suppression(count: u64) -> bool {
 /// The seeds `dets` yields: what a sample the model did not run on may re-report.
 ///
 /// Both producers hold their seed memory by calling this — the ndjson path's
-/// [`CameraState::last_dets`] and `cairn-native`'s `Stream` — so the rule is one
+/// [`CameraState::last_dets`] and `cairn-ort`'s `Stream` — so the rule is one
 /// rule rather than two that happen to agree. Three things separate a seed from
 /// the detection it was copied from:
 ///

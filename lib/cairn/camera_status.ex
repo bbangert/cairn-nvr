@@ -139,7 +139,8 @@ defmodule Cairn.CameraStatus do
     :ets.insert(@table, {camera_id, info})
     # local_broadcast, not broadcast: the backing table is a node-local named
     # ETS table, so a remote subscriber could never read what it was told
-    # about — and plugin status arrives at line rate, one message per member.
+    # about — and detector status arrives once per `Cairn.Native.Status` poll
+    # per camera.
     Phoenix.PubSub.local_broadcast(Cairn.PubSub, @topic, {:camera_status, camera_id, info})
   end
 

@@ -18,7 +18,7 @@ flowchart TD
 
   ring["Ring buffer<br/><i>pre-window only</i>"]
   rtphub["RTP hub<br/><i>PubSub fan-out</i>"]
-  native["In-VM engine (Rust NIF)<br/><i>decode · motion gate · infer · Re-ID</i>"]
+  native["Detect chain (the board's elements)<br/><i>decode · scale · motion gate · infer · Re-ID</i>"]
 
   pubsub(["fragment PubSub"])
 
@@ -50,7 +50,7 @@ flowchart TD
 Three planes still meet only at well-defined boundaries, but they now share one VM:
 
 - **Encoded video plane.** One ingest session per camera delivers compressed H.264 into the camera's long-lived Membrane pipeline, which fans it out three ways without ever decoding for display: CMAF fragments to the ring, RTP packets to the WebRTC hub, encoded access units to the detect branch. Cairn is codec-copy end to end for everything a human watches.
-- **Inference plane.** The detect branch decodes and infers inside the node's own engine — `plugins/cairn-detect`'s stage library linked as the `cairn-native` NIF, running on dirty schedulers. Frames never leave the crate; what crosses the NIF boundary is compressed access units in and observation terms out.
+- **Inference plane.** The detect branch decodes and infers through native libraries the node loads, on dirty schedulers: a decode library and an engine library, both the board's choice (on the generic board `cairn-native` and `cairn-ort`, each linking `plugins/cairn-detect`'s stage library). Compressed access units go into the decoder, decoded frames pass between the branch's elements as buffer payloads (or, where a board keeps them on the device, as dma-buf leases), and observation terms come out of the engine.
 - **Event plane.** Detection aggregation, event lifecycle, and clip extraction consume from the other two via PubSub and produce files on disk.
 
 ## Ingest
@@ -72,18 +72,70 @@ Topology: source (`BridgeSource` or `RTSPDualStream.Source`) → TS demux (bridg
 
 1. **Recording branch**: `SessionCut` → CMAF muxer → `RingBufferSink`, shaping each segment into a `Cairn.Fragment` (pts from the segment's own `tfdt`, timescale from the init header, `keyframe?` = first sample is a sync sample). The muxer survives neither a session's pts reset nor an identical-SPS reconnect, so the gate ends its branch's stream on `StreamClosed` — which is also what flushes the muxer's held tail into the ring — and the owner links a fresh branch immediately.
 2. **RTP branch**: `SessionCut` → RFC 6184 payloader → in-process `push_packet/2` into `Cairn.RTPHub`. No sockets anywhere; per-session too, which is what gives each session its own ssrc.
-3. **Detect branch**: picker (backpressure, keep-newest depth-1, refuses to emit across a dropped-AU hole until the next IDR) → the board's chain (`Cairn.Pipeline.DetectChain`; on the generic board `Decoder` → the motion gate when the camera has one → `Inference`, one unit in flight between each pair, `Decoder` and `Inference` being the NIF call sites; on the Rockchip release with `decoder: rkmpp`, `DecodeScale` → `Download` in `Decoder`'s place) → `ObservationStamper` (the observation clock, and the per-batch tracking context resolved from config + the runtime overlay) → `Membrane.MOTTracker` (the generic tracker element hosting the core the config names — `Cairn.Tracker` by default) → `TrackSink` (tagged objects, lifecycle events and a checkpoint snapshot → `Cairn.Detect.Dispatch` → the camera's `CameraTracker`, which owns the event lifecycle and nothing else). Absent when the camera names no `plugin:`. Never per-session: the decoder's and inference's native state is the expensive half, and it is exactly what a reconnect must not cost — the epoch rides buffer metadata instead, and `Inference` reopens its stream when it changes.
+3. **Detect branch**: picker (backpressure, keep-newest depth-1, refuses to emit across a dropped-AU hole until the next IDR) → the board's chain (`Cairn.Pipeline.DetectChain`; on the generic board `Decoder` → the motion gate when the camera has one → `Inference`, one unit in flight between each pair, `Decoder` and `Inference` being the NIF call sites; on the Rockchip release with `decoder: rkmpp`, `DecodeScale` → `Download` in `Decoder`'s place, each a NIF call site as well) → `ObservationStamper` (the observation clock, and the per-batch tracking context resolved from config + the runtime overlay) → `Membrane.MOTTracker` (the generic tracker element hosting the core the config names — `Cairn.Tracker` by default) → `TrackSink` (tagged objects, lifecycle events and a checkpoint snapshot → `Cairn.Detect.Dispatch` → the camera's `CameraTracker`, which owns the event lifecycle and nothing else). Absent when the camera names no `plugin:`. Never per-session: the decoder's and inference's native state is the expensive half, and it is exactly what a reconnect must not cost — the epoch rides buffer metadata instead, and `Inference` reopens its stream when it changes.
 
 ## Detection: the in-VM engine
 
-`cairn-detect`'s stages (decode/hwdecode, motion gate, inference, Re-ID embedder) are one Rust library with two consumers: the standalone binary (used by the canary, the parity harness, and board benches) and the `cairn-native` Rustler NIF the node loads. They cannot diverge — same crate, same code.
+`cairn-detect`'s stages (decode/hwdecode, motion gate, inference, Re-ID embedder) are one Rust library with four consumers: the standalone binary (the generic board's canary, the parity harness, board benches), the `cairn-native` NIF that decodes, the `cairn-ort` NIF that infers, and the Rockchip board's crate. They cannot diverge — same crate, same code. The library's motion gate survives as the parity reference only: a live camera's gate is `Cairn.Pipeline.MotionGate`, an Nx element between decode and inference.
 
 - **One engine, one model per node.** Config load refuses groups whose profiles ask for different models. The engine's model config comes from the hardware profile the camera's `plugins:` group names.
 - **Dirty schedulers, errors as values.** Decode and inference entry points run on dirty schedulers; per-stream faults (decode errors, a failed inference) return as values and stay contained to that stream. `catch_unwind` guards the NIF boundary.
-- **Blast radius, and what buys it down.** A NIF panic restarts the whole node — the accepted cost of not running a second BEAM (measured: 0 faults in 83k + 110k soak inferences before acceptance). Model load is the known crash/wedge vector, so `Cairn.Native.Canary` probe-loads any new or changed model in a **throwaway OS process** (the real `cairn-detect` binary, group mode) before the NIF is allowed to load it.
+- **Blast radius, and what buys it down.** A NIF panic restarts the whole node — the accepted cost of not running a second BEAM (measured: 0 faults in 83k + 110k soak inferences before acceptance). Model load is the known crash/wedge vector, so `Cairn.Native.Canary` probe-loads any new or changed model in a **throwaway OS process** before the NIF is allowed to load it. The executable is the board's choice per backend, and links the same stages the engine does: `cairn-detect` in group mode for `ort` and `qnn`, `cairn-rockchip-probe` for `rknn`.
 - **Health is probed, not inferred.** `Cairn.Native.Health` is its own process that calls the host under a deadline it imposes from outside (ORT/QNN offer no per-call deadline); the ratio check distinguishes a wedged NPU (nothing completing) from saturation (slow but faster than CPU). A wedge is an operator alert, never a restart loop — no restart at any level recovers a wedged NPU. `Cairn.Native.Status` maps engine and per-camera verdicts (including refused hardware decoders) onto the same `cameras:status` surface everything else reads.
-- **Per-SoC hardware axis.** Decode candidate + NPU runtime per family (QCS6490: Venus/v4l2 + QNN; RK3566: software or opt-in MPP + RGA (`rkmpp`) + RKNN; RK3576 pending hardware) — the table is `docs/npu-backends.md`. A profile that *names* a hardware decoder is refused if the decoder falls back to software: silent degradation is this system's recurring defect class, and the detect branch going dark (recording intact, reason on status) beats detecting nothing at 15× the CPU.
+- **Per-SoC hardware axis.** Decode candidate + NPU runtime per family (QCS6490: Venus/v4l2 + QNN; RK3566, in the Rockchip release: MPP + RGA (`rkmpp`) + RKNN; RK3576 not measured) — the table is `docs/npu-backends.md`. A profile that *names* a hardware decoder is refused if the decoder falls back to software: silent degradation is this system's recurring defect class, and the detect branch going dark (recording intact, reason on status) beats detecting nothing at 15× the CPU.
 - **Teardown discipline.** Native destructors are deferred to a drain thread; `Cairn.Native.Drain` starts first in the app tree (so it terminates last) and drains them bounded at shutdown, keeping VM halt from racing accelerator deinit.
+
+## Boards
+
+Everything that differs between SoC families — the decoders and NPU runtimes on offer, the elements in a camera's detect branch, the profiles that ship — belongs to a **board**, and a release is built for exactly one. Three layers:
+
+- **`libs/cairn_stage`, the contract.** `Cairn.Stage.Board` is the behaviour a board implements. `Cairn.Stage.Step` and `Cairn.Stage.Chain` say what a detect chain is and check one. `DecoderNif` and `EngineNif` are the behaviours a board's NIF modules meet, `FrameMeta` and `DmaFrame` the frame formats that pass between elements. `SampleGate` and `DecoderCore` are the sampling rule and the decode element's lifecycle, held here so every board's decoder behaves alike. The library depends on Membrane and on nothing of Cairn's.
+- **The base, `:cairn`.** Everything else in this document, and the generic board (`Cairn.Board.Generic`): decode through `cairn-native`, ONNX Runtime and QNN through `cairn-ort`.
+- **A board library under `boards/`.** Today `boards/cairn_rockchip`: its elements (`DecodeScale`, `Download`), its NIF crate over MPP, librga and RKNN, its probe binary and its profiles. Its Elixir depends on `cairn_stage` and never on the base. The base libraries it reuses are lent to it by name in `config/boards/rockchip.exs`: the generic decoder and engine, for a camera that does not ask for `rkmpp` and a backend that is not `rknn`, and the decoder host, which its own decode element opens through as well. Its Rust crate is the exception to that separation: it has path dependencies on `plugins/cairn-detect` and `plugins/cairn-ort`.
+
+`CAIRN_BOARD` (default `generic`) picks the board when the release is compiled, and nothing switches it afterwards. `mix.exs` adds the board library as a dependency; `config/config.exs` imports `config/boards/<board>.exs`, which names the board module; `Cairn.Board` reads that name once, at compile time; and the Dockerfile's runtime stage is `vendor-<board>`.
+
+### What a board answers
+
+| Callback | Answers |
+|----------|---------|
+| `name/0` | The board's name; config errors carry it |
+| `detect_chain/1` | The steps of one camera's detect branch (below) |
+| `decoders/0` | The `decoder:` names a profile may use |
+| `backends/0` | The `backend:` names, each with its capabilities: the `model:` key naming its artifact, whether NMS may be fused into the graph, whether shapes are dynamic, whether the CPU baseline needs an FP32 twin |
+| `decoder_backend/1` | The decode NIF module behind a decoder name |
+| `engine/1` | The engine NIF module behind a backend name, and the canary executable that probe-loads a model for it |
+| `preflight/0` | Which of those names cannot work on this host, and why (a missing device, library or NIF) — a profile naming one is valid and would do nothing |
+| `artifacts/1` | Runtime files the release does not carry, which the base fetches at first start and keeps only if they hash to the pinned sha256 |
+| `profiles_dir/0` | Where the board's shipped profiles are |
+
+### The detect chain
+
+`detect_chain/1` returns a camera's detect branch as a list of `%Cairn.Stage.Step{}`: the element to build, its child name, the stages it `covers`, and its `input` and `output` format tags (`:h264`, `:rgb`, `:dma_frame`, `:detections`). The base hands it a context holding the camera's id and stream parameters, its resolved `decoder:` name, its motion gate config, and `generic` — the base's own steps for that camera — so a board can keep any of them without depending on the base.
+
+The generic board returns `generic` unchanged: `:decoder` (H.264 in, RGB out) → `:motion_gate` when the camera has one → `:infer`. The Rockchip board, for `decoder: rkmpp`, replaces the decode step with two of its own and keeps the rest: `:decoder` (`DecodeScale`: H.264 in, a frame in a dma-buf out) → `:download` (dma-buf to RGB) → the base's gate and `:infer`. Inference is the base's element on every board; which engine it reaches is `engine/1`'s answer.
+
+`Cairn.Pipeline.DetectChain` checks the list with `Cairn.Stage.Chain.validate/2` before anything is built from it, and a chain that fails raises at pipeline build, naming the rule:
+
+- the chain is a non-empty list of `%Step{}` with unique names;
+- every covered stage is one of `decode`, `scale`, `motion`, `infer`, each covered at most once and in that order;
+- every required stage is covered — `motion` only when the camera configured a gate, since a board that dropped it would detect on every frame the operator asked to skip;
+- the first step takes `:h264`, the last emits `:detections`, and each step's output is the next step's input.
+
+**A fused element is declared by its step's `covers:` list, and nowhere else.** An element doing two stages' work lists both — `Cairn.Pipeline.Decoder` and `Cairn.Rockchip.DecodeScale` each cover `[:decode, :scale]` — and an adapter that only converts between formats covers none (`Download`). The check reads the declaration, not the element: nothing verifies that an element does what its step claims. A wrong list passes, and misleads the next reader of the chain — the Rockchip board itself finds the base step to replace by looking for `:decode` in `covers`.
+
+### Adding a board
+
+A second board, `boards/cairn_foo`, needs:
+
+1. A Mix project depending on `cairn_stage` only: a module implementing the nine `Cairn.Stage.Board` callbacks, its NIF modules (`EngineNif`, and `DecoderNif` if it decodes) written to load without their library, and its profiles under `priv/profiles`.
+2. `config/boards/foo.exs`, naming the module and lending it whichever base libraries it reuses.
+3. A `board_deps/1` clause in `mix.exs`.
+4. In the image: a `vendor-foo` runtime stage; its library, NIF and profiles copied into the release-build stage, which names `boards/cairn_rockchip` by path today and checks the Rockchip release for the last two; a vendor-libraries stage if it needs vendor userspace; a branch in `tools/container/build-rust-aarch64.sh` if it has a Rust crate; its canary executable on the PATH.
+5. In `.github/workflows/container.yml`: the `board` option and its add-on mapping, with a `deploy/vagus-addon/<addon>/config.yaml`.
+6. In CI: an entry in the sobelow and dialyzer matrices, a test job compiled with `CAIRN_BOARD=foo`, a job for the library standing alone, and the five Rust gates for its crate.
+
+A board that brings a new backend name also touches shared code, and this is where the separation is incomplete. `BackendKind` in `plugins/cairn-detect` enumerates backends, `Rknn` among them. The base treats every backend but `ort` as experimental. And a backend's model verdicts live in the base's profile catalog, keyed on the backend's name, as `rknn_conversion` does.
 
 ## The ring buffer
 
@@ -187,7 +239,7 @@ Three rules every lane child obeys, each of them a real defect found in review:
 
 ## Resource budget
 
-Approximate budget for 4 cameras at 5 MP H.264, 20 fps (the measured QCS6490 wall — Venus refuses a fifth concurrent 5 MP decode session outright):
+Approximate budget on QCS6490 for 4 cameras at 5 MP H.264, 20 fps (the measured wall — Venus refuses a fifth concurrent 5 MP decode session outright):
 
 | Resource | Usage | Notes |
 |----------|-------|-------|
@@ -198,4 +250,8 @@ Approximate budget for 4 cameras at 5 MP H.264, 20 fps (the measured QCS6490 wal
 | Ring RAM | pre_window × bitrate × cameras | fixed |
 | Disk | 0–4 MB/s during events | ~3 GB/event-hour/camera at 4 Mbps |
 
-The scaling dimensions: **decode+scale** is the per-camera cost that caps camera count (inference is not — measured ~80 passes/s available against 5/s per camera), and **disk** dominates long retention. Capacity and fps bands are measured per SBC and recorded in that board's profile; x86 is a test host and never gets a measured band.
+The scaling dimensions on that board: **decode+scale** is the per-camera cost that caps camera count (inference is not — measured ~80 passes/s available against 5/s per camera), and **disk** dominates long retention.
+
+RK3566 is the other way round: **inference is the cap.** The engine's one RKNN context carries about 18 passes/s on YOLOX-tiny 416 and under 8 on YOLOX-s 640, so at the 2 fps floor (1.875 passes/s per camera) the measured boundary is nine cameras on the first and four on the second, with the NPU itself about half idle and MPP decode and the RGA scale far from their limits (`docs/evidence/rk3566-capacity-20261118.md`). Those runs drove the pipeline without the application around it: at nine cameras the VM peaked at 217 MB RSS and the whole system averaged 34 % CPU.
+
+Capacity and fps bands are measured per SBC and recorded in that board's profile; x86 is a test host and never gets a measured band.

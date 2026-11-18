@@ -854,10 +854,9 @@ pub(super) fn declared_input_size(dtype: &ValueType) -> Option<InputSize> {
 ///
 /// A flag that contradicts a model's static shape is rejected here rather
 /// than left to fail inside the backend's own `run` on the first sampled
-/// frame, where the message is the runtime's — onnxruntime's, on the one
-/// backend that executes — and the process has already been running for a
-/// minute. A profile's own size is only a last resort: it is a family
-/// default, not a statement about this export.
+/// frame, where the message is that runtime's own and the process has already
+/// been running for a minute. A profile's own size is only a last resort: it
+/// is a family default, not a statement about this export.
 ///
 /// A profile carrying [`ModelProfile::variant_sizes`] has no usable default at
 /// all, so it supplies none: for a family whose every export leaves its spatial
