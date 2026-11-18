@@ -1,6 +1,6 @@
 //! Multiplexed mode: one process, N camera streams.
 //!
-//! Cairn launches a plugin *group* with a single `--cameras-json` argument
+//! A plugin *group* is launched with a single `--cameras-json` argument
 //! instead of `--camera-id`/`--udp-port`/`--min-score-json`. Each member gets
 //! its own decode thread and its own latest-sample slot; one inference thread
 //! drains the slots, applying the floors and stamping the id of whichever
@@ -8,10 +8,11 @@
 //!
 //! The error policy is the mirror image of single-camera mode. A member
 //! camera that is stopped, restarting, or not yet sending is *normal* here —
-//! Cairn deliberately leaves a group running when a member's ffmpeg bounces —
-//! so a stream never takes the process down: it logs and re-opens forever.
-//! Only the inference thread's failures are fatal (exit 1 -> Cairn's backoff
-//! restart of the whole group).
+//! the contract's host leaves a group running when a member's ffmpeg bounces,
+//! and the canary's one synthetic member never sends at all — so a stream
+//! never takes the process down: it logs and re-opens forever. An error out
+//! of the inference loop — the model, or a write to stdout — exits 1, and the
+//! control thread ending exits 3.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -38,9 +39,9 @@ const REOPEN_MAX: Duration = Duration::from_secs(30);
 /// starts over at [`REOPEN_MIN`] rather than inheriting a dark camera's wait.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 
-/// One group member, as Cairn writes it into `--cameras-json` — plus `motion`
-/// and `track_floor`, which Cairn does not write and an operator can add by
-/// hand.
+/// One group member of `--cameras-json`: the contract's `{id, udp_port,
+/// min_score}`, plus `motion` and `track_floor`, which the contract does not
+/// have and a hand-driven run can add.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CameraSpec {
     pub id: String,
@@ -49,13 +50,13 @@ pub struct CameraSpec {
     #[serde(default)]
     pub min_score: HashMap<String, f64>,
     /// Motion-gate knobs for this member alone, overriding the process-wide
-    /// `--motion-json`. Absent — which is what Cairn writes today — means the
-    /// member takes the global settings unchanged.
+    /// `--motion-json`. Absent means the member takes the global settings
+    /// unchanged.
     #[serde(default)]
     pub motion: MotionOverrides,
     /// Track floor for this member alone, replacing the process-wide
-    /// `--track-floor-json`. Absent — which is also what Cairn writes today —
-    /// means the member takes the global setting unchanged.
+    /// `--track-floor-json`. Absent means the member takes the global setting
+    /// unchanged.
     #[serde(default)]
     pub track_floor: TrackFloorOverrides,
 }
@@ -177,8 +178,8 @@ pub fn run(
 /// Open -> decode -> log -> re-open, forever. Never returns.
 ///
 /// The single-camera contract is the opposite: there, an open failure or the
-/// 30s read timeout is fatal so Cairn restarts the process (see `run_single`
-/// in cli.rs). Here the process serves other cameras that are still live,
+/// 30s read timeout is fatal and the process exits (see `run_single` in
+/// cli.rs). Here the process serves other cameras that are still live,
 /// and a member's silence is an expected state rather than a fault.
 fn stream_loop(
     spec: &CameraSpec,
@@ -328,7 +329,7 @@ fn infer_loop(
     }
 
     // Only reachable once every decode thread is gone, which they never do on
-    // their own — so this is a real fault worth restarting the group for.
+    // their own — so this is a real fault, worth the exit.
     bail!("every camera stream is gone")
 }
 
@@ -453,8 +454,8 @@ mod tests {
     const TWO: &str = r#"[{"id":"front","udp_port":17000,"min_score":{"default":0.4,"person":0.8}},
                           {"id":"drive","udp_port":17004,"min_score":{"default":0.9}}]"#;
 
-    /// `floors_for` with the flag absent, which is every run Cairn launches
-    /// today: no track floor anywhere, so the call cannot fail.
+    /// `floors_for` with the flag absent: no track floor anywhere, so the call
+    /// cannot fail.
     fn no_track_floor(specs: &[CameraSpec]) -> Vec<ScoreFloors> {
         floors_for(specs, &TrackFloorOverrides::default())
             .expect("a group with no track floor has nothing to pair")

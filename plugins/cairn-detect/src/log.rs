@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 const BOUND: usize = 256;
 
 /// How long [`drain`] waits at an exit: enough for a healthy stderr to take the
-/// queue, not enough to hold a restart up behind a wedged one.
+/// queue, not enough to hold the exit up behind a wedged one.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A bounded queue of formatted lines and the thread that empties it.
@@ -292,7 +292,7 @@ mod tests {
     }
 
     /// An exit behind a wedged writer gives up on the tail rather than hanging:
-    /// Cairn is waiting to respawn the process.
+    /// whatever launched the process is waiting on it.
     #[test]
     fn draining_a_wedged_writer_gives_up_instead_of_hanging() {
         let (sink, _permits, _written) = gated(1);

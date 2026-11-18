@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Feed a recorded fixture clip to a UDP port as RTP, exactly like Cairn does.
+"""Feed a recorded fixture clip to a UDP port as RTP, the way the plugin
+contract's host did.
 
-Cairn's own ffmpeg invocation lives in lib/cairn/ffmpeg_port.ex
-(Cairn.FfmpegPort.build_argv/4). For a local-file source (the `true ->`
-branch of its `input_opts` cond, used for dev/fixture loops) it builds:
+That host's feed was Cairn's ffmpeg bridge (Cairn.FfmpegPort.build_argv in
+lib/cairn/ffmpeg_port.ex) while it still had RTP outputs; today it writes one
+MPEG-TS stream to a pipe and detection is fed in-process. For a local-file
+source (the `true ->` branch of its `input_opts` cond, used for dev/fixture
+loops) it built:
 
     ffmpeg -nostdin -nostats -loglevel warning \
       -re -stream_loop -1 -i <path> \
@@ -13,17 +16,17 @@ branch of its `input_opts` cond, used for dev/fixture loops) it builds:
            which a plugin never sees and this harness does not reproduce]
 
 Notably:
-  - `-bsf:v h264_mp4toannexb` is NOT optional. Cairn's comment on that line
-    explains why: RTP consumers need SPS/PPS in-band, and an mp4-muxed
+  - `-bsf:v h264_mp4toannexb` is NOT optional: RTP consumers need SPS/PPS
+    in-band, and an mp4-muxed
     source (like these fixture clips) keeps them in extradata only. Skip
     this bitstream filter and a decoder joining mid-stream (the normal
     case per the plugin contract) may never see parameter sets at all.
-  - There is no `-an` in Cairn's real argv. It doesn't need one: `-map 0:v`
+  - There was no `-an` in that argv. It didn't need one: `-map 0:v`
     already selects only the video stream, so no audio track ever reaches
     the RTP muxer (RTP/AVP payload type 96 here is video-only anyway). We
-    keep `-map 0:v -c:v copy` to match Cairn exactly rather than relying on
+    keep `-map 0:v -c:v copy` to match that argv exactly rather than relying on
     `-an` to do the same job a different way.
-  - Cairn passes `-stream_loop -1` unconditionally for file sources; this
+  - The bridge passes `-stream_loop -1` unconditionally for file sources; this
     harness exposes it as --loops so you can also do a bounded run.
 
 This script reproduces the single RTP output a plugin actually receives.

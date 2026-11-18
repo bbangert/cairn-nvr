@@ -1,6 +1,6 @@
-//! The control channel: Cairn's protocol v1 lines on our stdin.
+//! The control channel: the contract host's protocol v1 lines on our stdin.
 //!
-//! Cairn tells a plugin which *stream epoch* each camera's frames belong to.
+//! The host tells a plugin which *stream epoch* each camera's frames belong to.
 //! An epoch is a ULID minted per ffmpeg run: it changes whenever a camera's
 //! stream restarts, and the host drops any `frame.objects` line whose epoch
 //! is not the one currently in its own table. So a camera's epoch is not
@@ -18,9 +18,9 @@
 //! camera, and a group host tags every line with the member it is about.
 //!
 //! Reading happens on a dedicated thread that does nothing else, because the
-//! host writes with `:nosuspend` — a plugin that stops draining its stdin does
-//! not block the host, it silently *loses* the epoch announcements, and then
-//! every line it emits is discarded as stale.
+//! contract's host never blocks on the write — a plugin that stops draining
+//! its stdin does not block the host, it silently *loses* the epoch
+//! announcements, and then every line it emits is discarded as stale.
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -187,9 +187,11 @@ impl Streams {
 /// The thread ending — EOF, a read error, or a panic — ends the *process*.
 /// Without that the epoch map freezes: a stream bounce is never learned, and
 /// every line emitted afterwards is discarded host-side as `stale_epoch`
-/// while this process stays alive and keeps the accelerator busy. Neither
-/// `Cairn.PluginPort` nor `Cairn.PluginGroupPort` watches for that; both
-/// respawn on exit, which is why exiting is the recovery.
+/// while this process stays alive and keeps the accelerator busy. The
+/// contract's host does not watch for that and does restart a plugin that
+/// exits, which is why exiting is the recovery. EOF is also how a launcher
+/// that closes stdin ends a run — parity does; the canary signals the
+/// process instead.
 pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
     thread::Builder::new()
         .name("control".into())
@@ -204,7 +206,7 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             }))
             .is_err();
             let cause = if panicked { "panicked" } else { "stdin closed" };
-            note!("control: control channel gone ({cause}), exiting so Cairn respawns us");
+            note!("control: control channel gone ({cause}), exiting");
             // Before `_exit`, which writes nothing: `note!` only queued that line,
             // so the reason this process ended would die with it.
             crate::log::drain();
@@ -212,7 +214,7 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             // the main thread may be anywhere — including inside onnxruntime's
             // session constructor. `spawn_reader` is called *before* the model
             // load on purpose (an unread pipe drops the `stream.started` lines
-            // Cairn writes at spawn), so that overlap is the normal case, not a
+            // a host writes at spawn), so that overlap is the normal case, not a
             // corner. `process::exit` runs atexit handlers and C++ static
             // destructors, and doing that under a half-built session killed
             // roughly 40% of runs with SIGSEGV and gave the rest a fabricated
@@ -225,7 +227,7 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             // pipe and a buffered detection is an undelivered one — and the log
             // queue behind [`crate::note!`] is drained just above.
             //
-            // Non-zero: this is an abnormal end, and the host logs the status.
+            // Non-zero: this is an abnormal end, and the status says so.
             //
             // SAFETY: `_exit` is async-signal-safe and terminates immediately.
             // It touches no Rust state, so there is nothing for another thread
@@ -281,7 +283,7 @@ mod tests {
     const A: &str = "01K1B2C3D4E5F6G7H8J9K0M1N2";
     const B: &str = "01K1B2C3D4E5F6G7H8J9K0M1N3";
 
-    /// Byte-for-byte what `Cairn.PluginGroupPort.stream_started/2` writes.
+    /// The contract's `stream.started` line.
     fn started(camera_id: &str, epoch: &str) -> String {
         format!(
             r#"{{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"{camera_id}","stream_epoch":"{epoch}","rtp":{{"clock_rate":90000}}}}"#

@@ -62,8 +62,8 @@ pub(super) fn check_label_count(
 /// The same shape parses `--track-floor-json` (the whole process's default)
 /// and a `--cameras-json` member's `track_floor` key (that one camera's
 /// override), which is the [`crate::motion::MotionOverrides`] pattern and for
-/// the same reason: this is the operator's own flag, written into the
-/// configured command rather than appended by Cairn, so it has to be
+/// the same reason: this is the operator's own flag, part of the
+/// command rather than an argument the host appends, so it has to be
 /// expressible in both modes.
 ///
 /// `deny_unknown_fields` for the motion gate's reason too — a mistyped knob

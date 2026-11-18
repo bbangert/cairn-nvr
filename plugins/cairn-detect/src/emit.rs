@@ -20,11 +20,13 @@ use serde::Serialize;
 use crate::control::Streams;
 use crate::note;
 
-/// Cairn drops any line longer than this, so a too-long line is a lost
-/// sample rather than a soft error — we shed detections to stay under it.
+/// The contract's host drops any line longer than this, so a too-long line
+/// is a lost sample rather than a soft error — we shed detections to stay
+/// under it.
 ///
 /// This is the contract's framing bound (`docs/archive/plugin-contract.md`
-/// §Framing): both host ports open the plugin with `{:line, 65_536}`.
+/// §Framing): its host reads with `{:line, 65_536}`, as the canary still
+/// does.
 pub const MAX_LINE_BYTES: usize = 65_536;
 
 /// The host's `|pts| <= 2^62` bound. `av_rescale_q` saturates to `i64::MIN`
@@ -232,7 +234,8 @@ pub fn status_line(
 /// Detections arrive least-interesting-last, so both the cap and the
 /// truncation drop the least interesting ones. A line with zero objects is
 /// emitted even if it somehow still exceeds the budget: a valid oversized line
-/// is dropped by Cairn, a truncated one would be malformed for every consumer.
+/// is dropped by the contract's host, a truncated one would be malformed for
+/// every consumer.
 ///
 /// That order is [`Det::evidence`] first and score second — `crate::infer`
 /// ranks by that key at both of its own cuts and this is the same list — so
@@ -244,8 +247,8 @@ pub fn status_line(
 /// It matters because the boundary is *per class*: with `min_score` at 0.4 for
 /// `person` and 0.8 for `car`, a band `car` at 0.5 outscores an evidence
 /// `person` at 0.45, and a cut ranking by score alone would keep the noise and
-/// drop the detection. Cairn writes per-label floors, so that is a real
-/// configuration and not a contrived one.
+/// drop the detection. A camera's `min_score` map is per label, so that is a
+/// real configuration and not a contrived one.
 ///
 /// At 64 shaped objects a full line runs to about 12.3 KB, and to about
 /// 14.2 KB when every object is a seed carrying `observation_kind` — measured
@@ -277,7 +280,7 @@ pub fn objects_line(
             },
             objects: &dets[..kept],
         });
-        // `<=`: Cairn reads with erlang line mode `{:line, 65_536}`, whose
+        // `<=`: the contract's host read with erlang line mode `{:line, 65_536}`, whose
         // limit applies to the line data excluding the newline delimiter and
         // is inclusive — a payload of exactly 65 536 bytes still arrives as
         // one `{:eol, _}`, and only 65 537 splits.

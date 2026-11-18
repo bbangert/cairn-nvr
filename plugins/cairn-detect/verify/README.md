@@ -6,8 +6,9 @@ some_plugin --udp-port 17000 --camera-id test | tee run.ndjson | ./validate_ndjs
 ./compare_runs.py --a fp32.ndjson --b int8.ndjson
 ```
 
-**The plugin emits no detections until it is told a stream epoch.** Cairn
-sends one `stream.started` per camera on the plugin's stdin at spawn, and a
+**The plugin emits no detections until it is told a stream epoch.** The
+contract's host (`docs/archive/plugin-contract.md`; Cairn no longer runs
+one) sends one `stream.started` per camera on the plugin's stdin at spawn, and a
 `frame.objects` line has no valid `stream_epoch` to carry before that — so a
 run driven by hand has to supply the control line itself, and keep stdin open
 afterwards. EOF on stdin **exits the plugin** (an epoch map that can never

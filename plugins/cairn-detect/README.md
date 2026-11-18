@@ -14,9 +14,25 @@ fed to it and how its output must be read — is one
 [profile](#model-profiles), sniffed from the model itself unless the shape is
 genuinely ambiguous, in which case the plugin refuses to guess.
 
-It is both what you should deploy and the worked example to read when writing
-your own plugin: everything the contract requires of a plugin is exercised
-here, in the two modes Cairn can launch one in.
+**Cairn no longer launches this binary as a plugin.** Detection runs inside the
+node — the stages in `src/` are a library that the `cairn-native` and
+`cairn-ort` NIFs link — and `config.yml` takes no plugin command. The binary
+is still built and shipped, and what runs it is:
+
+- the canary (`Cairn.Native.Canary`), which probe-loads a model in a throwaway
+  process before the node's engine opens it. It uses
+  [multiplexed mode](#multiplexed-mode) with one synthetic member that never
+  receives a packet;
+- the node's CPU baseline (`--cpu-baseline <passes>`), which times model passes
+  on the CPU in a fresh process and exits;
+- the parity reference (`mix cairn.parity`) and the harnesses under `verify/`
+  and `tools/`, which drive it and read its stdout.
+
+Nothing restarts it. The rest of this README describes it as the contract's
+plugin: everything the contract requires of one is exercised here, in both of
+its modes. Where the text has Cairn launching the process, appending
+arguments, writing epochs or restarting it, read the contract's host — the
+ports Cairn removed, and today whichever of the callers above is driving.
 
 ## At a glance
 
@@ -65,51 +81,55 @@ not export. `src/glibc_compat.rs` forwards those four symbols to their C99
 equivalents.
 
 The shims are compiled unconditionally on linux-gnu, so they are *harmless*
-rather than inert: even on glibc 2.41 the statically linked onnxruntime keeps
-calling them and gets C99 parsing (no `0b` prefix), which its config parsing
-never depends on. They are not exported in `.dynsym`, so they cannot interpose
-glibc's versions for FFmpeg or any other shared library — that stops being
-true if anyone adds `-rdynamic`/`--export-dynamic` to `RUSTFLAGS` or builds
-this as a cdylib. Delete the module once no build host is older than 2.38.
+rather than inert: even on glibc 2.41 the onnxruntime linked statically into
+the binary keeps calling them and gets C99 parsing (no `0b` prefix), which its
+config parsing never depends on. The binary does not export them in `.dynsym`,
+so there they cannot interpose glibc's versions for FFmpeg or any other shared
+library — that stops being true if anyone adds `-rdynamic`/`--export-dynamic`
+to `RUSTFLAGS`.
 
-## Wire into config.yml
+The two NIF cdylibs that link this library are a different case.
+`libcairn_native.so` and `libcairn_ort.so` each export all four
+(`nm -D --defined-only`) and, in the default build with onnxruntime linked
+in, call three of them (`strtol`, `strtoll`, `strtoull`) through the PLT, so
+which definition those calls bind to is the dynamic linker's choice when the
+node loads the NIF. That has not been traced on a glibc that has `__isoc23_*`
+of its own.
 
-Plugin flags go *before* the contract args, which Cairn appends
-(`--camera-id`, `--udp-port`, `--min-score-json`). Paths are relative to the
-directory Cairn runs from:
+Delete the module once no build host is older than 2.38.
 
-```yaml
-cameras:
-  - id: front_door
-    rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
-    # An argv list (or a multi-word string) is an inline command: this
-    # camera's own process. Receives RTP on an assigned UDP port, prints
-    # ndjson detections on stdout.
-    plugin:
-      - plugins/cairn-detect/target/release/cairn-detect
-      - --model
-      # .onnx files are gitignored — fetch this one with the curl in the
-      # Model section (or drop in any supported model; see Model).
-      - plugins/cairn-detect/yolox_nano.onnx
-      # The labels file belongs to the model above it, not to the plugin:
-      # coco.names is the 80-entry list YOLOX and the Ultralytics families
-      # emit, RF-DETR needs the 91-entry coco91.names. Changing --model
-      # without changing this is a startup error, not a silent mislabel.
-      - --labels
-      - plugins/cairn-detect/coco.names
-      - --decoder
-      - auto
-    min_score:
-      default: 0.5
-      person: 0.6
+## Running it
+
+`config.yml` no longer wires this binary in. An inline `plugin:` command is a
+config error, and a `plugins:` group is a profile reference whose `command:`
+key gets an unknown-key warning and nothing else; what a camera's detection
+is configured with now is in `docs/profile-authoring.md`. The canary passes
+the node's model config as this binary's model flags
+(`Cairn.Native.Config.to_argv/1`) — the model half only, never `--decoder`,
+`--motion-json` or `--track-floor-json`.
+
+A run by hand gives both halves: the model flags, then the contract args a
+host would append (`--camera-id`, `--udp-port`, `--min-score-json`):
+
+```bash
+./target/release/cairn-detect \
+    --model yolox_nano.onnx --labels coco.names --decoder auto \
+    --camera-id front_door --udp-port 17000 \
+    --min-score-json '{"default":0.5,"person":0.6}'
 ```
 
-Logs land in `{data_dir}/log/plugin-front_door.log`. `--decoder auto` is the
-default and can be omitted.
+`.onnx` files are gitignored — fetch this one with the curl in the
+[Model](#model) section, or drop in any supported model. The labels file
+belongs to the model, not to the binary: `coco.names` is the 80-entry list
+YOLOX and the Ultralytics families emit, RF-DETR needs the 91-entry
+`coco91.names`. Pairing a model with the other list is a startup error, not a
+silent mislabel. `--decoder auto` is the default and can be omitted.
+Diagnostics go to stderr.
 
-To serve several cameras from one process, declare the same command once as a
-named group under `plugins:` and point cameras at it by name — see
-[Multiplexed mode](#multiplexed-mode).
+The process emits no frames until a `stream.started` arrives on stdin (see
+[The control channel](#the-control-channel)); [Verifying
+changes](#verifying-changes) has a complete run. To serve several cameras
+from one process, see [Multiplexed mode](#multiplexed-mode).
 
 | flag | required | meaning |
 |------|----------|---------|
@@ -150,13 +170,10 @@ built — the state a plugin-side reconnect leaves a camera in, which arrives
 with no epoch change to bypass with. A scene cut is not treated as motion: it
 buys the one model pass that looks at the new scene, not `linger_ms` of them.
 
-```yaml
-plugin:
-  - plugins/cairn-detect/target/release/cairn-detect
-  - --model
-  - plugins/cairn-detect/yolox_nano.onnx
-  - --motion-json
-  - '{"enabled": true, "min_area_fraction": 0.005}'
+```bash
+./target/release/cairn-detect --model yolox_nano.onnx \
+    --motion-json '{"enabled": true, "min_area_fraction": 0.005}' \
+    --camera-id front_door --udp-port 17000
 ```
 
 | knob | default | meaning |
@@ -315,13 +332,10 @@ emitted, at the score the model gave it, as an ordinary `detected` object.
 **It is off unless you switch it on**, and a run without it emits exactly what
 it emitted before the flag existed — byte for byte.
 
-```yaml
-plugin:
-  - plugins/cairn-detect/target/release/cairn-detect
-  - --model
-  - plugins/cairn-detect/yolox_nano.onnx
-  - --track-floor-json
-  - '{"floor": 0.1}'
+```bash
+./target/release/cairn-detect --model yolox_nano.onnx \
+    --track-floor-json '{"floor": 0.1}' \
+    --camera-id front_door --udp-port 17000
 ```
 
 | knob | default | meaning |
@@ -356,8 +370,8 @@ mint a new one.
    where the line is serialized — so the band is always the tail and always
    the first thing to go. Ranking by score alone would not do it: with
    `min_score` at 0.4 for `person` and 0.8 for `car`, a band `car` at 0.5
-   outscores an evidence `person` at 0.45, and per-label floors are a
-   configuration Cairn writes.
+   outscores an evidence `person` at 0.45, and a camera's `min_score` map is
+   per label.
 3. **A seed never re-reports the band.** With the [motion gate](#motion-gate)
    on as well, a skipped sample re-reports the last real line's
    *evidence-grade* boxes only. A sub-floor box is a thing seen in one frame,
@@ -402,8 +416,7 @@ a group whose members carry different `min_score` maps has to be split by
 
 stdout carries protocol v1 ndjson and nothing else — one JSON object per
 line, flushed as it is written, capped at the contract's 65 536 bytes. Every
-diagnostic goes to stderr, where Cairn logs it. Three message types leave
-this plugin:
+diagnostic goes to stderr. Three message types leave this plugin:
 
 ```jsonc
 // once, before the model load
@@ -445,7 +458,7 @@ measure of how long the model took.
 
 ### The control channel
 
-Cairn writes back on the plugin's **stdin**, and this is not optional
+The host writes back on the plugin's **stdin**, and this is not optional
 reading. A camera's *stream epoch* — a ULID minted per ffmpeg run — only ever
 arrives this way:
 
@@ -457,8 +470,8 @@ arrives this way:
 ```
 
 A dedicated thread owns stdin from before the model load until the process
-exits. Cairn writes with `:nosuspend`: a plugin that stops draining does not
-slow the host down, it silently *loses* announcements — and a lost epoch
+exits. The contract's host never blocks on the write: a plugin that stops
+draining does not slow the host down, it silently *loses* announcements — and a lost epoch
 means every line that camera produces afterwards is discarded host-side as
 stale. Unknown message types and other protocol versions are ignored rather
 than treated as errors; a malformed line is logged and skipped.
@@ -475,39 +488,14 @@ epoch that replaced it.
 
 ## Multiplexed mode
 
-The same binary also serves a whole plugin group from one process. Reach for
-it when the hardware is the constraint rather than the camera count: an
+The same binary also serves a whole plugin group from one process — the mode
+the canary runs. It exists for hardware that is the constraint rather than
+the camera count: an
 accelerator that only one process can hold at a time (a Coral Edge TPU is the
 motivating case) can never be shared by a process per camera, and one model
 loaded once is cheaper than N copies even where sharing is merely wasteful.
 
-Declare the command once and let cameras join it by name:
-
-```yaml
-plugins:
-  detect:
-    command:
-      - plugins/cairn-detect/target/release/cairn-detect
-      - --model
-      - plugins/cairn-detect/yolox_nano.onnx
-      # coco.names goes with yolox (and yolov8/v10); an rfdetr model needs
-      # coco91.names — see --labels above
-      - --labels
-      - plugins/cairn-detect/coco.names
-
-cameras:
-  - id: front_door
-    rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
-    plugin: detect
-    min_score:
-      default: 0.5
-      person: 0.6
-  - id: driveway
-    rtsp_url: rtsp://user:pass@192.168.1.11:554/stream1
-    plugin: detect
-```
-
-Cairn then appends one argument instead of the per-camera three:
+A group's host appends one argument instead of the per-camera three:
 
 | flag | required | meaning |
 |------|----------|---------|
@@ -515,20 +503,19 @@ Cairn then appends one argument instead of the per-camera three:
 
 It conflicts with `--camera-id`/`--udp-port`/`--min-score-json`; give one set
 or the other. `--motion-json` and `--track-floor-json` are the exceptions:
-they are your own flags in the configured command rather than ones Cairn
-appends, so they apply in both modes — in group mode as the default for every
+they are flags of the command rather than arguments the host appends, so
+they apply in both modes — in group mode as the default for every
 member. A member may also carry its own `motion` object in `--cameras-json`,
 overriding only the knobs it names, or its own `track_floor` object, replacing
 the group's outright (there is one knob, so the two are the same thing).
-Cairn writes neither key today, so both are reachable from a hand-driven run
-(see below); a track floor is checked against *that member's* `min_score` map,
+The contract has neither key, so both are reachable only from a hand-driven
+run (see below); a track floor is checked against *that member's* `min_score` map,
 so one can be legal for one camera in a group and refused for another. Each
 member gets its own decode thread and its own
 newest-wins sample slot, and a single inference thread drains the slots —
 picking at random among the ready ones, so a busy camera cannot starve a quiet
 one. Score floors are applied per member. Startup logs the whole roster
-(`cameras=[front_door@17000, driveway@17004]`) to the group's shared
-`{data_dir}/log/plugin-detect.log`.
+(`cameras=[front_door@17000, driveway@17004]`) on stderr.
 
 Every output line carries the `camera_id` of the member it describes, and the
 `stream_epoch` Cairn last announced for *that* member — in group mode Cairn
@@ -537,13 +524,14 @@ dropped, and a line under the wrong epoch is dropped as stale. Sequence
 counters are per member too; a busy camera's count never leaks into a quiet
 one's.
 
-**A silent stream is normal here, not a fault.** Cairn leaves a group running
-when a member camera is stopped or its ffmpeg is bouncing, so each stream is
+**A silent stream is normal here, not a fault.** The contract's host leaves a
+group running when a member camera is stopped or its ffmpeg is bouncing, and
+the canary's one member never sends at all, so each stream is
 an open → decode → log → re-open loop, forever, backing off 5 s → 30 s (reset
 after a minute of healthy run). This is the mirror image of per-camera mode,
-where a failed open or the 30 s read timeout is fatal *by design* so Cairn
-restarts the process. Only a model-load or inference failure exits, and it
-takes every member's detection down with it until the backoff restart — the
+where a failed open or the 30 s read timeout is fatal *by design*. What does
+exit is a failed model load, inference pass or write to stdout, or the control
+channel closing, and it takes every member's detection down with it — the
 group is one failure domain, which is exactly why per-stream trouble is kept
 per-stream.
 
@@ -573,8 +561,11 @@ Linux probes `v4l2`. Naming a backend probes only that one.
 
 **A backend that will not open is never fatal.** Every failure is logged and
 the next candidate is tried, ending at software decode — a forced
-`--decoder vaapi` on a host without VAAPI runs slowly rather than
-crash-looping under Cairn's restart backoff.
+`--decoder vaapi` on a host without VAAPI runs slowly rather than exiting,
+which under the contract's host was a restart loop. The node's own decode
+path does the opposite with the same library: a *named* decoder that cannot
+open is refused, the camera's detect branch goes dark, and the reason is in
+its status.
 
 Sampled frames only — never the full stream — are scaled on the GPU and then
 downloaded, because downloading full-resolution frames would cost more than
@@ -1270,13 +1261,13 @@ time instead of the host's.
 ## Verifying changes
 
 `verify/` holds the local harness: `feed.py` replays a fixture clip to a UDP
-port with the exact ffmpeg argv Cairn uses, `validate_ndjson.py` checks a
+port with the ffmpeg argv the contract's host used, `validate_ndjson.py` checks a
 plugin's stdout against protocol v1 (envelope and field bounds, per-camera
 sequence continuity, pts monotonicity, effective sample rate, score/label
 histogram), and `compare_runs.py` diffs two runs on the same clip — FP32
 against INT8, a hardware backend against software. See `verify/README.md` for
 the two-terminal recipe. A typical run, where the brace group stands in for
-Cairn's control channel:
+the host's control channel:
 
 ```bash
 python3 verify/feed.py --clip /path/to/fixture.mp4 --port 17910 &
@@ -1362,28 +1353,30 @@ where `NormBox` cannot be named at all.
 
 - Joining mid-stream is normal. The open is retried 12 times, 5 s apart, with
   a generous `analyzeduration` so the probe waits out a GOP instead of failing
-  with "Invalid data found"; after that we exit loudly and let Cairn back off.
+  with "Invalid data found"; after that we exit loudly.
   In multiplexed mode that budget is unbounded instead — one member's open
   failure re-opens forever rather than taking the group's other cameras down.
 - The udp `timeout` option (30 s) bounds both ends: without it a silent port
   blocks forever inside the probe,
   so the retry loop never gets a second attempt, and a mid-run silence parks
-  the packet read instead of exiting for Cairn to restart.
+  the packet read instead of returning the error either mode acts on.
 - The socket binds loopback explicitly (`localaddr`). The SDP's
   `c=IN IP4 127.0.0.1` does not constrain the bind — libavformat's udp
   protocol otherwise listens on `0.0.0.0`, and anything that can route to the
   host could inject frames into a camera's detector.
-- The demuxer also binds `udp-port + 1` for RTCP even though Cairn sends none.
-  Cairn reserves it (`Cairn.UDPPorts` allocates four ports per camera); if
-  something else takes that port the stream will not open at all. `localaddr`
+- The demuxer also binds `udp-port + 1` for RTCP. The contract reserves it
+  (its host allocated four ports per camera), so a hand-driven run has to keep
+  it free: if something else takes that port the stream will not open at all.
+  `localaddr`
   moves that port to loopback too.
-- Every codec context caps `max_pixels` at 32 MP. This plugin is the first
-  thing in the system that decodes camera bitstream (Cairn's ffmpeg is
-  `-c:v copy`), so an SPS declaring 16384x16384 would otherwise size the
-  allocation.
+- Every codec context caps `max_pixels` at 32 MP. This library is usually the
+  first thing to decode a camera's bitstream (Cairn's ffmpeg copies video
+  unless a camera opts into transcode), so an SPS declaring 16384x16384 would
+  otherwise size the allocation.
 - Frames that cannot be decoded *or* converted cost one sample, not the
-  process: both are counted and logged (first, then every 50th). Only a dead
-  inference thread or a dead stream is fatal.
+  process: both are counted and logged (first, then every 50th). What is fatal
+  is a dead inference thread, a closed control channel and, in per-camera
+  mode, a dead stream.
 - Inference runs on its own thread behind a size-1 channel. Held inline it
   stalls the socket read long enough to overflow the receive buffer at
   multi-megabit bitrates, which corrupts the stream rather than just dropping
@@ -1417,10 +1410,12 @@ where `NormBox` cannot be named at all.
 - The hardware filter graph is built on the first sampled frame, not at open:
   it needs the decoder's frames pool, which does not exist until something has
   been decoded.
-- Output lines are capped at the contract's 65 536 bytes — the bound both
-  host ports open us with (`{:line, 65_536}`) — by shedding from the end of a
+- Output lines are capped at the contract's 65 536 bytes — the bound its host
+  read with, and the canary still does (`{:line, 65_536}`) — by shedding from
+  the end of a
   list ranked evidence first and score second, so the least interesting
-  detections go first; an oversized line would be dropped by Cairn anyway. At 64
+  detections go first; an oversized line would be dropped by that host anyway.
+  At 64
   shaped objects a line runs to about 12.3 KB — 14.2 KB when every object is
   a seeded re-report carrying `observation_kind` — so that shedding is a
   guard rather than a working part of the path. The object list is cut at 64 first,
@@ -1446,8 +1441,10 @@ where `NormBox` cannot be named at all.
 - The control thread ending ends the process. EOF, a read error or a panic on
   it means no epoch will ever change again, and a frozen epoch map turns into
   every later line being dropped host-side as stale while this process keeps
-  the accelerator busy. Exiting non-zero is the recovery: both host ports
-  respawn on exit and neither watches for a wedged plugin.
+  the accelerator busy. Exiting non-zero is the recovery the contract's host
+  acts on: it restarts a plugin that exits and does not watch for a wedged
+  one. It is also how a harness run ends: closing stdin exits the process
+  with status 3.
 - `observed_at` is stamped at the sample gate, not at emit time. A sample can
   wait behind a busy model pass, and the host uses this to place the frame on
   its timeline — stamping it late would fold our own latency into the
