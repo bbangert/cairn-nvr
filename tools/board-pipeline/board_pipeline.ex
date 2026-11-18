@@ -1,27 +1,14 @@
-defmodule Cairn.Config do
-  @moduledoc """
-  Struct-only stand-in: `Cairn.Native.Host.reconfigure/2` pattern-matches
-  `%Cairn.Config{}`, and an undefined struct in a pattern is a compile
-  *error* where an undefined remote call is only a warning. Reconfigure is
-  the config-reload path, which this harness never takes — no field of the
-  real struct is ever read here, so none are declared.
-  """
-
-  defstruct []
-end
-
 defmodule Cairn.BoardPipeline.DetectionSink do
   @moduledoc """
-  The harness's own terminus, and the one place it stops being the production
-  spec verbatim.
+  The harness's own terminus, where it stops being the production branch.
 
   Production ends the branch in three host-side elements —
   `Cairn.Pipeline.ObservationStamper`, the generic `Membrane.MOTTracker` and
-  `Cairn.Pipeline.TrackSink` — none of which touch a NIF, and whose closure
-  (the tracker core, its stages, the runtime control overlay) is most of the
-  application. This harness asks what the pipeline *around the NIFs* does, so
-  it ends where the NIF's output does: at `Inference`'s own pad, counting the
-  frames it emits.
+  `Cairn.Pipeline.TrackSink` (tier 1: `Cairn.Pipeline.PresenceSink` alone) —
+  none of which touch a NIF, and whose closure (the tracker core, its stages,
+  the runtime control overlay) is most of the application. This harness asks
+  what the pipeline *around the NIFs* does, so it ends where the NIF's output
+  does: at `Inference`'s own pad, forwarding what each frame produced.
   """
 
   use Membrane.Sink
@@ -52,11 +39,11 @@ defmodule Cairn.BoardPipeline.AuSource do
   harness measures the *pipeline*, and the sample gate, the picker's slot and
   inference demand only mean anything against real inter-frame time.
 
-  Output is `Cairn.Pipeline.RtspSource`'s exact pad: a packetized
-  `Membrane.RemoteStream` of whole Annex-B access units with nanosecond pts,
-  for `Membrane.H264.Parser` to turn into `%Membrane.H264{alignment: :au}`
-  with the SPS geometry in the stream format — the format-driven decoder
-  open this harness exists to exercise.
+  Output is a packetized `Membrane.RemoteStream` of whole Annex-B access
+  units with nanosecond pts, for `Membrane.H264.Parser` to turn into
+  `%Membrane.H264{alignment: :au}` with the SPS geometry in the stream format
+  — what `Membrane.RTSPDualStream.Source` hands production's detect branch,
+  and what drives the format-driven decoder open this harness exercises.
   """
 
   use Membrane.Source
@@ -153,9 +140,9 @@ end
 
 defmodule Cairn.BoardPipeline.Collector do
   @moduledoc """
-  Receives what the pipeline produces and says what it saw: the tracker-cast
-  observations from `Cairn.Detect.Dispatch`, the decoder-open evidence from
-  the `:sys` hook on the host, and each element's `:stats` notification. IO
+  Receives what the pipeline produces and says what it saw: the observations
+  `DetectionSink` forwards, the decoder-open evidence from the `:sys` hook on
+  the host, and each chain element's `:stats` notification. IO
   is `IO.puts` with a `board-pipeline:` prefix, matching `Cairn.BoardSoak`'s
   ssh-log discipline.
   """
@@ -181,6 +168,9 @@ defmodule Cairn.BoardPipeline.Collector do
        cams: %{},
        decoder_opens: [],
        stats: %{},
+       # camera id -> the children its pipe asked for `:stats`, so a reply that
+       # never came is named in the summary rather than waited for.
+       asked: %{},
        # cpu_first anchors the whole-run average; cpu_last is the rolling
        # anchor for the per-tick progress figure.
        cpu_first: counters,
@@ -237,6 +227,10 @@ defmodule Cairn.BoardPipeline.Collector do
     {:noreply, %{state | decoder_opens: state.decoder_opens ++ [{source, at_ms - state.t0}]}}
   end
 
+  def handle_info({:stats_asked, camera_id, children}, state) do
+    {:noreply, %{state | asked: Map.put(state.asked, camera_id, children)}}
+  end
+
   def handle_info({:stats, camera_id, child, stats}, state) do
     {:noreply, %{state | stats: Map.put(state.stats, {camera_id, child}, stats)}}
   end
@@ -269,6 +263,7 @@ defmodule Cairn.BoardPipeline.Collector do
        cpu_pct: run_avg,
        decoder_opens: state.decoder_opens,
        stats: state.stats,
+       asked: state.asked,
        line: line(state, run_avg)
      }, state}
   end
@@ -347,6 +342,8 @@ defmodule Cairn.BoardPipeline.Collector do
   # Whole-run average from cumulative counters — time-weighted by
   # construction. A mean of the per-tick samples would weight the summary's
   # short final window the same as a full 30 s interval (Copilot, PR #99).
+  # It spans the collector's start to the summary call, so pipeline start, the
+  # drain second and teardown are inside it.
   defp cpu_run_avg(%{cpu_first: {busy0, total0}}) do
     case cpu_counters() do
       {busy1, total1} when total1 > total0 ->
@@ -362,11 +359,11 @@ end
 
 defmodule Cairn.BoardPipeline.EpochStamp do
   @moduledoc false
-  # The production pipeline's EpochTagger mints via Cairn.StreamEpochs, which
-  # this standalone harness deliberately does not run (see the moduledoc's
-  # remote-call note) — each pipe's epoch is fixed for its lifetime, so the
-  # tag is a constant stamp. Phase 2's Inference reads it off every frame and
-  # drops untagged ones, which is how an unstamped harness measures zero.
+  # The production pipeline's EpochTagger mints via Cairn.StreamEpochs, whose
+  # table this harness never starts — each pipe's epoch is fixed for its
+  # lifetime, so the tag is a constant stamp. Inference reads it off every
+  # frame and drops untagged ones, which is how an unstamped harness measures
+  # zero.
   # Sits after the parser: the parser does not carry input metadata through.
   use Membrane.Filter
 
@@ -384,24 +381,59 @@ defmodule Cairn.BoardPipeline.EpochStamp do
   end
 end
 
+defmodule Cairn.BoardPipeline.Board do
+  @moduledoc """
+  The release's board with one change, for `BOARD_PIPELINE_ENGINES` > 1: a
+  camera's `:infer` step calls the `Cairn.Native.Host` this harness assigned
+  it. `Cairn.Pipeline.DetectChain.build/4` hands a board only the chain
+  context, so the assignment is a `:persistent_term` the harness writes
+  before the pipe builds. `name/0` and `detect_chain/1` are all `build/4`
+  asks of a board; the host reads the release's own. Every camera's decoder
+  still opens through the first host (the default name), which is sound only
+  because all the hosts load one config.
+  """
+
+  def assign(camera_id, server), do: :persistent_term.put({__MODULE__, camera_id}, server)
+
+  def detect_chain(context) do
+    server = :persistent_term.get({__MODULE__, context.camera_id})
+
+    context
+    |> board().detect_chain()
+    |> Enum.map(fn
+      %{name: :infer, element: %{session: {module, _server}} = infer} = step ->
+        %{step | element: %{infer | session: {module, server}}}
+
+      step ->
+        step
+    end)
+  end
+
+  def name, do: board().name()
+
+  defp board, do: Cairn.Board.module()
+end
+
 defmodule Cairn.BoardPipeline.Pipe do
   @moduledoc """
-  The detect branch of `Cairn.Pipeline.Camera`, minus the tee and the other
-  branches: source and parser stand in for an ingest session, everything from
-  the picker on is the production spec verbatim — the manual-pad `via_in`
-  options between picker/decoder/inference are the load-bearing one-frame
-  seams and are copied, not re-derived.
+  One camera's detect branch as production builds it
+  (`Cairn.Pipeline.DetectChain.build/4`, so the release's board picks the
+  elements), with a paced clip and parser standing in for the ingest session
+  and `DetectionSink` for the host-side tracker. `stream_params: %{}` builds
+  no motion gate: every sampled frame is inferred.
   """
 
   use Membrane.Pipeline
 
-  alias Cairn.BoardPipeline.{AuSource, DetectionSink}
-  alias Cairn.Pipeline.{Decoder, Inference, Picker}
+  alias Cairn.BoardPipeline.{AuSource, DetectionSink, EpochStamp}
+
+  # The harness's own children; every other child is a chain step, and every
+  # chain element answers `:stats`.
+  @own [:source, :ingest_parser, :epoch_stamp, :detect]
 
   @impl true
   def handle_init(_ctx, opts) do
     camera = Keyword.fetch!(opts, :camera)
-    epoch = Keyword.fetch!(opts, :epoch)
     collector = Keyword.fetch!(opts, :collector)
 
     spec =
@@ -409,40 +441,28 @@ defmodule Cairn.BoardPipeline.Pipe do
         clip: Keyword.fetch!(opts, :clip),
         seconds: Keyword.fetch!(opts, :seconds)
       })
-      # `Cairn.Pipeline.Camera`'s rtsp ingest pairing: the parser re-emits
-      # AU-aligned Annex-B with the SPS geometry in the stream format, which
-      # is what drives the decoder's format-driven open.
+      # AU-aligned Annex-B with the SPS geometry in the stream format, as the
+      # rtsp source emits it in production.
       |> child(:ingest_parser, %Membrane.H264.Parser{
         output_alignment: :au,
         output_stream_structure: :annexb
       })
-      |> child(:epoch_stamp, %Cairn.BoardPipeline.EpochStamp{epoch: epoch})
-      |> child(:picker, Picker)
-      # One AU between the two, so the picker learns that the decoder is free
-      # the moment it is, and no more than one is ever in flight.
-      |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
-      |> child(:decoder, %Decoder{camera_id: camera.id, stream_params: %{}})
-      # …and one sampled frame between decoder and inference, for the same
-      # reason: inference demands only after `push_frame/5` returns.
-      |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
-      |> child(:infer, %Inference{
-        session: {Cairn.Native.Host, Cairn.Native.Host},
-        stream_id: camera.id,
-        stream_params: %{}
-      })
+      |> child(:epoch_stamp, %EpochStamp{epoch: Keyword.fetch!(opts, :epoch)})
+      |> Cairn.Pipeline.DetectChain.build(
+        camera,
+        [decoder: Keyword.fetch!(opts, :decoder), stream_params: %{}],
+        Keyword.fetch!(opts, :board)
+      )
       |> child(:detect, %DetectionSink{camera_id: camera.id, collector: collector})
 
     {[spec: spec], %{collector: collector, camera_id: camera.id}}
   end
 
   @impl true
-  def handle_info(:stats, _ctx, state) do
-    {[
-       notify_child: {:picker, :stats},
-       notify_child: {:decoder, :stats},
-       notify_child: {:infer, :stats},
-       notify_child: {:detect, :stats}
-     ], state}
+  def handle_info(:stats, ctx, state) do
+    children = ctx.children |> Map.keys() |> Enum.reject(&(&1 in @own)) |> Enum.sort()
+    send(state.collector, {:stats_asked, state.camera_id, children})
+    {Enum.map(children, &{:notify_child, {&1, :stats}}), state}
   end
 
   @impl true
@@ -456,37 +476,36 @@ end
 
 defmodule Cairn.BoardPipeline do
   @moduledoc """
-  Runs cairn's real membrane detect branch — parser, `Cairn.Pipeline.Picker`,
-  `Cairn.Pipeline.Decoder`, `Cairn.Pipeline.Inference` — against a real
-  `Cairn.Native.Host` (with its `Cairn.Native.Health` monitor) in a standalone
-  BEAM: plan task 5.2's other half. `Cairn.BoardSoak` asks whether the NIFs
-  survive; this asks whether the *pipeline around them* behaves — the
-  format-driven decoder open, the one-frame manual seams, the pacing of the
-  model call.
+  Runs cairn's detect branch, as the release's board builds it, for N paced
+  clip streams against real `Cairn.Native.Host`s (each with its
+  `Cairn.Native.Health`). `Cairn.BoardSoak` asks whether the NIFs survive;
+  this asks whether the *pipeline around them* behaves — the format-driven
+  decoder open, the one-frame manual seams, the pacing of the model call —
+  and how many streams a board carries at `sample_fps`.
 
-  Compiled with `elixirc`, not `mix`: no release and no cairn application,
-  only the module subset `tools/board-pipeline/run-local.sh` lists plus the
-  membrane closure. The seams that keep the rest of the app out:
+  A source file required into a VM that has cairn's modules but has started
+  none of its applications: a release's `bin/cairn eval` (`rk-cell.sh`) or
+  the elixirc slice `run-local.sh` builds. The seams that keep the rest of the
+  app out:
 
     * `Host.start_link(config: ...)` — a non-nil `:config` opt means
       `Cairn.Config.Server` is never consulted;
-    * `canary: [enabled: false]` — no `cairn-detect` binary is spawned;
+    * `canary: [enabled: false]` unless `BOARD_PIPELINE_CANARY=1` — no probe
+      binary is spawned, and so no CPU baseline is measured either (on an
+      accelerator backend the host warns that health cannot be judged against
+      one);
     * a fixed per-pipe epoch stamped onto every buffer by
-      `Cairn.BoardPipeline.EpochStamp` (the inference element reads it off
-      the frame; params carry none) — `Cairn.StreamEpochs` is
-      short-circuited (its ETS-missing paths answer `:unknown` harmlessly);
+      `Cairn.BoardPipeline.EpochStamp` — `Cairn.StreamEpochs`' table is never
+      started, and its table-missing paths answer `:unknown` harmlessly;
     * `Cairn.BoardPipeline.DetectionSink` — the branch ends at the inference
-      element's pad, so the host-side tracker closure stays out (see that
-      module).
+      element's pad, so the host-side tracker closure stays out.
 
-  The undefined-module warnings the standalone compile emits — `Cairn.Config`
-  / `Cairn.Config.Server` (host.ex, config/camera.ex, canary.ex) and
-  `Phoenix.PubSub` (stream_epochs.ex, host.ex) — are remote calls this path
-  never takes.
+  A run that measured ends with one `board-pipeline: engine …` line per host
+  and one `board-pipeline: result …` line, `key=value` pairs for
+  `rk-ladder.sh` to cut.
   """
 
-  alias Cairn.BoardPipeline.{Collector, Pipe}
-  alias Cairn.Config.Camera
+  alias Cairn.BoardPipeline.{Board, Collector, Pipe}
   alias Cairn.Native.Health
   alias Cairn.Native.Host
 
@@ -507,17 +526,38 @@ defmodule Cairn.BoardPipeline do
     labels: "/data/cairn-bench/coco.names",
     backend: "qnn",
     qnn_library: "/data/cairn-bench/libonnxruntime_providers_qnn.so",
+    model_profile: nil,
+    input_size: nil,
+    cpu_twin: nil,
+    canary: 0,
     clip: nil,
     seconds: 300,
     decoder: "auto",
     sample_fps: 5,
     streams: 1,
+    engines: 1,
     # `.so`-less NIF paths for `Application.put_env`; absent falls back to
     # `:code.priv_dir(:cairn)`, which only resolves when cairn's ebin is on
     # the code path.
     native_lib: nil,
     ort_lib: nil
   }
+
+  @doc "`run/1` from the environment, halting 0 on `:ok` and 1 otherwise."
+  @spec main() :: no_return()
+  def main do
+    # Membrane logs every child's options at debug, the whole clip included.
+    Logger.configure(level: :info)
+
+    case run() do
+      :ok ->
+        System.halt(0)
+
+      other ->
+        IO.puts("board-pipeline: #{inspect(other)}")
+        System.halt(1)
+    end
+  end
 
   @doc """
   Run the pipeline harness. `opts` is a map or keyword list; any key left out
@@ -535,46 +575,86 @@ defmodule Cairn.BoardPipeline do
     result =
       with :ok <- validate_positive(opts, :streams),
            :ok <- validate_positive(opts, :seconds),
+           :ok <- validate_positive(opts, :sample_fps),
+           :ok <- validate_positive(opts, :engines),
+           :ok <- validate_canary(opts),
+           :ok <- validate_engines_have_cameras(opts),
            :ok <- start_apps(),
-           :ok <- check_available(),
+           :ok <- check_available(opts),
            {:ok, clip} <- read_clip(opts.clip) do
         with_stack(opts, clip)
       end
 
     # As `Cairn.BoardSoak`: make the deferred native drops queue and run now,
-    # so the halt that follows never races the cairn-teardown thread.
+    # so the halt that follows never races the teardown thread.
     :erlang.garbage_collect()
 
-    drains = %{
-      native: Cairn.Native.available?() and Cairn.Native.drain_teardown(10_000),
-      ort: CairnOrt.available?() and CairnOrt.drain_teardown(10_000)
-    }
+    drains = Enum.map_join(nif_modules(opts), " ", &"#{inspect(&1)}=#{drain(&1)}")
+    IO.puts("board-pipeline: drains " <> drains)
 
-    IO.puts("board-pipeline: drains native=#{drains.native} ort=#{drains.ort}")
-    result
+    case result do
+      {:ok, report} ->
+        print_report(report, opts)
+        :ok
+
+      error ->
+        error
+    end
   end
+
+  # The decode and engine libraries the board resolves for this run, each once:
+  # `rkmpp` and `rknn` name the same Rockchip module.
+  defp nif_modules(opts) do
+    board = Cairn.Board.module()
+    Enum.uniq([board.decoder_backend(opts.decoder), board.engine(opts.backend).module])
+  end
+
+  defp drain(module) do
+    exported?(module, :available?, 0) and module.available?() and
+      exported?(module, :drain_teardown, 1) and module.drain_teardown(10_000)
+  end
+
+  defp exported?(module, function, arity),
+    do: Code.ensure_loaded?(module) and function_exported?(module, function, arity)
 
   defp with_stack(opts, clip) do
     {:ok, _task_sup} = Task.Supervisor.start_link(name: Cairn.TaskSupervisor)
-    {:ok, host} = Host.start_link(config: host_config(opts), canary: [enabled: false])
-    {:ok, health} = Health.start_link(host: Host)
+
+    # The first keeps the default name: the decode step opens through it.
+    servers =
+      for n <- 1..opts.engines, do: if(n == 1, do: Host, else: Module.concat(Host, "E#{n}"))
+
+    stack =
+      Enum.map(servers, fn server ->
+        {:ok, host} =
+          Host.start_link(
+            name: server,
+            config: host_config(opts),
+            canary: [enabled: opts.canary == 1]
+          )
+
+        {:ok, health} = Health.start_link(host: server)
+        {server, host, health}
+      end)
 
     result =
-      case await_engine() do
-        :ok -> run_pipeline(opts, clip)
+      case Enum.find(Enum.map(servers, &await_engine/1), &(&1 != :ok)) do
+        nil -> run_pipeline(opts, clip, servers)
         error -> error
       end
 
-    GenServer.stop(health)
-    GenServer.stop(host)
-    # The host's stream closes run in tasks that outlive it; give them the
-    # moment they need before the drains below account for their drops.
-    # Grace for the ResourceGuard's async cleanups and the host's close tasks;
-    # the bounded drains below are the actual backstop if 500 ms was not it.
+    Enum.each(stack, fn {_server, host, health} ->
+      GenServer.stop(health)
+      GenServer.stop(host)
+    end)
+
+    # Grace for the ResourceGuard's async cleanups and the host's close tasks,
+    # which outlive it; the bounded drains after this are the backstop.
     Process.sleep(500)
     result
   end
 
+  # The keys `Cairn.Config.Profile.native_config/1` lowers a profile rung into.
   defp host_config(opts) do
     %{
       model: opts.model,
@@ -582,6 +662,9 @@ defmodule Cairn.BoardPipeline do
       backend: opts.backend,
       decoder: opts.decoder,
       sample_fps: opts.sample_fps,
+      model_profile: opts.model_profile,
+      input_size: opts.input_size,
+      cpu_twin: opts.cpu_twin,
       qnn: %{library: opts.qnn_library}
     }
   end
@@ -589,10 +672,13 @@ defmodule Cairn.BoardPipeline do
   # The status call queues behind the model load `init/1` runs in its
   # continue, so one long-deadline call is the readiness barrier — a QNN HTP
   # graph compile is multi-second.
-  defp await_engine do
-    case Host.status(Host, 300_000) do
+  defp await_engine(server) do
+    case Host.status(server, 300_000) do
       %{engine: :ready} = status ->
-        IO.puts("board-pipeline: engine ready — model #{status.model} backend #{status.backend}")
+        IO.puts(
+          "board-pipeline: engine #{inspect(server)} ready — model #{status.model} " <>
+            "backend #{status.backend}"
+        )
 
         :ok
 
@@ -602,48 +688,72 @@ defmodule Cairn.BoardPipeline do
     end
   end
 
-  defp run_pipeline(opts, clip) do
+  defp run_pipeline(opts, clip, servers) do
     {:ok, collector} = Collector.start_link()
     install_decoder_probe(collector)
+    board = if opts.engines == 1, do: Cairn.Board.module(), else: Board
 
-    # One pipeline per stream against the one shared Host — the capacity
+    # One pipeline per stream, round-robin over the hosts — the capacity
     # question is how many detect branches this box carries at sample_fps.
-    pipelines =
+    cameras =
       for n <- 1..opts.streams do
-        camera = %Camera{
-          id: "#{@camera_id}-#{n}",
-          rtsp_url: "rtsp://board-pipeline.invalid/clip-#{n}"
-        }
+        camera = %{id: "#{@camera_id}-#{n}"}
+        Board.assign(camera.id, Enum.at(servers, rem(n - 1, length(servers))))
 
         {:ok, _supervisor, pipeline} =
           Membrane.Pipeline.start_link(Pipe,
             camera: camera,
+            board: board,
+            decoder: opts.decoder,
             epoch: Cairn.ULID.generate(),
             collector: collector,
             clip: clip,
             seconds: opts.seconds
           )
 
-        pipeline
+        {camera.id, pipeline}
       end
 
     # One extra second so the source's own deadline fires and end_of_stream
     # drains through the sink before teardown starts.
     Process.sleep(opts.seconds * 1000 + 1000)
-    Enum.each(pipelines, &send(&1, :stats))
+    # Health publishes only when a cycle ends (once a minute), so one is run
+    # now. `inferences` is the whole run's count; the p50 is over what ran
+    # since Health's last cycle, at most a minute of the run's tail, and `-`
+    # if nothing did. It is the engine's detect call per pass (`infer_us`):
+    # the wait on the model lock is in it and tensor packing is not. With
+    # several cameras on one engine it reads well above the crate's own
+    # `infer latency` line, which times the backend's run alone.
+    engines = Enum.map(servers, &engine_status/1)
+    Enum.each(cameras, fn {_id, pipeline} -> send(pipeline, :stats) end)
     Process.sleep(300)
-    Enum.each(pipelines, &(:ok = Membrane.Pipeline.terminate(&1, timeout: 10_000)))
 
-    summarize(GenServer.call(collector, :summary), opts)
+    Enum.each(cameras, fn {_id, pipeline} ->
+      :ok = Membrane.Pipeline.terminate(pipeline, timeout: 10_000)
+    end)
+
+    summary = GenServer.call(collector, :summary)
+    summarize(summary, opts)
     GenServer.stop(collector)
-    :ok
+
+    obs = Enum.map(cameras, fn {id, _} -> get_in(summary.cams, [id, :observations]) || 0 end)
+
+    # No `result` line for a run that observed nothing: `rk-ladder.sh` would
+    # take it for a cell that ran.
+    if Enum.sum(obs) == 0,
+      do: {:error, :no_observations},
+      else: {:ok, %{engines: engines, obs: obs}}
   end
 
-  # A `:sys` debug hook on the host: `Cairn.Pipeline.Decoder` opens through a
-  # hard-wired `Host.open_decoder` call, so the `source` argument crossing the
-  # host's mailbox is the only externally observable proof that the parser's
-  # geometry-bearing stream format arrived before the open — the decoder has
-  # no other way to learn a `{w, h}`.
+  defp engine_status(server) do
+    Host.check_health(server)
+    Host.status(server, 30_000)
+  end
+
+  # A `:sys` debug hook on the host the decode step opens through: the
+  # `source` argument crossing its mailbox is the only externally observable
+  # proof that the parser's geometry-bearing stream format arrived before the
+  # open — the decoder has no other way to learn a `{w, h}`.
   defp install_decoder_probe(collector) do
     :sys.install(
       Process.whereis(Host),
@@ -712,8 +822,9 @@ defmodule Cairn.BoardPipeline do
     # must be a line in the summary, not a silently shorter list.
     expected =
       for n <- 1..opts.streams,
-          child <- [:picker, :decoder, :infer, :detect],
-          do: {"#{@camera_id}-#{n}", child}
+          camera_id = "#{@camera_id}-#{n}",
+          child <- Map.get(summary.asked, camera_id, [:pipe]),
+          do: {camera_id, child}
 
     case expected -- Map.keys(summary.stats) do
       [] ->
@@ -726,6 +837,28 @@ defmodule Cairn.BoardPipeline do
         )
     end
   end
+
+  # Plain ASCII, single-space `key=value`, last: busybox `sed` cuts these.
+  defp print_report(report, opts) do
+    report.engines
+    |> Enum.with_index(1)
+    |> Enum.each(fn {status, n} ->
+      IO.puts(
+        "board-pipeline: engine n=#{n} health=#{field(status[:health])} " <>
+          "p50_ms=#{field(status[:p50_ms])} inferences=#{field(status[:inferences])}"
+      )
+    end)
+
+    IO.puts(
+      "board-pipeline: result streams=#{opts.streams} engines=#{opts.engines} " <>
+        "seconds=#{opts.seconds} sample_fps=#{opts.sample_fps} total_obs=#{Enum.sum(report.obs)} " <>
+        "min_obs=#{Enum.min(report.obs)} max_obs=#{Enum.max(report.obs)}"
+    )
+  end
+
+  defp field(nil), do: "-"
+  defp field(value) when is_float(value), do: Float.round(value, 2)
+  defp field(value), do: value
 
   defp start_apps do
     Enum.reduce_while(@apps, :ok, fn app, :ok ->
@@ -752,7 +885,8 @@ defmodule Cairn.BoardPipeline do
   # `streams: 0` would make `1..opts.streams` a *descending* range and run
   # two streams — the exact off-by-configuration board-soak documents.
   # `seconds: 0` survives to the summary's per-second division and raises
-  # there, after the run — refuse both up front.
+  # there, after the run — refuse each up front. An env value that is not an
+  # integer arrives here as its string and is refused the same way.
   defp validate_positive(opts, key) do
     case Map.fetch!(opts, key) do
       value when is_integer(value) and value >= 1 ->
@@ -764,22 +898,43 @@ defmodule Cairn.BoardPipeline do
     end
   end
 
-  # A missing library must not read as a clean run.
-  defp check_available do
-    cond do
-      not Cairn.Native.available?() ->
-        IO.puts(
-          "board-pipeline: cairn-native did not load: #{inspect(Cairn.Native.load_error())}"
-        )
+  defp validate_canary(%{canary: canary}) when canary in [0, 1], do: :ok
 
-        {:error, :native_unavailable}
+  defp validate_canary(%{canary: other}) do
+    IO.puts("board-pipeline: refusing to run — canary must be 0 or 1, got #{inspect(other)}")
+    {:error, {:canary, other}}
+  end
 
-      not CairnOrt.available?() ->
-        IO.puts("board-pipeline: cairn-ort did not load: #{inspect(CairnOrt.load_error())}")
-        {:error, :ort_unavailable}
+  # An engine with no camera still loads a model, and the result line would
+  # count it as one that carried load.
+  defp validate_engines_have_cameras(%{engines: engines, streams: streams})
+       when engines <= streams,
+       do: :ok
 
-      true ->
+  defp validate_engines_have_cameras(%{engines: engines, streams: streams}) do
+    IO.puts("board-pipeline: refusing to run — engines (#{engines}) exceed streams (#{streams})")
+
+    {:error, {:engines, engines}}
+  end
+
+  # A missing library must not read as a clean run. An unset
+  # CAIRN_RKNN_LIBRARY is the loader's search path, which on a release image
+  # is never where librknnrt sits: the base downloads it.
+  defp check_available(opts) do
+    rknn_library = System.get_env("CAIRN_RKNN_LIBRARY")
+
+    case Enum.reject(nif_modules(opts), &(exported?(&1, :available?, 0) and &1.available?())) do
+      _unavailable when opts.backend == "rknn" and rknn_library in [nil, ""] ->
+        IO.puts("board-pipeline: refusing to run — backend rknn needs CAIRN_RKNN_LIBRARY set")
+        {:error, :rknn_library_unset}
+
+      [] ->
         :ok
+
+      [module | _] ->
+        error = if exported?(module, :load_error, 0), do: module.load_error()
+        IO.puts("board-pipeline: #{inspect(module)} did not load: #{inspect(error)}")
+        {:error, {:unavailable, module}}
     end
   end
 
@@ -816,14 +971,20 @@ defmodule Cairn.BoardPipeline do
       model: string_opt(given, :model, "BOARD_PIPELINE_MODEL"),
       labels: string_opt(given, :labels, "BOARD_PIPELINE_LABELS"),
       backend: string_opt(given, :backend, "BOARD_PIPELINE_BACKEND"),
-      # Blank means "no library" rather than the board default, so a wrapper
-      # script can export the var unconditionally.
+      # Blank means "none" rather than the default, so a wrapper script can
+      # export these unconditionally.
       qnn_library: blank_to_nil(string_opt(given, :qnn_library, "BOARD_PIPELINE_QNN_LIBRARY")),
+      model_profile:
+        blank_to_nil(string_opt(given, :model_profile, "BOARD_PIPELINE_MODEL_PROFILE")),
+      input_size: blank_to_nil(string_opt(given, :input_size, "BOARD_PIPELINE_INPUT_SIZE")),
+      cpu_twin: blank_to_nil(string_opt(given, :cpu_twin, "BOARD_PIPELINE_CPU_TWIN")),
+      canary: integer_opt(given, :canary, "BOARD_PIPELINE_CANARY"),
       clip: Map.get(given, :clip, System.get_env("BOARD_PIPELINE_CLIP", @defaults.clip)),
       seconds: integer_opt(given, :seconds, "BOARD_PIPELINE_SECONDS"),
       decoder: string_opt(given, :decoder, "BOARD_PIPELINE_DECODER"),
       sample_fps: integer_opt(given, :sample_fps, "BOARD_PIPELINE_SAMPLE_FPS"),
       streams: integer_opt(given, :streams, "BOARD_PIPELINE_STREAMS"),
+      engines: integer_opt(given, :engines, "BOARD_PIPELINE_ENGINES"),
       native_lib:
         blank_to_nil(Map.get(given, :native_lib, System.get_env("BOARD_PIPELINE_NATIVE_LIB"))),
       ort_lib: blank_to_nil(Map.get(given, :ort_lib, System.get_env("BOARD_PIPELINE_ORT_LIB")))
@@ -848,30 +1009,28 @@ defmodule Cairn.BoardPipeline do
       :error ->
         case System.get_env(env) do
           nil -> Map.fetch!(@defaults, key)
-          value -> parse_integer(env, value, Map.fetch!(@defaults, key))
+          value -> parse_integer(value, Map.fetch!(@defaults, key))
         end
     end
   end
 
-  defp parse_integer(env, value, default) do
+  # Blank means the default: a wrapper script exports these unconditionally
+  # (the QCS `run-cell.sh` passes `BOARD_PIPELINE_SAMPLE_FPS=""`). Anything
+  # else that is not an integer is returned raw for validation to refuse.
+  defp parse_integer("", default), do: default
+
+  defp parse_integer(value, _default) do
     case Integer.parse(value) do
-      {n, ""} ->
-        n
-
-      _not_an_integer ->
-        IO.puts(
-          "board-pipeline: ignoring #{env}=#{inspect(value)} — not an integer; " <>
-            "using #{inspect(default)}"
-        )
-
-        default
+      {n, ""} -> n
+      _not_an_integer -> value
     end
   end
 
   defp announce(opts) do
     IO.puts(
       "board-pipeline: model=#{opts.model} backend=#{opts.backend} decoder=#{opts.decoder} " <>
-        "sample_fps=#{opts.sample_fps} streams=#{opts.streams} clip=#{inspect(opts.clip)} " <>
+        "sample_fps=#{opts.sample_fps} streams=#{opts.streams} engines=#{opts.engines} " <>
+        "input_size=#{inspect(opts.input_size)} clip=#{inspect(opts.clip)} " <>
         "seconds=#{opts.seconds}"
     )
   end

@@ -1,18 +1,24 @@
-# DRAFT: every budget below is PROVISIONAL, taken from the bring-up
-# benches; the measurement campaign (plan Phase 12: a boundary run per
-# rung) replaces them, and the claim with them.
+# Rockchip RK3566 (HA Green): two Apache YOLOX rungs, INT8 for the NPU
+# (rknn-toolkit2 2.3.2, tools/rknn-export). No release carries them: the
+# artifact store fetches each from its `url:` at first start and the rung
+# is usable once the file hashes to its `sha256:`. While one is missing, a
+# config whose cameras run this profile is refused, naming it.
 #
-# Rockchip RK3566 (HA Green): the three Apache YOLOX rungs, INT8 for the
-# NPU (rknn-toolkit2 2.3.2, tools/rknn-export). No release carries them:
-# the artifact store fetches each from its `url:` at first start and the
-# rung is usable once the file hashes to its `sha256:`. While one is
-# missing, a config whose cameras run this profile is refused, naming it.
+# Budgets are boundary runs on the board in the release's own VM, Core and
+# Matter running, gate open at 2 fps: the most cameras that each kept
+# their full rate through two 300 s cells, times the 1.875/s floor rate
+# (docs/evidence/rk3566-capacity-20261118.md, whose cell names these are).
 #
-# Budgets are passes/s through one engine, every frame offered: sustained,
-# not a p50 — rungs 1 and 3 on a recorded 1080p clip through the probe
-# binary, rung 2 as its own comment says. The in-VM engine has read slower
-# on live cameras (p50 45-48 ms on the 416 rung against 33 ms here), so
-# these may be optimistic; Phase 12 says.
+# One engine is one context, and these budgets are one context's. Two
+# contexts of one model carried more (+57 % on the 416 rung, +34 % on
+# yolox_s), but the engine has no pool.
+#
+# Two different models loaded together ran in lockstep in the bring-up
+# benches, each at the same pass rate. No rung is budgeted for that: a
+# config whose cameras ask for different models is refused.
+#
+# yolox_tiny at 640 is not a rung: it held four cameras and missed five,
+# the same as yolox_s below, so no fleet would select it.
 #
 # experimental: true because rknn has not soaked (D-P10); a group naming
 # this profile also needs `allow_experimental: true`. AGPL pack rungs are
@@ -22,34 +28,24 @@ tier: 1
 backend: rknn
 model_profile: yolox
 model_ladder:
-  # Best accuracy (40.5 paper mAP). provisional budget: 756 passes in
-  # 78 s (board-p4).
+  # Best accuracy (40.5 paper mAP). measured: 4 cameras clean
+  # (b-s640-r1-4cam-1794965572, b-s640-r2-4cam-1794965898), 5 miss.
   - sha256: c61524bca75d6f5df3fd255c8f27b5eaca544c94cbd05d4ce835a82a48733282
     url: https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/yolox_s_640_i8.rknn
     model:
       onnx: models/yolox_s.onnx
     input_size: 640
-    engine_budget: 9.7
-  # tiny's weights at 640, kept by its parity bar (person recall 0.94 vs
-  # the 416 rung's 0.87). provisional budget: the 60 s sustained loop of
-  # a trial build (board probe); this pinned file has no run of its own.
-  # Its twin is the 416 release file with the input size rewritten.
-  - sha256: cd146e38777ea0c38e20c114c4166fb9b7553c379e20651a999167acb0bb044a
-    url: https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/yolox_tiny_640_i8.rknn
-    model:
-      onnx: models/yolox_tiny_640.onnx
-    input_size: 640
-    engine_budget: 11.96
-  # provisional budget: 1,812 passes in 78 s (board-p4).
+    engine_budget: 7.5
+  # measured: 9 cameras clean (b-t416-r1-9cam-1794962358,
+  # b-t416-r2-9cam-1794962684), 10 miss.
   - sha256: 832df464bc84259d8d612bb7e9d4f6dd8573acb94f9847e051cce4c438c78304
     url: https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/yolox_tiny_416_i8.rknn
     model:
       onnx: models/yolox_tiny.onnx
     input_size: 416
-    engine_budget: 23.2
-# Arithmetic, not a measured fleet: the 416 rung's budget at tier 1's
-# 2 fps floor (1.875/s effective), 23.2 / 1.875 = 12.
-supported_cameras: 12
+    engine_budget: 16.875
+# The 416 rung's nine measured cameras.
+supported_cameras: 9
 # MPP decode and RGA scale. Named because a named decoder is a requirement:
 # without the device nodes detection stops and says so, rather than
 # decoding in software on the cores the rest of the pipeline needs.

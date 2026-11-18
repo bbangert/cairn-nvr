@@ -90,6 +90,28 @@ curl -H "Authorization: Bearer <integrations.token>" http://192.168.2.155:4000/a
   `grep`, `sed`, `cut` and `tail` are there.
 - The artifact expires after three days.
 
+## Capacity cells on the Green
+
+`tools/board-pipeline/board_pipeline.ex` runs inside the image's own release
+(`bin/cairn eval`, no application started): `rk-cell.sh` is one
+`podman run --rm` cell, `rk-ladder.sh` a detached run of cells over stream
+counts. sftp into `/root/cairn-bench-rk` (`BASE`): `h/board_pipeline.ex` and
+`h/<clip>.aus` (seen at `/h`), librknnrt and the `.rknn` rungs under
+`artifacts/` (`/artifacts`; a copy of a Cairn data dir's `artifacts/`, its
+files named by sha256, serves), and the two scripts; results land in `runs/`.
+
+```sh
+cd /root/cairn-bench-rk
+IMAGE=<image> MODEL=/artifacts/<rung> \
+  INPUT_SIZE=640 RKNN_LIBRARY=/artifacts/<librknnrt> CLIP=/h/<clip>.aus \
+  sh rk-ladder.sh s640 "3 4 5 6 7" >/dev/null 2>&1 &
+tail -n 3 runs/s640.ladder.log; cat runs/s640.csv    # done at LADDER-DONE
+```
+
+- `bench.sh` is the QCS6490 plugin-era runner, not used on the Green: its
+  blanket `killall` must never run on a board hosting other containers. The
+  cell scripts touch only the container `cairn-bench-cell`.
+
 ## The add-on on a bench board, through vagus
 
 Once the image is on ghcr and the add-on's directory is in a store repository

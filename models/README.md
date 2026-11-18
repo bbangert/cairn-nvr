@@ -46,6 +46,7 @@ files above are quantized for the HTP; on that board's CPU the FP32 files
 are the ones to run.
 
 The qdq paths are what `priv/profiles/generic/qcs6490-tier1.yml` names; the
-FP32 files are CPU twins in the Rockchip board's `rk3566-tier1.yml`.
+two Megvii files are CPU twins in the Rockchip board's `rk3566-tier1.yml`,
+and the 640 tiny file is the twin of a rung that profile does not carry.
 `models/…` resolves against the node's working directory — `/app` in the
 image, the repo root in dev.
