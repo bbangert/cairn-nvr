@@ -139,8 +139,12 @@ amd64)
   ORT_SHA=1254da24fb389cf39dc0ff3451ab48301740ffbfcbaf646849df92f80ee92c57
   ;;
 esac
+# Our mirror first (arm64 only), Microsoft's second: microsoft/onnxruntime
+# went 404 on 2026-11-17. The sha256 check makes the host irrelevant.
 curl -fsSL -o /tmp/ort.tgz \
-  "https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/$ORT_TGZ"
+  "https://github.com/bbangert/cairn-nvr/releases/download/ort-1.26.0/$ORT_TGZ" ||
+  curl -fsSL -o /tmp/ort.tgz \
+    "https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/$ORT_TGZ"
 echo "$ORT_SHA /tmp/ort.tgz" | sha256sum -c -
 tar -xzf /tmp/ort.tgz -C /tmp
 ORT_DIR="/tmp/${ORT_TGZ%.tgz}"
