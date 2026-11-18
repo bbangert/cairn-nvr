@@ -129,6 +129,21 @@ defmodule Cairn.PipelineOwnerTest do
     Process.sleep(1_100)
   end
 
+  # A ring holding a fragment from just now: the only ring the detect signal
+  # is believed behind. `fragment/1` again keeps it inside the 1 s window.
+  defp recording(cam) do
+    start_supervised!({RingBuffer, camera_id: cam.id, pre_window_seconds: 5},
+      id: {:ring, cam.id}
+    )
+
+    fragment(cam)
+  end
+
+  defp fragment(cam) do
+    RingBuffer.put_fragment(cam.id, %Fragment{camera_id: cam.id, seq: 0, pts: 0, data: <<1>>})
+    wait_until(fn -> RingBuffer.last_fragment_at(cam.id) != nil end)
+  end
+
   describe "the pipeline's lifetime" do
     test "is started once, with the owner's initial reason, and monitored" do
       cam = camera(uid("po"))
@@ -574,14 +589,16 @@ defmodule Cairn.PipelineOwnerTest do
     @tag :capture_log
     test "rebuilds when the detect branch goes stale behind a healthy ring" do
       cam = camera(uid("pw"), plugin: {:group, "g"})
+      recording(cam)
       owner = start_owner(cam, watchdog_interval_ms: 50)
       id = cam.id
 
       assert_receive {:pipeline_started, first, _opts}, 2_000
 
       # The sink's own reply, stood in for by hand: the detect branch last
-      # produced a buffer five stall windows ago, while the ring — which has
-      # never held a fragment — is not stale at all.
+      # produced a buffer five stall windows ago, while the ring holds a
+      # fragment from just now.
+      fragment(cam)
       send(owner, {:stats, %{last_buffer_at_ms: System.monotonic_time(:millisecond) - 5_000}})
 
       assert_receive {:status, ^id, :stalled}, 2_000
@@ -596,6 +613,7 @@ defmodule Cairn.PipelineOwnerTest do
     test "a detect branch stale behind a closed detection gate is not a wedge" do
       cam = camera(uid("pd"), plugin: {:group, "g"})
       Cairn.CameraControl.put(cam.id, %{detection_enabled: false})
+      recording(cam)
       owner = start_owner(cam, watchdog_interval_ms: 50)
 
       assert_receive {:pipeline_started, _first, _opts}, 2_000
@@ -604,8 +622,10 @@ defmodule Cairn.PipelineOwnerTest do
       refute_receive {:pipeline_started, _pid, _opts}, 500
 
       # Re-enabling does not rebuild on the age the disable left behind: the
-      # branch gets a full stall window to produce its first real buffer.
+      # branch gets a full stall window to produce its first real buffer. The
+      # ring is kept fresh so only the gate is holding the rebuild back.
       Cairn.CameraControl.put(cam.id, %{detection_enabled: true})
+      fragment(cam)
       refute_receive {:pipeline_started, _pid, _opts}, 500
     end
 
@@ -660,7 +680,8 @@ defmodule Cairn.PipelineOwnerTest do
         id: {:ring, cam.id}
       )
 
-      owner = start_owner(cam, watchdog_interval_ms: 50)
+      # Any first_fragment_ms at or under the 1 s stall window collapses to it.
+      owner = start_owner(cam, watchdog_interval_ms: 50, first_fragment_ms: 1)
 
       assert_receive {:pipeline_started, first, _opts}, 2_000
       send(owner, {:stream_connected, :main, []})
@@ -671,6 +692,62 @@ defmodule Cairn.PipelineOwnerTest do
       assert_receive {:pipeline_started, second, opts}, 2_000
       assert second != first
       assert opts[:initial_reason] == :stall_bounce
+    end
+
+    test "an empty ring gets the first-fragment window, not the stall window" do
+      cam = camera(uid("pe"))
+
+      start_supervised!({RingBuffer, camera_id: cam.id, pre_window_seconds: 5},
+        id: {:ring, cam.id}
+      )
+
+      start_supervised!({StubBridge, {cam.id, self(), true}}, id: {:bridge, cam.id})
+      start_owner(cam, watchdog_interval_ms: 50)
+
+      assert_receive {:pipeline_started, _first, _opts}, 2_000
+
+      # Well past the 1 s stall window: a bridge still on its way to a first
+      # fragment is slow, not wedged.
+      refute_receive :bounced, 1_500
+    end
+
+    test "a detect branch that fed before the first fragment is not rebuilt over an empty ring" do
+      cam = camera(uid("pq"), ingest: :rtsp, plugin: {:group, "g"})
+
+      start_supervised!({RingBuffer, camera_id: cam.id, pre_window_seconds: 5},
+        id: {:ring, cam.id}
+      )
+
+      owner = start_owner(cam, watchdog_interval_ms: 50)
+      id = cam.id
+
+      assert_receive {:pipeline_started, _first, _opts}, 2_000
+      send(owner, {:stream_connected, :main, []})
+      send(owner, {:stats, %{last_buffer_at_ms: System.monotonic_time(:millisecond) - 5_000}})
+
+      # Source connected and past the 1 s stall window: only the first-fragment
+      # window holds the rebuild back, and an empty ring is no proof the
+      # source delivers.
+      refute_receive {:pipeline_started, _pid, _opts}, 1_500
+      refute_receive {:status, ^id, :stalled}, 0
+    end
+
+    @tag :capture_log
+    test "an empty ring is stale once the pipeline outlives the first-fragment window" do
+      cam = camera(uid("pl"))
+
+      start_supervised!({RingBuffer, camera_id: cam.id, pre_window_seconds: 5},
+        id: {:ring, cam.id}
+      )
+
+      start_supervised!({StubBridge, {cam.id, self(), true}}, id: {:bridge, cam.id})
+      # Well above the 1 s stall floor, so the window is the larger of the two.
+      start_owner(cam, watchdog_interval_ms: 50, first_fragment_ms: 2_500)
+
+      assert_receive {:pipeline_started, _first, _opts}, 2_000
+
+      refute_receive :bounced, 1_500
+      assert_receive :bounced, 2_500
     end
 
     test "leaves a stalled rtsp camera alone while its source is reconnecting" do
@@ -711,6 +788,7 @@ defmodule Cairn.PipelineOwnerTest do
     @tag :capture_log
     test "a rebuild waits for the old bridge_source registration to clear first" do
       cam = camera(uid("pz"), plugin: {:group, "g"})
+      recording(cam)
       owner = start_owner(cam, watchdog_interval_ms: 50, pipeline_module: StubBridgePipeline)
       id = cam.id
 
@@ -728,6 +806,7 @@ defmodule Cairn.PipelineOwnerTest do
         :sys.resume(partition)
       end)
 
+      fragment(cam)
       send(owner, {:stats, %{last_buffer_at_ms: System.monotonic_time(:millisecond) - 5_000}})
 
       assert_receive {:status, ^id, :stalled}, 2_000
@@ -768,22 +847,6 @@ defmodule Cairn.PipelineOwnerTest do
     defp wedge(owner) do
       send(owner, {:stats, %{last_buffer_at_ms: System.monotonic_time(:millisecond) - 5_000}})
       send(owner, :watchdog)
-    end
-
-    # The main stream is recording perfectly well throughout — which is both
-    # the premise of every test here (only the sub is in trouble) and what
-    # keeps the ring signal out of the way of the detect one.
-    defp recording(cam) do
-      start_supervised!({RingBuffer, camera_id: cam.id, pre_window_seconds: 5},
-        id: {:ring, cam.id}
-      )
-
-      fragment(cam)
-    end
-
-    defp fragment(cam) do
-      RingBuffer.put_fragment(cam.id, %Fragment{camera_id: cam.id, seq: 0, pts: 0, data: <<1>>})
-      wait_until(fn -> RingBuffer.last_fragment_at(cam.id) != nil end)
     end
 
     test "waits for the substream to connect before believing the detect signal" do

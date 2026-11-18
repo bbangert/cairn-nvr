@@ -39,13 +39,15 @@ defmodule Cairn.PipelineOwner do
   Per tick, two liveness signals — the ring's last fragment
   (`Cairn.RingBuffer.last_fragment_at/1`) and, for a detecting camera, the age
   of the last buffer at `Cairn.Pipeline.TrackSink` — against
-  `config.stall_seconds`:
+  `config.stall_seconds`. A ring that has never held a fragment is given 60 s
+  if that is longer: a first fragment costs a connect and a GOP, with every
+  other camera starting beside it.
 
-    * detect branch stale while the ring is healthy: the wedge is downstream
-      of the tee (or, for a dual-stream camera, on the sub stream), where no
-      reconnect reaches it — rebuild. Not while `Cairn.CameraControl` has
-      detection switched off, and not while the stream feeding the branch is
-      not connected: both make it quiet on purpose (`detect_gate/1`).
+    * detect branch stale while the ring holds a fresh fragment: the wedge is
+      downstream of the tee (or, for a dual-stream camera, on the sub stream),
+      where no reconnect reaches it — rebuild. Not while `Cairn.CameraControl`
+      has detection switched off, and not while the stream feeding the branch
+      is not connected: both make it quiet on purpose (`detect_gate/1`).
     * ring stale on `ingest: rtsp` while the *main* source reports itself
       connected: the same wedge on the recording side — rebuild. A source in
       backoff or lost is a mere outage and gets nothing: the in-element
@@ -87,6 +89,14 @@ defmodule Cairn.PipelineOwner do
   # Stale ticks with ffmpeg respawned before the bridge bounce escalates.
   @bridge_escalate_ticks 2
 
+  # The least a pipeline is given to put its first fragment in the ring. That
+  # costs a spawn, a connect (ffmpeg's own RTSP timeout is 10 s), a probe and
+  # a GOP: an absolute cost, not the operator's tolerance for a stream gone
+  # silent. With nine cameras starting at once on an RK3566, eight got their
+  # first bytes 11.7–14.2 s in and the 15 s default bounced four healthy
+  # bridges.
+  @first_fragment_ms 60_000
+
   @roles [:main, :sub]
 
   defstruct camera: nil,
@@ -114,8 +124,8 @@ defmodule Cairn.PipelineOwner do
             detect_gated_at_ms: nil,
             bridge_stale_ticks: nil,
             rebuilt_at_ms: nil,
-            # stands in for the ring's last-fragment time until the first
-            # fragment exists — see ring_stale?/1
+            # the clock for the first-fragment window while the ring is empty
+            # — see ring_state/1
             pipeline_started_at_ms: nil,
             # the ref the one pending `{:start, ref}` carries; any other is
             # stale — see enter_backoff/2
@@ -490,12 +500,13 @@ defmodule Cairn.PipelineOwner do
 
   defp check_liveness(state) do
     state = detect_gate(state)
+    ring = ring_state(state)
 
     cond do
-      detect_stale?(state) and not ring_stale?(state) ->
+      detect_stale?(state) and ring == :fresh ->
         rebuild(state, "detect branch stale while the ring is healthy")
 
-      not ring_stale?(state) ->
+      ring != :stale ->
         %{state | bridge_stale_ticks: nil}
 
       bridge?(state) ->
@@ -560,23 +571,30 @@ defmodule Cairn.PipelineOwner do
   defp debounced?(%{rebuilt_at_ms: nil}), do: false
   defp debounced?(state), do: now_ms() - state.rebuilt_at_ms < stall_ms(state)
 
-  # `nil` is not automatically healthy: a pipeline that wedges before its
-  # FIRST fragment would otherwise never trip the watchdog — nothing rebuilds
-  # per reconnect anymore, so nothing else would ever clear it. The pipeline's
-  # own start stands in for the missing fragment timestamp; the escalation
-  # rules still require a connected source before any of this becomes a
-  # rebuild, so a camera that is merely down stays exempt. An empty ring
-  # cannot pair with an OLD start: the ring is upstream of this process in
-  # the camera's :rest_for_one media chain, so a ring restart restarts the
-  # owner too.
-  defp ring_stale?(state) do
-    since = last_fragment_at(state.camera.id) || state.pipeline_started_at_ms
-
-    case since do
-      nil -> false
-      at -> now_ms() - at > stall_ms(state)
+  # An empty ring is not automatically healthy: a pipeline that wedges before
+  # its FIRST fragment would otherwise never trip the watchdog — nothing
+  # rebuilds per reconnect, so nothing else would ever clear it. The
+  # pipeline's own age is judged instead, against `first_fragment_ms/1`; the
+  # escalation rules still require a connected source before any of this
+  # becomes a rebuild, so a camera that is merely down stays exempt.
+  # An empty ring cannot pair with an OLD start: the ring is upstream of this
+  # process in the camera's :rest_for_one media chain, so a ring restart
+  # restarts the owner too.
+  #
+  # `:awaiting` is neither stale nor proof that the source delivers, and the
+  # detect arm needs that proof: frames reach the branch a GOP before the
+  # first fragment exists, so its stamp can age over an empty ring.
+  defp ring_state(state) do
+    case last_fragment_at(state.camera.id) do
+      nil -> if first_fragment_overdue?(state), do: :stale, else: :awaiting
+      at -> if now_ms() - at > stall_ms(state), do: :stale, else: :fresh
     end
   end
+
+  defp first_fragment_overdue?(%{pipeline_started_at_ms: nil}), do: false
+
+  defp first_fragment_overdue?(state),
+    do: now_ms() - state.pipeline_started_at_ms > first_fragment_ms(state)
 
   # The ring is a sibling in the camera's tree and can be restarting; a
   # watchdog that exited on that would take the pipeline down with it, which is
@@ -611,7 +629,7 @@ defmodule Cairn.PipelineOwner do
   # Only a substream is judged by its source's own report — `:unknown` (never
   # connected) included, which is where a camera whose sub has never answered
   # sits. A main-role detect branch needs none: it feeds the ring too, so its
-  # outage is what `ring_stale?/1` already sees, and a bridge main never sends
+  # outage is what `ring_state/1` already sees, and a bridge main never sends
   # a report at all.
   defp detect_source_live?(state) do
     case detect_role(state.camera) do
@@ -632,6 +650,10 @@ defmodule Cairn.PipelineOwner do
   defp bridge?(state), do: state.camera.ingest == :ffmpeg
 
   defp stall_ms(state), do: state.config.stall_seconds * 1_000
+
+  # A stall_seconds above the floor is the operator's answer for both windows.
+  defp first_fragment_ms(state),
+    do: max(stall_ms(state), Keyword.get(state.opts, :first_fragment_ms, @first_fragment_ms))
 
   defp schedule_watchdog(state) do
     interval = Keyword.get(state.opts, :watchdog_interval_ms, 5_000)

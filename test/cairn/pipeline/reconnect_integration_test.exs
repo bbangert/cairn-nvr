@@ -254,9 +254,10 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
 
       tracker = start_tracker(id, name: Cairn.Registry.via(id, :camera_tracker))
       Event.subscribe()
+      Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(id))
 
       element = await_child(pipeline, :tracker)
-      session(source, short_media())
+      session(source, media())
       assert_receive {:stream_epoch, ^id, :main, epoch, :started}, 10_000
 
       # A live track behind an open event — the state a rebuild is expensive
@@ -270,9 +271,14 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       assert populated.processed > 0
       assert [%Track{object_id: ^oid}] = Cairn.Tracker.live_tracks(populated.core)
 
+      # The detect arm only trusts a ring that holds a fragment, so wait for a
+      # real one.
+      assert_receive {:fragment, %Fragment{}}, 10_000
+
       # The watchdog's escalation, driven rather than waited out: the detect
-      # branch last produced a buffer two stall windows ago while the ring is
-      # younger than one, and the tick that reads that is this process's.
+      # branch last produced a buffer two stall windows ago while the ring
+      # holds a fragment younger than one, and the tick that reads that is this
+      # process's.
       send(owner, {:stats, %{last_buffer_at_ms: System.monotonic_time(:millisecond) - 60_000}})
       send(owner, :watchdog)
 

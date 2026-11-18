@@ -7,7 +7,8 @@
 data_dir: data
 
 # Seconds without a new fragment before a camera is considered stalled
-# and its ffmpeg process is bounced.
+# and its ffmpeg process is bounced. A camera's first fragment after a
+# start is given at least 60 s.
 stall_seconds: 15
 
 # Emergency cleanup: when free space on data_dir drops below this,

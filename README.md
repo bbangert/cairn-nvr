@@ -78,7 +78,7 @@ See `config.example.yml` — every key is documented inline. Summary:
 | key | meaning |
 |-----|---------|
 | `data_dir` | all state: `cairn.db`, `events/`, `snapshots/`, `log/` (env `CAIRN_DATA_DIR` wins) |
-| `stall_seconds` | silent-stream watchdog before ffmpeg is bounced |
+| `stall_seconds` | silent-stream watchdog before ffmpeg is bounced (a camera's first fragment gets at least 60 s) |
 | `free_space_min_mb` | emergency-cleanup threshold |
 | `events.pre/post/max_*_seconds` | clip windows (per-camera overridable) |
 | `tracking.max_unseen_ms` / `tracking.max_live_tracks` / `tracking.stationary_after_ms` | track expiry in stream time (×5 while stationary), per-camera live-track cap, and how long a box must hold still to count as parked (per-camera overridable) |
