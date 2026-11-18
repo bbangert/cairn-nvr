@@ -21,10 +21,10 @@ model:
 model_profile: yolox
 input_size: 416
 labels: models/coco.names
-# Declared, pending on-hardware measurement. The plugin's sample gate is fixed
-# at 5 fps (`SAMPLE_FPS`, decode.rs), so that is the rate frames reach the
-# model at; whether a given host's CPU keeps up with it is the unmeasured half,
-# and it is the half a band is supposed to describe.
+# Declared, pending on-hardware measurement. With no `sample_fps:` the decode
+# gate samples at the default 5 fps (`Cairn.Native.Config`), so that is the rate
+# frames reach the model at; whether a given host's CPU keeps up with it is the
+# unmeasured half, and it is the half a band is supposed to describe.
 fps_band: [5, 5]
 tracking:
   # Presence, not defaults: this block *is* the stage list. `twin_mint` alone
@@ -33,7 +33,8 @@ tracking:
   # change what a config does on the day it adopts a profile, which is the one
   # thing this file must not do. Adding them is a per-profile decision — see
   # docs/profile-authoring.md on each stage — and note that bbd's measured
-  # win needs the plugin's own `--track-floor-json` alongside it.
+  # win needs the engine's track floor (`track_floor_json`) alongside it,
+  # which no config key sets yet.
   twin_mint: true
   # The globals, restated so that adopting this profile changes nothing.
   max_unseen_ms: 3000

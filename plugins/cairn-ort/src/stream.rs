@@ -8,10 +8,10 @@
 //! on the frame, measured where the pixels were, and what to *do* about them
 //! is decided where the model is.
 //!
-//! Calls block the caller on a dirty scheduler, ~12 ms per inference. The one
-//! shared session is the only admission control and there is none here: past
-//! what it can pass, surplus becomes `push_frame` latency for the host to
-//! refuse.
+//! Calls block the caller on a dirty scheduler for one model pass; the crate
+//! doc has measured times. The one shared session is the only admission
+//! control and there is none here: past what it can pass, surplus becomes
+//! `push_frame` latency for the host to refuse.
 
 use std::sync::Arc;
 use std::time::Instant;

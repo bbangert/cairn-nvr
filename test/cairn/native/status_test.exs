@@ -232,8 +232,8 @@ defmodule Cairn.Native.StatusTest do
     end
 
     test "a status map with no decoder_failures key still answers" do
-      # The degraded map a wedged host produces has no such key; the clause
-      # reads it with a default rather than requiring it.
+      # `payload/2` is public, so a `:ready` map need not come from the host;
+      # the clause reads the key with a default rather than requiring it.
       assert Status.payload(status_map([]) |> Map.delete(:decoder_failures), "cam")["state"] ==
                "ready"
     end

@@ -144,9 +144,9 @@ defmodule Cairn.Native.Host do
   `source` is what the camera is sending, as `{width, height}`, or `nil` from a
   caller that does not know. Software decode does not need it; a V4L2 M2M
   decoder does, and one opened without it opens anyway and then fails every
-  frame (`research/board-first-light.md`). The generic decode library
-  *defers* the hardware open until the stream's in-band SPS/PPS arrive, so
-  this call returns promptly with a software decoder that may still promote
+  frame (membrane-port `research/board-first-light.md`). The generic decode
+  library *defers* the hardware open until the stream's in-band SPS/PPS arrive,
+  so this call returns promptly with a software decoder that may still promote
   itself — `decode::open` in `plugins/cairn-detect/src/decode.rs`. A board
   library's decoder may open its hardware here, and fail here.
 
@@ -825,11 +825,11 @@ defmodule Cairn.Native.Host do
 
   # The one place the two libraries meet: the engine's resolved input spec is
   # read out of the engine library (cairn-ort, or a board's) as plain terms
-  # and handed to cairn-native's open, with the host's own decode config
-  # (`decoder`) alongside — so both halves are built for the same model
-  # without either naming the other. `sample_fps` stays host-side: it is
-  # `Cairn.Stage.SampleGate`'s rate, handed out in the reply below, and the
-  # crate no longer consumes it.
+  # and handed to the decode library's open (cairn-native, or a board's), with
+  # the host's own decode config (`decoder`) alongside — so both halves are
+  # built for the same model without either naming the other. `sample_fps`
+  # stays host-side: it is `Cairn.Stage.SampleGate`'s rate, handed out in the
+  # reply below, and no NIF takes it.
   #
   # Only the engine library's absence is checked at load, so the decode
   # library's is answered here, per camera: its stubs raise, and this runs

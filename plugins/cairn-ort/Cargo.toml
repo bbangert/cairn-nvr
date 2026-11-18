@@ -36,9 +36,9 @@ default = ["nif"]
 # runs, so a crate linking this one under its own NIF module turns this off;
 # the resource types and everything a NIF body calls stay public without it.
 nif = []
-# Passed through to cairn-detect for the aarch64 cross-build, where ort loads
-# the QAIRT-bundled runtime at startup instead of statically linking the
-# downloaded x86 archive.
+# Passed through to cairn-detect for container builds, on both arches, which
+# dlopen the pinned base ORT at `ORT_DYLIB_PATH` instead of statically linking
+# it.
 ort-load-dynamic = ["cairn-detect/ort-load-dynamic"]
 # Exposes the panic/poison test hooks to another crate's test build —
 # cairn-native's clip harness drives both halves of the split boundary and

@@ -591,7 +591,7 @@ added on the CPU side, where the tensor is packed. So `w=`/`h=` below are
 | `qsv` | QSV | `h264_qsv` | `scale_qsv=w=640:h=640:format=nv12,hwdownload,format=nv12` |
 | `nvdec` | CUDA | `h264` + nvdec | `scale_cuda=w=640:h=640:format=nv12,hwdownload,format=nv12` |
 | `videotoolbox` | VideoToolbox | `h264` + hwaccel | `scale_vt=w=640:h=640:format=nv12,hwdownload,format=nv12` |
-| `v4l2` | — | `h264_v4l2m2m` | none: the M2M codec decodes on the ASIC but returns system memory, so the software scaler handles it |
+| `v4l2` | — | `h264_v4l2m2m` | none: the M2M codec decodes on the ASIC but returns system memory, scaled by swscale; a `gles` build, which the containers are not, tries the GPU first |
 | `sw` | — | `h264` | none |
 
 NV12 is the download format because every backend's scaler supports it; the
@@ -826,8 +826,8 @@ position; `sum0`..`sum2` and any other output are ignored.
 
 **Adding a family is adding a profile**, not editing the decode path: a
 `ModelProfile` is a name, an `InputSpec` (size, encoding, resize policy) and an
-`OutputSpec` (layout, score composition, optional NMS). Nothing in `infer.rs`
-below the profile table branches on a model family.
+`OutputSpec` (layout, score composition, optional NMS). Nothing in `src/infer/`
+outside the profile table (`catalog.rs`) branches on a model family.
 
 #### Picking one
 
@@ -1154,8 +1154,10 @@ decode half.
 
 The release binary is **19.9 MB** stripped (24.9 MB unstripped; `strip = true`
 is set in `[profile.release]`). Most of it is the statically linked
-onnxruntime. It needs three files at runtime: itself, the `.onnx` model, and
-the labels file.
+onnxruntime of the default build; container builds use `ort-load-dynamic` and
+load it at runtime from `ORT_DYLIB_PATH` instead. The default build needs
+three files at runtime: itself, the `.onnx` model, and the labels file; an
+`ort-load-dynamic` build needs `libonnxruntime.so` as a fourth.
 
 Its only shared-library dependencies are FFmpeg and the C/C++ runtime:
 
@@ -1168,11 +1170,12 @@ libstdc++.so.6 libgcc_s.so.1 libm.so.6 libc.so.6
 ### Recommended: dynamic link against the distro's FFmpeg 7
 
 Ship the binary + model + labels, and depend on the target distro's FFmpeg 7
-runtime packages. onnxruntime is already inside the binary, so FFmpeg is the
-*only* external dependency family — and it is precisely the piece that has to
-match the host's VAAPI/QSV/NVDEC drivers, which the distro already wires up.
-Bundling our own FFmpeg would mean owning the hardware-acceleration matrix for
-every target we support, in exchange for removing one `apt install`.
+runtime packages. The default build carries onnxruntime inside the binary, so
+FFmpeg is its *only* external dependency family — and it is precisely the
+piece that has to match the host's VAAPI/QSV/NVDEC drivers, which the distro
+already wires up. Bundling our own FFmpeg would mean owning the
+hardware-acceleration matrix for every target we support, in exchange for
+removing one `apt install`.
 
 Distro FFmpeg versions (checked 2026-07-25 against sources.debian.org and the
 Launchpad API):
@@ -1234,8 +1237,8 @@ itself. Check what a host can actually do with `ffmpeg -hwaccels` and
 `vainfo`; cairn-detect's own probe logs the same answer at startup.
 
 glibc on both recommended targets (Debian 13: 2.41, Ubuntu 24.04: 2.39) is
-newer than onnxruntime's 2.38 requirement, so `src/glibc_compat.rs` is inert
-there.
+newer than onnxruntime's 2.38 requirement; the `src/glibc_compat.rs` shims are
+still called there, and harmless (see the glibc note above).
 
 ### Alternative: bundle a private FFmpeg
 
@@ -1393,10 +1396,10 @@ where `NormBox` cannot be named at all.
   matching its own `preproc`. Every decode path is handed an explicit
   projection built alongside the scaler, so a letterboxed run cannot report
   boxes against the input rectangle instead of the frame.
-- NMS runs for the raw layout only — an end-to-end export did it inside the
-  model — and over at most the top 300 anchors, ranked evidence first and
-  score second, which bounds an O(k²) pass that would otherwise start from
-  8400. Every layout that reaches that cut gates each candidate on **its own
+- NMS runs for every head except the end-to-end and DETR ones, which need
+  none, and over at most the top 300 anchors, ranked evidence first and score
+  second, which bounds an O(k²) pass that would otherwise start from 8400.
+  Every layout that reaches that cut gates each candidate on **its own
   class's** emission floor first, because the cut cannot see a label: under
   the documented allowlist pattern (`default: 1.0` with one class lower) 300
   stronger candidates in excluded classes would otherwise push the one

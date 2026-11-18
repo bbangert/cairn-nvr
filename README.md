@@ -9,7 +9,8 @@ UI to watch live and browse events. No continuous recording, no cloud,
 no accounts.
 
 Built for the Home Assistant-adjacent homelab niche: small (Elixir/OTP +
-ffmpeg + one Rust NIF), event-first (clips are first-class files on disk,
+ffmpeg + a Rust engine linked in as NIFs), event-first (clips are
+first-class files on disk,
 `{event_id}_{camera}_{timestamp}.mp4` — the index can always be rebuilt
 from the filenames), and honest about scope (if you want 24/7 recording
 or a giant model zoo, use Frigate — see `docs/frigate_comparison.md`).
@@ -21,8 +22,8 @@ bridge, or a native RTSP client with `ingest: rtsp`) feeds a Membrane
 pipeline that fans the compressed video out three ways in-process:
 CMAF fragments to the pre-roll ring (live view + recording), RTP to the
 WebRTC hub, and encoded access units to the detect branch, which decodes
-and infers in the node's own engine (`cairn-native`, a Rust NIF on dirty
-schedulers). The tracker opens an event, an extractor streams the
+and infers in the node's own engine (`cairn-native` and `cairn-ort`, Rust
+NIFs on dirty schedulers). The tracker opens an event, an extractor streams the
 pre-roll + live fragments to a single mp4, and post-window quiet closes
 it. Details in `docs/architecture.md`.
 
@@ -31,7 +32,10 @@ it. Details in `docs/architecture.md`.
   toggle — and to HLS where MediaSource is missing. Live detection boxes
   are drawn over the feed as LiveView renders them.
 - **Detection**: in the VM — `plugins/cairn-detect` (hardware decode,
-  ONNX Runtime, optional QNN on Qualcomm NPUs) linked as a NIF. New
+  ONNX Runtime, optional QNN on Qualcomm NPUs) linked into the node's NIFs. A board
+  release adds its own elements: the Rockchip one (`CAIRN_BOARD=rockchip`,
+  `boards/cairn_rockchip`) decodes through MPP and detects on the RK3566
+  NPU through RKNN, experimental until it has soaked. New
   models are a hardware-profile edit, not code. The retired external
   plugin protocol is archived at
   [`docs/archive/plugin-contract.md`](docs/archive/plugin-contract.md).
@@ -43,8 +47,9 @@ it. Details in `docs/architecture.md`.
   per rung) and the tracker stages that go with it. A plugin group names
   its profile and config load expands it into the engine's model config and
   the host's tracking policy, so the two halves cannot disagree. Shipped
-  ones live in `priv/profiles/` and a board's own directory; writing one for
-  a new board needs no code change — see
+  ones live in `priv/profiles/` and a board's own directory; writing one
+  needs no code change when the release already has the decoder and backend
+  it names — see
   [`docs/profile-authoring.md`](docs/profile-authoring.md).
 - **Retention**: per-label day counts, plus emergency cleanup that
   deletes oldest events when disk runs low.

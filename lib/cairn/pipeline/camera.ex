@@ -481,9 +481,12 @@ defmodule Cairn.Pipeline.Camera do
   # frames a second has to say so, or lost tracks stay adoptable for the ratio
   # of the two; and its live cap is a construction option, so the camera's own
   # is passed here rather than found on a batch. `sample_fps` is nominal where
-  # the gate delivers the grid-quantized effective rate, so the buffer runs up
-  # to ~7% long in wall time — accepted (D-R4, sample-rate-fidelity plan): the
+  # the gate delivers `Profile.effective_rate/1`, so the buffer runs long in
+  # wall time by the ratio of the two: nothing at 1, 3, 5 or 15 fps, 6.7% at
+  # 2, 4 and 8, 20% to 87% at the other rates under 15, and up to 100% above
+  # it. D-R4 (sample-rate-fidelity plan) accepted the 2 fps figure — the
   # knob's own constant is heuristic, and a correction needs a measured rate.
+  # No shipped profile runs a tracker at a rate that drifts.
   defp tracker_core(detect, policy) do
     case Keyword.fetch!(detect, :tracker) do
       SparseTrack ->

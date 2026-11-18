@@ -4,19 +4,20 @@
 //! the device at full frame rate, and only the samples that survive the
 //! sample gate — `--sample-fps` frames a second, 5 by default — are scaled
 //! to the model's input size *on the GPU* and then downloaded. Downloading
-//! first and scaling on the CPU would move ~34 Mbps of full-resolution frames
-//! through system memory and eat the entire saving, so a backend without a
+//! first and scaling on the CPU would move full-resolution frames through
+//! system memory and eat the entire saving, so a backend without a
 //! GPU scaler is treated as unavailable rather than silently taking that
 //! path.
 //!
 //! v4l2m2m is the exception on both counts, by the nature of the interface:
 //! a stateful M2M codec decodes on the ASIC and hands back **system memory**
-//! (`scale_filter()` is `None`, so nothing refuses it), and every sampled
-//! frame is then scaled on the CPU — off an uncached capture buffer, which is
-//! most of the per-camera CPU bill on such boards
-//! (membrane-port `research/board-first-light.md`). It stays available
-//! because ASIC decode is still the cheap half; making the scale cheap on
-//! that path is its own work item (plan task 5.6).
+//! (`scale_filter()` is `None`, so nothing refuses it). Scaling on the CPU,
+//! off an uncached capture buffer, is most of the per-camera CPU bill on such
+//! boards (membrane-port `research/board-first-light.md`). A build with the
+//! `gles` feature reads that buffer once and scales NV12 frames on the GPU,
+//! falling back to swscale when it cannot; without the feature (the
+//! container builds leave it off) swscale scales every sampled frame on the
+//! CPU. It stays available because ASIC decode is still the cheap half.
 
 use std::ffi::{CStr, CString};
 use std::fmt;

@@ -411,7 +411,7 @@ fn a_recorded_clip_decodes_and_infers() {
 
 /// The rate is `--sample-fps`, and specifically not the clip's keyframe rate: a
 /// gate upstream of the decoder could only ever admit keyframe-headed access units,
-/// which on the fleet's 2-5 s GOPs is 10-24x under what was asked for.
+/// which on the fleet's 2-5 s GOPs is 10-25x under what was asked for.
 #[test]
 fn the_rate_gate_admits_sample_fps_and_not_the_gop_rate() {
     let Some(artifacts) = artifacts() else {

@@ -217,9 +217,8 @@ defmodule Cairn.Native.Status do
   end
 
   defp headline(%{engine: :ready} = status, camera_id) do
-    # `Map.get`, not a match: the degraded map `unanswered/1` builds carries no
-    # decoder_failures key, and this clause must not be the reason a wedged
-    # host cannot be reported.
+    # `Map.get`, not a match: `payload/2` is public and takes maps
+    # `Host.status_map/1` did not build.
     case status |> Map.get(:decoder_failures, %{}) |> Map.get(camera_id) do
       nil -> accelerator(status)
       reason -> {"error", decoder_failure(reason)}

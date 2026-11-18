@@ -4,7 +4,7 @@
 #
 # Every rung below passed the HTP score leg on board .87 vs its own
 # CPU-EP run on real clips — a16 person-window medians 0.99-1.001,
-# a8 medians 1.03-1.18 (hot; see the a8 note below), no cap, no
+# a8 medians 1.0-1.18 (hot; see the a8 note below), no cap, no
 # depression — and carries a fresh governor-pinned p50
 # (docs/evidence/qdq-reexport-htp-20260821.md).
 # The shipped pre-campaign artifacts are DEFECTIVE (baked score
@@ -27,7 +27,7 @@
 # 1.5-2.5x latency, so those rungs ship a8. yolox_nano a8 collapses
 # per-frame and the yolo26/yolov8 family cannot do a8 at all (head
 # Concat leaves the scores 0 codes) — those stay a16. Known a8
-# semantics note: HTP scores read 3-18% HOT vs CPU (the EP's 8-bit
+# semantics note: HTP scores read up to 18% HOT vs CPU (the EP's 8-bit
 # sigmoid qparam sits a hair wide of the graph's pinned 1/256), so a
 # floor tuned on an a16 rung is conservative on an a8 rung.
 #
@@ -122,10 +122,10 @@ model_ladder:
 # larger fleet is refused at load even though it is also past every
 # budget.
 supported_cameras: 40
-# Venus, through ffmpeg's h264_v4l2m2m — the one decode field cairn
-# ships with a measurement behind it (spike 0.3: the live fleet
-# concurrently at 59 and 47 fps for ~2% CPU, vs ~30% of a core per
-# camera in software). Named rather than left at `auto` because on a
+# Venus, through ffmpeg's h264_v4l2m2m — the measured decode field of
+# this board's ladder (spike 0.3: the live fleet concurrently at 59
+# and 47 fps for ~2% CPU, vs ~30% of a core per camera in
+# software). Named rather than left at `auto` because on a
 # membrane camera a named decoder is a requirement: if Venus is not
 # there, detection stops and says so instead of quietly eating the CPU
 # the models need. At substream resolution decode never binds

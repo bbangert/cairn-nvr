@@ -141,7 +141,7 @@ fn try_levels<T, U>(levels: &[T; 3], f: &mut impl FnMut(&T) -> Option<U>) -> Opt
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     /// `[1, N, 6]` rows of `[x1, y1, x2, y2, score, class_id]` in input
-    /// pixels, already de-duplicated by the model (yolov10, YOLO26).
+    /// pixels, already de-duplicated by the model (yolov10).
     EndToEnd,
     /// `[1, 4 + nc, A]` channels-first over A anchors: `cx, cy, w, h` in input
     /// pixels then `nc` class scores, no objectness (yolov8, yolo11).
@@ -340,7 +340,7 @@ pub struct ModelProfile {
     /// A family here is a *name*, never a second entry in
     /// [`super::catalog::PROFILES`]: several Ultralytics generations export
     /// byte-identical tensor layouts, and listing each as its own profile
-    /// would make every ordinary detect head sniff as three candidates and
+    /// would make every ordinary detect head sniff as several candidates and
     /// hard-error on an ambiguity that does not exist. Naming them here keeps
     /// `--model-profile yolo11` working while sniffing still sees one profile
     /// per distinct decode.
@@ -398,10 +398,11 @@ mod tests {
     #[test]
     fn the_vocabulary_a_resolved_model_is_described_in_names_the_shape_the_score_and_where_the_size_came_from(
     ) {
-        // `main::model_summary` is the one line an operator reads before any
-        // frame arrives, and all three enums below reach it: `Layout` through
-        // `Detector::layout_summary`, `InputSizeSource` as the parenthetical
-        // beside the size, and `ScoreComposition` as `score=`.
+        // `cli::model_summary` is the binary's one line an operator reads
+        // before any frame arrives, and all three enums below reach it:
+        // `Layout` through `Detector::layout_summary`, `InputSizeSource` as
+        // the parenthetical beside the size, and `ScoreComposition` as
+        // `score=`.
         //
         // `Layout` is the one that interpolates the counts it was resolved
         // with, so a layout printing the profile's COCO 80 while decoding 79

@@ -527,9 +527,10 @@ fn run_single(args: &Args, providers: &[Provider]) -> Result<()> {
 ///
 /// The backend and its capabilities come from the opened [`Detector`], not from
 /// `args`: what ran is what this line should report. The capability half reads
-/// from the static table in `infer::backend` — the one the Elixir side's
-/// planned capability validation will mirror (today it mirrors only the
-/// artifact column).
+/// from the static table in `infer::backend`. The Elixir boards' `backends/0`
+/// tables mirror its fused-NMS and dynamic-shapes columns (their `artifact`
+/// is the `model:` key, not this table's format), and
+/// `Cairn.Config.Profile.check_capabilities/5` enforces the fused-NMS one.
 fn model_summary(args: &Args, detector: &Detector) -> String {
     let spec = detector.input_spec();
     format!(

@@ -102,9 +102,10 @@ defmodule Cairn.NativeStub do
   end
 
   @doc """
-  One decoded frame through `Cairn.Native.Host.push_frame/5`, spelled the way
-  `Cairn.Pipeline.Inference` spells it — for tests that only care that a push
-  happened, not what it carried.
+  One decoded frame through `Cairn.Native.Host.push_frame/5`, with the meta
+  keys `Cairn.Pipeline.Inference` pushes but a 90 kHz time base where it uses
+  nanoseconds — for tests that only care that a push happened, not what it
+  carried.
   """
   def host_push(host, camera_id, pts \\ 0) do
     frame = decoded_frame(pts: pts)

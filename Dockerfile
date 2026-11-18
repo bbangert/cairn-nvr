@@ -10,8 +10,9 @@
 #              the MPP and librga userspace that `decoder: rkmpp` and the
 #              probe binary's `--rk-probe` load is carried
 # Rust artifacts and the Rockchip libraries cross-compile on the build host
-# (D-C3); the only compile under emulation is the BEAM release, because BEAM
-# bytecode is arch-neutral and ERTS comes from the arm64 hexpm image.
+# (D-C3). What compiles under emulation is the release: BEAM code, which is
+# arch-neutral, and the Hex dependencies' own C NIFs. ERTS comes from the
+# arm64 hexpm image.
 #
 # The QAIRT libraries (generic arm64) ship under Qualcomm's AI Stack License,
 # which permits object-code redistribution incorporated in an application but
@@ -356,7 +357,8 @@ EOS
 
 # ---------------------------------------------------------------------------
 # The Elixir release, built on the target platform (qemu under buildx for
-# arm64 — BEAM-only work, the NIFs arrive prebuilt from native-build).
+# arm64 — BEAM code and the Hex dependencies' C NIFs; Cairn's own NIFs arrive
+# prebuilt from native-build).
 FROM hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-debian-${DEBIAN_TAG} AS release-build
 
 # pkg-config + libssl-dev: ex_dtls's bundlex native resolves openssl through
@@ -378,9 +380,10 @@ ENV CAIRN_BOARD=${CAIRN_BOARD}
 COPY mix.exs mix.lock ./
 # Path dependencies (`libs/`, `boards/`) resolve at deps.get, so they come in
 # with mix.exs; a generic build carries the board library and uses none. Only
-# the board library's mix.exs here and its lib/ before deps.compile — never
-# boards/ whole, whose Rust crate under native/ native-build already built,
-# and whose every edit would otherwise invalidate the dependency layers.
+# the board library's mix.exs here, and its lib/, priv/native and
+# priv/profiles before deps.compile — never boards/ whole, whose Rust crate
+# under native/ native-build already built, and whose every edit would
+# otherwise invalidate the dependency layers.
 COPY libs libs
 COPY boards/cairn_rockchip/mix.exs boards/cairn_rockchip/
 RUN mix deps.get --only prod

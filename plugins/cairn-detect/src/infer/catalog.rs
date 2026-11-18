@@ -5,7 +5,7 @@
 //! the contract applies to. A family is a *name*, never a second [`PROFILES`]
 //! entry: several Ultralytics generations export byte-identical tensor
 //! layouts, and listing each as its own profile would make every ordinary
-//! detect head sniff as three candidates and hard-error on an ambiguity that
+//! detect head sniff as several candidates and hard-error on an ambiguity that
 //! does not exist.
 
 use anyhow::{anyhow, Result};

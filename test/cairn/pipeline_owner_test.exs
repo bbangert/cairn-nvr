@@ -337,9 +337,9 @@ defmodule Cairn.PipelineOwnerTest do
 
     # What is pinned: the reload publishes its snapshot BEFORE calling
     # apply_diff, and an owner born inside that call sees it. The owners are
-    # started the way `Cairn.CameraSupervisor.apply_diff/2` starts them —
-    # supervisor-free, so `init/1` runs inside the server process while the
-    # reload is still in `handle_call`. The deadlock this arrangement would
+    # started from inside the server's `apply_diff` callback, as the real
+    # tree's are, so each `init/1` runs while the server is blocked in the
+    # reload's `handle_call`. The deadlock this arrangement would
     # cause has no time-box here: the default `config_lookup` addresses the
     # application's own named server, which is idle in test, so a call from
     # `init/1` would return rather than hang.

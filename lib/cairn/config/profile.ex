@@ -102,7 +102,7 @@ defmodule Cairn.Config.Profile do
                               # complete) = the last non-pack rung's reach
   ```
 
-  Resolution is static, at config load: `Cairn.Config.resolve_ladders/2`
+  Resolution is static, at config load: `Cairn.Config`
   picks the first rung whose budget covers the configured fleet and derives
   each camera's `sample_fps` from it.
 
@@ -270,8 +270,9 @@ defmodule Cairn.Config.Profile do
             # The ordered rung list (`model_ladder:`), nil for a single-model
             # profile, and the camera count it claims. `resolved_rung` is
             # written by `Cairn.Config`'s load-time resolution, never parsed:
-            # the selected rung's map, whose model fields are also lowered
-            # into the five above so everything downstream reads a ladder
+            # the selected rung's map, whose `model`, `model_profile` and
+            # `input_size` are also lowered into the fields above, with the
+            # `sample_fps` it affords, so everything downstream reads a ladder
             # profile as the single-model profile it resolved to.
             model_ladder: nil,
             supported_cameras: nil,
@@ -344,8 +345,8 @@ defmodule Cairn.Config.Profile do
   def family(_other), do: nil
 
   @doc """
-  The `model:` key naming `backend`'s compiled artifact — the one this
-  profile's `--model` is read from.
+  The `model:` key naming `backend`'s compiled artifact — the one
+  `artifact/1` reads.
   """
   @spec artifact_key(String.t()) :: String.t()
   def artifact_key(backend), do: capabilities(backend).artifact
@@ -371,9 +372,9 @@ defmodule Cairn.Config.Profile do
   The model artifact path this profile names for its own backend, or `nil`
   when it names none.
 
-  Verbatim, not resolved: the path is handed to the plugin process as
-  `--model` and read there, so anything that rewrote it here would check one
-  file and pass the plugin another.
+  Verbatim, not resolved: the engine and the canary read it against this
+  node's working directory, so anything that rewrote it here would check one
+  file and load another.
   """
   @spec artifact(t()) :: String.t() | nil
   def artifact(%__MODULE__{backend: backend, model: model}),
@@ -700,9 +701,9 @@ defmodule Cairn.Config.Profile do
     )
   end
 
-  # A family this side does not know is one the plugin's own parser would
-  # reject at startup; naming the menu here costs the operator a config error
-  # instead of a process that exits before it opens its first stream. Skipped
+  # A family this side does not know is one the engine's own parser would
+  # refuse at init; naming the menu here costs the operator a config error
+  # instead of an engine that never loads. Skipped
   # for a non-string value — `check_string/4` has already spoken about that.
   defp check_model_profile(acc, raw, name) do
     case Map.get(raw, "model_profile") do

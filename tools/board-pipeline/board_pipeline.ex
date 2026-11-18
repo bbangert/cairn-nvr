@@ -182,7 +182,8 @@ defmodule Cairn.BoardPipeline.Collector do
   # Gaps land in 10 ms buckets: the histogram's key count is then bounded by
   # the gap range, not the run length — exact-ms keys under scheduler jitter
   # would grow ~1:1 with gap_count on an hour run. 10 ms is 5% of the 200 ms
-  # expected gap, well under what the p50 is read for.
+  # gap at the default 5 fps (2% at the 2 fps the Green cells ran), well under
+  # what the p50 is read for.
   @gap_bucket_ms 10
 
   defp new_cam do
@@ -654,7 +655,8 @@ defmodule Cairn.BoardPipeline do
     result
   end
 
-  # The keys `Cairn.Config.Profile.native_config/1` lowers a profile rung into.
+  # The keys `Cairn.Config.Profile.native_config/1` lowers a profile rung into,
+  # plus `qnn`, which `Cairn.Native.Config.normalize/1` also accepts.
   defp host_config(opts) do
     %{
       model: opts.model,

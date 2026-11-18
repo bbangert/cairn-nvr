@@ -21,10 +21,11 @@
 //! raises `ArgumentError` in the caller *before* any body runs — a caller bug,
 //! not a stage fault, and so deliberately outside the error-term contract.
 //!
-//! Calls block the caller on a dirty scheduler, ~12 ms per inference. The one
-//! shared session is the only admission control and there is none here: past
-//! what it can pass, surplus becomes `push_frame` latency for the host to
-//! refuse.
+//! Calls block the caller on a dirty scheduler for one model pass: about 12 ms
+//! for yolox_nano on QCS6490's HTP, 47 ms for yolox_tiny at 416 on RK3566's
+//! NPU. The one shared session is the only admission control and there is none
+//! here: past what it can pass, surplus becomes `push_frame` latency for the
+//! host to refuse.
 
 mod config;
 mod engine;

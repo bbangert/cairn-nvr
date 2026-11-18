@@ -13,8 +13,10 @@ defmodule Cairn.Rockchip.MixProject do
 
   def application, do: [extra_applications: [:logger]]
 
-  # Only `cairn_stage` (and, in Rust, `cairn-detect`), never the base app:
-  # that is what keeps this library extractable.
+  # Only `cairn_stage`, never the base app: that is what keeps this library
+  # extractable. Its Rust crate has two path dependencies into this
+  # repository, `cairn-detect` and `cairn-ort` (the engine hosting, with its
+  # own NIF entry off).
   defp deps do
     [
       {:cairn_stage, path: "../../libs/cairn_stage"},

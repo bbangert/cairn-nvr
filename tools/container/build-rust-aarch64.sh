@@ -13,9 +13,10 @@
 # in separate directories, because the image copies rockchip/ wholesale onto
 # PATH and rockchip-nif/ into the board library's priv/native.
 #
-# Cross, never qemu (D-C3): the NIFs and these binaries are the only
-# arch-native artifacts; BEAM bytecode is arch-neutral and ERTS comes from the arm64
-# release build. Runs on any amd64 Debian trixie with:
+# Cross, never qemu (D-C3), for everything arch-native this repository builds
+# (these NIFs and binaries, fastrpc, the Rockchip vendor libraries). BEAM
+# bytecode is arch-neutral; ERTS comes with the arm64 release build, where
+# the Hex dependencies' own C NIFs compile under emulation. Runs on any amd64 Debian trixie with:
 #
 #   dpkg --add-architecture arm64 && apt-get update
 #   apt-get install gcc-aarch64-linux-gnu pkg-config clang \

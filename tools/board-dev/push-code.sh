@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The fast dev loop: build the release HERE, push its bytecode into the
 # running add-on container on the board, restart it. Seconds, not the
-# 20-minute tag→CI→ghcr→pull cycle — that stays the distribution path.
+# tag→CI→ghcr→pull cycle — that stays the distribution path.
 # MIX_ENV=prod inside this script is the sanctioned release build (Ben,
 # 2026-08-19); the plugin hook still guards ad-hoc prod commands.
 #
@@ -30,9 +30,9 @@
 # or new protocol impl means start.boot/start.script/cairn.rel/consolidated
 # must land with the bytecode.
 #
-# The installer maps lib/<app>-<vsn>/ → the EXISTING /app/lib/<app>-*/ dir:
-# the release boot script pins exact versions, so a dep whose version
-# changed must land in the directory the boot script actually loads.
+# The installer copies lib/<app>-<vsn>/ into /app/lib/<app>-<vsn>/, the
+# directory the pushed start.boot names, after checking the image has a
+# directory for that app at all.
 #
 # Scratch by definition: a vagus update recreates the container and erases
 # pushed code, and anything that feeds a CLAIM (parity cells, soak,
@@ -132,7 +132,7 @@ for d in lib/*/; do
   if [ -d "$d"priv/profiles ]; then rm -rf /app/lib/"$name"/priv/profiles; fi
   cp -r "$d". /app/lib/"$name"/
 done
-# By existing dir, not by version — like the app loop above: a local
+# By existing dir, not by version — unlike the app loop above: a local
 # version bump must not silently skip the config files while still
 # stamping PUSH_OK.
 #
