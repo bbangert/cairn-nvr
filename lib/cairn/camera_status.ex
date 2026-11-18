@@ -33,7 +33,7 @@ defmodule Cairn.CameraStatus do
   @spec topic() :: String.t()
   def topic, do: @topic
 
-  @doc "Broadcasts `{:camera_status, camera_id, info}` on change."
+  @doc "Broadcasts `{:camera_status, camera_id, info}` on every write, changed or not."
   @spec subscribe() :: :ok | {:error, term()}
   def subscribe, do: Phoenix.PubSub.subscribe(Cairn.PubSub, @topic)
 
