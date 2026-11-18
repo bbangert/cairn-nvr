@@ -499,6 +499,75 @@ defmodule Cairn.PipelineOwnerTest do
       Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
       assert_receive {:status, ^id, :running}, 2_000
     end
+
+    # A bridge respawn inside a surviving pipeline: `Cairn.FFmpegPort` writes
+    # :connecting straight to the table, so nothing reaches the owner and its
+    # cached status stays :running. The harness sees every owner write, so a
+    # second :running arriving at all is the assertion.
+    test "a new session's init and fragment re-earn :running the bridge took away" do
+      {topic, id} = running_bridge()
+
+      epoch = StreamEpochs.new_epoch(id, :stall_bounce)
+      send_session(topic, epoch)
+      assert_receive {:status, ^id, :running}, 2_000
+    end
+
+    test "an rtsp reconnect the pipeline survives re-earns :running" do
+      cam = camera(uid("pt"), ingest: :rtsp)
+      owner = start_owner(cam)
+      id = cam.id
+
+      assert_receive {:status, ^id, :connecting}, 2_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+
+      topic = RingBuffer.topic(id)
+      send_session(topic, StreamEpochs.new_epoch(id, :started))
+      assert_receive {:status, ^id, :running}, 2_000
+
+      send(owner, {:stream_connected, :main, []})
+      assert_receive {:status, ^id, :connecting}, 2_000
+
+      send_session(topic, StreamEpochs.new_epoch(id, :source_lost))
+      assert_receive {:status, ^id, :running}, 2_000
+    end
+
+    test "an init from a superseded epoch does not re-arm" do
+      {topic, id} = running_bridge()
+
+      send_session(topic, "01STALE")
+      refute_receive {:status, ^id, :running}, 300
+    end
+
+    test "one write per session, not one per fragment" do
+      {topic, id} = running_bridge()
+
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+      refute_receive {:status, ^id, :running}, 300
+
+      send_session(topic, StreamEpochs.new_epoch(id, :stall_bounce))
+      assert_receive {:status, ^id, :running}, 2_000
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+      refute_receive {:status, ^id, :running}, 300
+    end
+
+    defp running_bridge do
+      cam = camera(uid("pt"), ingest: :ffmpeg)
+      start_owner(cam)
+      id = cam.id
+
+      assert_receive {:status, ^id, :connecting}, 2_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+
+      topic = RingBuffer.topic(id)
+      send_session(topic, StreamEpochs.new_epoch(id, :started))
+      assert_receive {:status, ^id, :running}, 2_000
+      {topic, id}
+    end
+
+    defp send_session(topic, epoch) do
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:init_segment, %{epoch: epoch}})
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+    end
   end
 
   describe "the watchdog" do

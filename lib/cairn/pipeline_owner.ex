@@ -24,10 +24,15 @@ defmodule Cairn.PipelineOwner do
 
   `:running` is gated on an init segment carrying the *main* stream's current
   epoch (`Cairn.StreamEpochs` is the reference; this process no longer mints
-  and so no longer knows one first-hand). A superseded session's fragments
-  arriving late therefore cannot vouch for the pipeline that replaced it. Main
-  and not the detect role, whatever the camera's substream says: recording is
-  cut from the main tee, so a sub epoch would never match an init segment.
+  and so no longer knows one first-hand), and each such init arms one write: a
+  reconnect the pipeline survives (a bridge respawn, an rtsp session's) puts
+  `:connecting` back, and the next session's media has to be able to answer
+  it. Fragments carry no epoch, so a closed session's flushed tail can spend
+  the write. That reads wrong only when the session died before its first
+  fragment, and then until the source's next attempt, one minimum backoff
+  later. Main and not the detect role, whatever the camera's substream says:
+  recording is cut from the main tee, so a sub epoch would never match an init
+  segment.
 
   ## Watchdog (D3)
 
@@ -96,7 +101,8 @@ defmodule Cairn.PipelineOwner do
             restart_reason: :started,
             # init_seen gates :running on an init segment carrying the main
             # stream's current epoch; got_fragment makes the transition once
-            # per pipeline
+            # per matching init — each session's, and a mid-session encoder
+            # change's
             init_seen: false,
             got_fragment: false,
             # what each source last told us about its role's stream
@@ -261,10 +267,10 @@ defmodule Cairn.PipelineOwner do
 
   # Ring broadcasts. The init segment carries the epoch, fragments do not — so
   # matching it against the main stream's current epoch is what ties the
-  # fragment-based :running transition to the pipeline that is running *now*.
+  # fragment-based :running transition to the session that is running *now*.
   def handle_info({:init_segment, %{epoch: epoch}}, state) do
     if StreamEpochs.current({state.camera.id, :main}) == {:ok, epoch} do
-      {:noreply, %{state | init_seen: true}}
+      {:noreply, %{state | init_seen: true, got_fragment: false}}
     else
       {:noreply, state}
     end
@@ -272,7 +278,10 @@ defmodule Cairn.PipelineOwner do
 
   def handle_info({:fragment, _frag}, %{init_seen: true, got_fragment: false} = state)
       when state.pipeline != nil do
-    state = set_status(state, :running)
+    # Past `set_status/2`'s dedupe: the :connecting this corrects can be
+    # `Cairn.FFmpegPort`'s, written to the table while the status cached here
+    # stayed :running.
+    state = force_status(state, :running)
     {:noreply, %{state | got_fragment: true, backoff_ms: backoff_min(state)}}
   end
 
@@ -630,8 +639,9 @@ defmodule Cairn.PipelineOwner do
   end
 
   defp set_status(%{status: status} = state, status), do: state
+  defp set_status(state, status), do: force_status(state, status)
 
-  defp set_status(state, status) do
+  defp force_status(state, status) do
     status_fun = Keyword.get(state.opts, :status_fun, &CameraStatus.set/2)
     status_fun.(state.camera.id, status)
     %{state | status: status}
