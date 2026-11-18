@@ -1,4 +1,4 @@
-//! Opening the H.264 RTP feed Cairn points at us.
+//! Opening the H.264 RTP feed on the UDP port the host names.
 
 use std::ffi::CString;
 use std::fs;
@@ -20,9 +20,9 @@ const MAX_OPEN_ATTEMPTS: u32 = 12;
 
 /// Raw RTP has no session negotiation; feed the demuxer a static SDP.
 ///
-/// The demuxer also binds `port + 1` for RTCP even though Cairn never sends
-/// any — that port is reserved for us (see `Cairn.UDPPorts`). ffmpeg ignores
-/// an `a=rtcp:` override here, so the reservation has to hold.
+/// The demuxer also binds `port + 1` for RTCP, which the contract reserves
+/// for the plugin. ffmpeg ignores an `a=rtcp:` override here, so a
+/// hand-driven run has to keep that port free.
 pub fn sdp_for(port: u16) -> String {
     format!(
         "v=0\r\n\
@@ -40,7 +40,7 @@ fn stream_options() -> AVDictionary {
     // per attempt.
     AVDictionary::new(c"protocol_whitelist", c"file,udp,rtp", 0)
         .set(c"fflags", c"nobuffer", 0)
-        // Cairn's ffmpeg puts SPS/PPS in-band next to keyframes, and a plugin
+        // The feed's ffmpeg puts SPS/PPS in-band next to keyframes, and a plugin
         // starting mid-stream lands between them with nothing to probe. The
         // defaults give up in milliseconds ("Invalid data found"); these let
         // the probe wait out a GOP instead.
@@ -61,8 +61,8 @@ fn stream_options() -> AVDictionary {
         // Socket read timeout, matching the Python reference's `timeout=30`.
         // Without it a port that never receives a byte blocks forever inside
         // the probe (so the retry loop below never gets a second attempt) and
-        // a mid-run silence parks `read_packet` instead of exiting for Cairn
-        // to restart.
+        // a mid-run silence parks `read_packet` instead of returning the
+        // error either mode acts on.
         .set(c"timeout", c"30000000", 0) // µs
 }
 
@@ -129,12 +129,11 @@ impl Drop for SdpFile {
 
 /// Open the RTP feed, waiting out the gap to the next keyframe.
 ///
-/// Joining between keyframes is routine (Cairn starts us alongside ffmpeg,
-/// and loading the ONNX model takes long enough to miss the opening parameter
-/// sets). Retrying in-process beats exiting: a restart would just land in the
-/// same gap, one backoff later. We do still give up eventually so a genuinely
-/// dead port surfaces as a plugin crash in Cairn's log rather than a silent
-/// spin.
+/// Joining between keyframes is routine (the feed runs whether or not we are
+/// listening, and loading the model takes long enough to miss the opening
+/// parameter sets). Retrying in-process beats exiting: a restart would just
+/// land in the same gap. We do still give up eventually so a genuinely dead
+/// port surfaces as an exit rather than a silent spin.
 pub fn open_stream(port: u16) -> Result<AVFormatContextInput> {
     open_stream_within(port, MAX_OPEN_ATTEMPTS)
 }

@@ -346,9 +346,10 @@ fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
 /// paths), and nothing downstream reports which one ran.
 /// So on this path a named decoder is a requirement, as `backend: qnn` already
 /// is on the inference side, and `auto` stays the way to say "whatever works".
-/// The classic plugin keeps the fallback: its refusal would be a process exit
-/// into a restart loop, where here the detect branch goes dark, recording
-/// continues, and the reason reaches `cameras:status`
+/// The `cairn-detect` binary keeps the fallback — under the plugin contract's
+/// host its refusal was a process exit into a restart loop — where here the
+/// detect branch goes dark, recording continues, and the reason reaches
+/// `cameras:status`
 /// (`Cairn.Native.Host` records it; `Cairn.Native.Status` headlines it).
 ///
 /// A decoder whose hardware probe is deferred passes here on its promise:

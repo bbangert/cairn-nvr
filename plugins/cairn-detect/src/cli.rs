@@ -3,21 +3,29 @@
 //! A library function rather than the binary's body so that a board crate's
 //! probe binary is one call to [`run`], naming the backends it carries.
 //!
-//! See `docs/archive/plugin-contract.md`. Cairn appends the arguments of one
-//! of the two contract variants to whatever command it is configured with; the
-//! model flags and the motion gate's `--motion-json` come from that configured
-//! command, which is why the gate needs no host change to reach either mode.
+//! This is the plugin side of `docs/archive/plugin-contract.md`. Cairn no
+//! longer launches it as a plugin — the stages run in the node, through the
+//! NIFs — and nothing restarts it. What runs it is the canary's probe load
+//! (`Cairn.Native.Canary`), `--cpu-baseline`, which measures and exits, and
+//! the harnesses — parity, `verify/` and the scripts under `tools/`; "the
+//! host" below is whichever of them launched the process, standing where the
+//! contract's host stood.
+//!
+//! The host appends the arguments of one of the two contract variants to its
+//! own command; the model flags and the motion gate's `--motion-json` come
+//! from that command, which is why the gate needs no host change to reach
+//! either mode.
 //!
 //!   * per-camera: `--camera-id`, `--udp-port`, `--min-score-json` — one
-//!     process per camera, and any stream failure is fatal so Cairn restarts
-//!     it (`run_single` below).
+//!     process per camera, and any stream failure is fatal: the contract
+//!     has a plugin exit on what it cannot recover (`run_single` below).
 //!   * multiplexed: `--cameras-json` — one process for a whole plugin group,
 //!     where a member's silence is normal and never exits ([`multiplex`]).
 //!
 //! Both directions of the protocol are live in both modes: detections go out
-//! on stdout, and Cairn's per-camera stream epochs come in on stdin
+//! on stdout, and the host's per-camera stream epochs come in on stdin
 //! ([`control`]). stdout carries protocol lines and nothing else — every
-//! diagnostic, here and in the stages, goes to stderr where Cairn logs it.
+//! diagnostic, here and in the stages, goes to stderr.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -88,8 +96,8 @@ struct Args {
     /// `epoch_bypass_ms`, `reverify_ms`.
     ///
     /// Unlike `--min-score-json` this does *not* conflict with
-    /// `--cameras-json`: the gate is the operator's own setting, written into
-    /// the configured command rather than appended by Cairn, so it has to be
+    /// `--cameras-json`: the gate is the operator's own setting, a flag of
+    /// the command rather than an argument the host appends, so it has to be
     /// expressible in both modes. In group mode it is the default for every
     /// member, and a member's own `motion` key overrides the knobs it names.
     #[arg(long)]
@@ -101,8 +109,8 @@ struct Args {
     /// default — emits exactly what the per-class floors admit.
     ///
     /// Operator-owned like `--motion-json`, and for the same reason it does
-    /// not conflict with `--cameras-json`: it is written into the configured
-    /// command rather than appended by Cairn, so it has to be expressible in
+    /// not conflict with `--cameras-json`: it is a flag of the command rather
+    /// than an argument the host appends, so it has to be expressible in
     /// both modes. In group mode it is the default for every member, and a
     /// member's own `track_floor` key replaces it.
     #[arg(long)]
@@ -210,7 +218,7 @@ pub struct Provider {
 /// reported on stderr as `fatal: …`.
 pub fn run(providers: &[Provider]) -> ExitCode {
     let failed = serve(providers).inspect_err(|e| {
-        // Exit loudly: Cairn restarts us with jittered backoff.
+        // Exit loudly: this line and the status are all the host learns.
         note!("fatal: {e:#}");
     });
     // On both paths, because `note!` only queues: a clean run has lines of its own
@@ -273,8 +281,8 @@ fn serve(providers: &[Provider]) -> Result<()> {
             }
         }
     }
-    // Before the model load, which is seconds: the host logs the hello and
-    // checks that protocol 1 is in `supported_versions`.
+    // Before the model load, which is seconds: the contract wants the hello
+    // ahead of everything else and reads its absence as a v0 plugin.
     emit::stdout_line(&emit::hello_line())?;
 
     match args.cameras_json.as_deref() {
@@ -285,11 +293,12 @@ fn serve(providers: &[Provider]) -> Result<()> {
 
 /// The control thread, started before anything slow.
 ///
-/// Cairn writes `stream.started` for every camera as soon as it spawns us,
-/// with `:nosuspend` — an unread pipe loses those announcements rather than
-/// queueing them, and a lost epoch means every line that camera produces is
-/// dropped host-side until the next restart. So stdin is drained from the
-/// first moment, all the way through the model load.
+/// The contract's host writes `stream.started` for every camera as soon as
+/// it spawns the process, and never blocks on the write: once the pipe is
+/// full an announcement is dropped rather than queued, and a camera that
+/// missed one is silent or emitting under an epoch the host has retired.
+/// So stdin is drained from the first moment, all the way through the model
+/// load.
 fn start_control<'a>(camera_ids: impl IntoIterator<Item = &'a str>) -> Result<Arc<Streams>> {
     let streams = Arc::new(Streams::new(camera_ids));
     control::spawn_reader(Arc::clone(&streams))?;
@@ -417,8 +426,8 @@ fn track_floor_overrides(args: &Args) -> Result<TrackFloorOverrides> {
     TrackFloorOverrides::parse(args.track_floor_json.as_deref().unwrap_or("{}"))
 }
 
-/// One process, one camera. Any stream failure is fatal by design: Cairn
-/// restarts this process with jittered backoff, and there is nothing else
+/// One process, one camera. Any stream failure is fatal by design: the
+/// contract's host restarts a plugin that exits, and there is nothing else
 /// running here to keep alive.
 fn run_single(args: &Args, providers: &[Provider]) -> Result<()> {
     let camera_id = args
@@ -767,8 +776,8 @@ mod tests {
 
     #[test]
     fn the_track_floor_is_configurable_in_both_forms() {
-        // Cairn's own flags conflict with --cameras-json; this one is the
-        // operator's, written into the configured command, so like
+        // The host's per-camera arguments conflict with --cameras-json; this
+        // one is the operator's, a flag of the command, so like
         // --motion-json it has to survive next to either form.
         let knobs = r#"{"floor":0.15}"#;
         let group = parse(&["--cameras-json", "[]", "--track-floor-json", knobs]).unwrap();

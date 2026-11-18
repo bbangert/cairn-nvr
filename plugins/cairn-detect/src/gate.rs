@@ -21,8 +21,8 @@
 //! [`crate::motion::MotionDetector`] — a camera whose measurement has started
 //! over while its `Gate` has not. What covers the rebuilt detector's blind
 //! window is [`MotionVerdict::calibrating`]; see [`Gate::decide`]. Single mode
-//! has no such window: a stream failure there is fatal, and the process Cairn
-//! restarts has a fresh `Gate` too. In `cairn-native` the `Gate` belongs to the
+//! has no such window: a stream failure there is fatal, and a process started
+//! again has a fresh `Gate` too. In `cairn-native` the `Gate` belongs to the
 //! stream, so a reopen builds a fresh detector and a fresh `Gate` together and the
 //! mismatch cannot arise; that host also calls [`Gate::decide`] directly rather
 //! than [`sample_line`], so the policy is shared and the emission is not.

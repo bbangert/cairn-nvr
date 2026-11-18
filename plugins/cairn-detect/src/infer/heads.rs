@@ -1427,8 +1427,7 @@ mod tests {
             (300.0, 300.0, 40.0, 40.0, 0usize, 0.3),
             (500.0, 500.0, 40.0, 40.0, 0usize, 0.05),
         ];
-        // Without the flag the band is not on the wire at all — the identity
-        // every run Cairn launches today depends on.
+        // Without the flag the band is not on the wire at all.
         let plain = v8(3, &anchors, &floors(r#"{"default":0.5}"#), SQUARE);
         assert_eq!(plain.len(), 1);
         assert_eq!(plain[0].score, 0.9);

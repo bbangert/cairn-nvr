@@ -12,11 +12,11 @@ already exists: a family the Rust catalog ships, a backend the plugin can
 name, a stage the tracker implements. There are no free knobs here — a value
 this file does not accept is one nothing in cairn implements.
 
-You do not need a profile. Nothing in the config requires one and no default
-config has one; a camera without a profiled group behaves exactly as it always
-has. You want one when you are running cairn on an accelerator, when you want
-the model choice to be a reviewable file rather than a line of argv, or when
-different cameras on one node run different hardware.
+A camera needs a profile only to detect: one with no `plugin:` key runs
+without detection, and no default config names a profile. Detection has no
+other route — a camera's `plugin:` names a `plugins:` group, every group must
+name a `profile:` (one without is a config error), and the group's cameras run
+what that profile names.
 
 Shipped profiles live in `priv/profiles/`; a board's own live in the directory
 its release names (`Cairn.Stage.Board.profiles_dir/0`); yours live wherever

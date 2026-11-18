@@ -367,8 +367,8 @@ def run_plugin_and_feed(args, seq_name: str, seqinfo: dict, video_path: Path, ca
         raise SystemExit(f"[{seq_name}] capture drain thread hung after plugin exit")
 
     # Closing stdin above is deliberate control-channel EOF, and the plugin
-    # exits it with libc::_exit(3) by design (control.rs: "exiting so Cairn
-    # respawns us") -- 3 is the expected code for exactly what we just did,
+    # exits it with libc::_exit(3) by design (control.rs: "control channel
+    # gone") -- 3 is the expected code for exactly what we just did,
     # not a failure. Only something other than {0, 3} is one.
     if proc.returncode not in (0, 3):
         raise SystemExit(f"[{seq_name}] plugin exited {proc.returncode}. stderr tail:\n{''.join(stderr_tail)}")

@@ -237,8 +237,8 @@ pub fn source_size(frame: &AVFrame) -> Result<InputSize> {
 
 /// Cap on decoded frame size, applied to every codec context.
 ///
-/// Cairn's ffmpeg is `-c:v copy`, so this plugin is the first thing in the
-/// system that actually decodes camera bitstream: without a cap, an SPS
+/// Cairn's ffmpeg copies video unless a camera opts into transcode, so this
+/// is usually a bitstream's first decoder: without a cap, an SPS
 /// declaring 16384x16384 gets buffers allocated to match. 8K (33.2 MP) fits
 /// under this; anything larger fails inside libavcodec (which logs the
 /// dimensions it rejected) and lands in the tolerated decode-error path
@@ -250,8 +250,8 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 /// A backend that cannot open — no device, no driver, no GPU scaler — is
 /// logged and skipped, and software decode is the last resort. What a
 /// *named* backend's failure means is the embedder's to say via `fallback`:
-/// the plugin binary allows the fallback (its refusal would be a process
-/// exit into a restart loop), the NIF path refuses it so the branch goes
+/// the plugin binary allows the fallback (a refusal was a process exit
+/// into its host's restart loop), the NIF path refuses it so the branch goes
 /// dark with the reason surfaced instead of silently decoding at software
 /// cost. At open time both behave alike — the eager path always falls back,
 /// and the NIF's `require_named_hardware` turns that into an open error —
@@ -1522,8 +1522,8 @@ pub fn sample_interval(sample_fps: u32) -> Duration {
 
 /// Read packets forever, handing sampled frames to the inference thread.
 ///
-/// Returns only on error or end of stream — both are fatal for the process,
-/// which is what Cairn's restart-with-backoff expects.
+/// Returns only on error or end of stream. Single-camera mode exits on
+/// either; multiplexed mode re-opens the stream (`multiplex::stream_loop`).
 ///
 /// `sample_fps` is the process's resolved `--sample-fps`, validated at parse
 /// time to `1..=30` — this loop just turns it into an interval and never
