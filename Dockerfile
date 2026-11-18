@@ -129,28 +129,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN <<'EOS'
 set -eux
 mkdir -p /opt/ort /opt/qnn
+# microsoft/onnxruntime went 404 on 2026-11-17; the sha256 checks make the
+# hosts irrelevant.
 case "$TARGETARCH" in
 arm64)
+  # Our byte-identical mirror first, Microsoft's release second.
   ORT_TGZ=onnxruntime-linux-aarch64-1.26.0.tgz
-  ORT_SHA=34ff1c2d0f12e2cf3d33a0c5f82e39792e1d581fbd6968fd7c30d173654be01a
+  curl -fsSL -o /tmp/ort.tgz \
+    "https://github.com/bbangert/cairn-nvr/releases/download/ort-1.26.0/$ORT_TGZ" ||
+    curl -fsSL -o /tmp/ort.tgz \
+      "https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/$ORT_TGZ"
+  echo "34ff1c2d0f12e2cf3d33a0c5f82e39792e1d581fbd6968fd7c30d173654be01a /tmp/ort.tgz" | sha256sum -c -
+  tar -xzf /tmp/ort.tgz -C /tmp
+  ORT_DIR="/tmp/${ORT_TGZ%.tgz}"
+  cp -a "$ORT_DIR"/lib/libonnxruntime.so* \
+    "$ORT_DIR"/lib/libonnxruntime_providers_shared.so /opt/ort/
+  cp "$ORT_DIR"/LICENSE "$ORT_DIR"/ThirdPartyNotices.txt /opt/ort/
   ;;
 amd64)
-  ORT_TGZ=onnxruntime-linux-x64-1.26.0.tgz
-  ORT_SHA=1254da24fb389cf39dc0ff3451ab48301740ffbfcbaf646849df92f80ee92c57
+  # No copy of the x64 tarball survived. Microsoft's NuGet package is the
+  # same build (its arm64 libs are byte-identical to the tarball's) but ships
+  # only the unversioned file, so the tarball's links are recreated.
+  curl -fsSL -o /tmp/ort.nupkg \
+    https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.26.0/microsoft.ml.onnxruntime.1.26.0.nupkg
+  echo "50cc3772668f04b8373ad65a36793f94699bc4e818f6e691fc68f1578c38ce42 /tmp/ort.nupkg" | sha256sum -c -
+  unzip -j /tmp/ort.nupkg -d /tmp/ort \
+    runtimes/linux-x64/native/libonnxruntime.so \
+    runtimes/linux-x64/native/libonnxruntime_providers_shared.so \
+    LICENSE ThirdPartyNotices.txt
+  cp /tmp/ort/libonnxruntime.so /opt/ort/libonnxruntime.so.1.26.0
+  ln -s libonnxruntime.so.1.26.0 /opt/ort/libonnxruntime.so.1
+  ln -s libonnxruntime.so.1 /opt/ort/libonnxruntime.so
+  cp /tmp/ort/libonnxruntime_providers_shared.so /tmp/ort/LICENSE \
+    /tmp/ort/ThirdPartyNotices.txt /opt/ort/
   ;;
 esac
-# Our mirror first (arm64 only), Microsoft's second: microsoft/onnxruntime
-# went 404 on 2026-11-17. The sha256 check makes the host irrelevant.
-curl -fsSL -o /tmp/ort.tgz \
-  "https://github.com/bbangert/cairn-nvr/releases/download/ort-1.26.0/$ORT_TGZ" ||
-  curl -fsSL -o /tmp/ort.tgz \
-    "https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/$ORT_TGZ"
-echo "$ORT_SHA /tmp/ort.tgz" | sha256sum -c -
-tar -xzf /tmp/ort.tgz -C /tmp
-ORT_DIR="/tmp/${ORT_TGZ%.tgz}"
-cp -a "$ORT_DIR"/lib/libonnxruntime.so* \
-  "$ORT_DIR"/lib/libonnxruntime_providers_shared.so /opt/ort/
-cp "$ORT_DIR"/LICENSE "$ORT_DIR"/ThirdPartyNotices.txt /opt/ort/
 
 if [ "$TARGETARCH" = "arm64" ]; then
   WHL=onnxruntime_qnn-2.4.0-cp312-cp312-manylinux_2_34_aarch64.whl
