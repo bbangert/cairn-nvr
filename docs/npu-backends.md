@@ -77,13 +77,20 @@ silicon — Frigate #18878 shows a VPU session allocated and consuming
   `tools/rknn-export/README.md`.
 - Runtime from Rust: rknpu2-rs binds librknnrt (2.3.2 API), zero-copy
   in/out, but no async, no batching, no multi-core orchestration
-  documented — assume sequential single-inference per model. No perf-mode
+  documented — one inference at a time per context. Contexts of one model
+  do overlap (measured, below); Cairn's engine holds one. No perf-mode
   API equivalent to QNN's.
 - Per-board reality (inference-only vs pipeline):
   - rk3566 (~1 TOPS): model-zoo yolov8n@640 claimed 34 fps, but Frigate
     real-world reports 95-250 ms inference (~4-10 fps with overhead). On
-    the HA Green, INT8 yolox_tiny@416 sustains 23.2 passes/s and
-    yolox_s@640 9.7 — `rk3566-tier1`'s provisional budgets.
+    the HA Green, in the pipeline with one context, INT8 yolox_tiny@416
+    holds nine cameras at 2 fps (16.57 passes/s carried) and yolox_s@640
+    four (7.36) — `rk3566-tier1`'s budgets are those camera counts at the
+    loader's 1.875/s floor rate, 16.875 and 7.5. A third to just over half
+    of each pass is CPU time in the calling thread; one context leaves the
+    NPU 40-51 % busy at saturation, and a second context of the same model
+    adds 57 % (tiny@416) or 34 % (s@640):
+    `docs/evidence/rk3566-capacity-20261118.md`.
   - rk3576 (6 TOPS, INT4-capable): no official benchmarks found; ~6×
     rk3566 expected; Frigate discussions confirm multi-stream viability.
 - **Preprocessing: no Rust crate for RGA** (Rockchip's 2D accelerator for

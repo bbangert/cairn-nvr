@@ -221,12 +221,11 @@ defmodule Cairn.ArtifactsTest do
       assert Artifacts.state(sha_of("none"), ctx.store) == {:missing, :unlisted}
     end
 
-    test "the Rockchip profile's three rungs, from this repo's models release" do
+    test "the Rockchip profile's two rungs, from this repo's models release" do
       release = "https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/"
       entries = Profile.fetch_entries(["boards/cairn_rockchip/priv/profiles"])
 
-      assert Enum.map(entries, & &1.name) ==
-               ~w(yolox_s_640_i8.rknn yolox_tiny_640_i8.rknn yolox_tiny_416_i8.rknn)
+      assert Enum.map(entries, & &1.name) == ~w(yolox_s_640_i8.rknn yolox_tiny_416_i8.rknn)
 
       for entry <- entries do
         assert entry.sha256 =~ ~r/\A[0-9a-f]{64}\z/

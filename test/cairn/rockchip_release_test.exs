@@ -104,18 +104,16 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
 
     @rungs [
       {"c61524bca75d6f5df3fd255c8f27b5eaca544c94cbd05d4ce835a82a48733282", "yolox_s_640_i8.rknn",
-       "models/yolox_s.onnx", 640, 9.7},
-      {"cd146e38777ea0c38e20c114c4166fb9b7553c379e20651a999167acb0bb044a",
-       "yolox_tiny_640_i8.rknn", "models/yolox_tiny_640.onnx", 640, 11.96},
+       "models/yolox_s.onnx", 640, 7.5},
       {"832df464bc84259d8d612bb7e9d4f6dd8573acb94f9847e051cce4c438c78304",
-       "yolox_tiny_416_i8.rknn", "models/yolox_tiny.onnx", 416, 23.2}
+       "yolox_tiny_416_i8.rknn", "models/yolox_tiny.onnx", 416, 16.875}
     ]
 
-    test "rk3566-tier1: three fetched Apache rungs with their twins, and the store's set" do
+    test "rk3566-tier1: two fetched Apache rungs with their twins, and the store's set" do
       assert {:ok, config, []} = Config.from_map(%{"data_dir" => "tmp/cfg_test"})
       profile = config.profiles["rk3566-tier1"]
       assert %{tier: 1, experimental: true, backend: "rknn", decoder: "rkmpp"} = profile
-      assert profile.supported_cameras == 12
+      assert profile.supported_cameras == 9
       url = "https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/"
       assert length(profile.model_ladder) == length(@rungs)
 
@@ -141,16 +139,16 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       assert {:ok, %{model: @stub_rknn, cpu_twin: "models/yolox_s.onnx", input_size: 640}} =
                Config.native_model_config(config)
 
-      [{tiny640, _, _, _, _} | _] = tl(@rungs)
+      [{tiny416, _, _, _, _}] = tl(@rungs)
 
       state = fn sha256 ->
-        if sha256 == tiny640, do: {:missing, "timeout"}, else: verified.(sha256)
+        if sha256 == tiny416, do: {:missing, "timeout"}, else: verified.(sha256)
       end
 
       assert {:error, [error]} = Config.from_map(map("rk3566-tier1", []), artifact: state)
 
       assert error ==
-               "plugin det: profile rk3566-tier1 needs yolox_tiny_640_i8.rknn (ladder rung 2), " <>
+               "plugin det: profile rk3566-tier1 needs yolox_tiny_416_i8.rknn (ladder rung 2), " <>
                  "not downloaded yet: the last fetch failed: timeout — the download is retried " <>
                  "until it succeeds; no camera can run on this group before then"
     end

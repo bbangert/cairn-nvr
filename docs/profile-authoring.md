@@ -464,11 +464,14 @@ on a non-`ort` backend.
 Written here rather than invented as validation, because a check that cannot
 see what it is checking is worse than a sentence you can read.
 
-**RKNN is sequential.** librknnrt documents no async submission, no batching
-and no multi-core orchestration for one model: assume one inference at a time
-per model. Nothing in a profile can say otherwise — there is no batch size and
-no concurrency field — so this is a sizing fact, not a setting. If an rk3566
-budget looks achievable only by overlapping inferences, it is not achievable.
+**RKNN is sequential per context, and the engine holds one.** librknnrt
+documents no async submission and no batching: one inference at a time per
+context. Nothing in a profile can say otherwise — there is no batch size and
+no concurrency field — so this is a sizing fact, not a setting. Further
+contexts of one model do overlap on the RK3566
+(`docs/evidence/rk3566-capacity-20261118.md`), but that is not something a
+profile can ask for: if an rk3566 budget looks achievable only by overlapping
+inferences, it is not achievable.
 
 **A fixed-geometry artifact pins `input_size:` and nothing here can check
 it.** Both NPU backends compile the model at one input geometry, so an
@@ -646,7 +649,7 @@ the release that can run it:
 |---|---|---|---|---|---|
 | `generic-ort` | `priv/profiles/` | `ort` | band 5–5 | twin gate only | today's behaviour, named; the migration target and the one non-experimental profile |
 | `qcs6490-tier1` | `priv/profiles/generic/` (generic board) | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: six rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
-| `rk3566-tier1` | `boards/cairn_rockchip/priv/profiles/` | `rknn` | derived per rung | none (tier 1) | three fetched Apache YOLOX rungs with baked CPU twins, `decoder: rkmpp`, claim 12 cameras; every budget provisional |
+| `rk3566-tier1` | `boards/cairn_rockchip/priv/profiles/` | `rknn` | derived per rung | none (tier 1) | two fetched Apache YOLOX rungs with baked CPU twins, `decoder: rkmpp`, claim 9 cameras; both budgets boundary-measured (`docs/evidence/rk3566-capacity-20261118.md`) |
 
 The two ladders are `experimental: true` because their backends have not
 proven out in soak: a group naming one needs your `allow_experimental: true`.
