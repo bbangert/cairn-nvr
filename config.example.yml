@@ -70,22 +70,22 @@ events:
 # person detection's embedding (carried on the observation but only used if
 # this is on) feeds a rolling per-track appearance, and the bbd admission
 # gains an appearance veto and a cost tiebreak from it. Its only seam into the tracker
-# is that admission, so reid: true requires bbd: true — config load refuses
-# the combination of reid: true with bbd: false rather than accept a flag that
-# can never act. Off by default: the fusion is unmeasured until phase-6 E2E
-# and its veto threshold is provisional until then.
+# is that admission, so reid: true acts only on a camera where bbd runs — and
+# no config key selects an embedder model yet, so today it changes nothing.
+# Off by default: the fusion is unmeasured until phase-6 E2E and its veto
+# threshold is provisional until then.
 #
 # None of the four has a per-camera form: they describe the matcher and the
-# motion filter rather than a scene, so they are one answer for every camera
-# that is not covered by a hardware profile. A profile is the other way to
-# answer bbd, oru and ocr — per plugin group, i.e. per piece of hardware — and
-# for the cameras on a profiled group those three keys are ignored entirely,
-# with a warning at load saying the profile won. reid does not have a profile
-# form yet and is not superseded by one — it keeps applying to a profiled
-# camera too, for whatever bbd the group's own stage list leaves it (a load
-# warning names a profiled group whose stage list leaves bbd out, since reid
-# does nothing there either). See docs/profile-authoring.md; profiles are the
-# migration target for bbd/oru/ocr, and there is no deadline.
+# motion filter rather than a scene. bbd, oru and ocr here are the answer for
+# the cameras of a group whose hardware profile runs a tracker and has no
+# tracking: block, which is none of the profiles cairn ships. A profile's
+# tracking: block is the other way to answer them — per plugin group, i.e. per
+# piece of hardware — and for that group's cameras these three keys are ignored
+# entirely, with a warning at load when one is set. reid does not have a profile
+# form yet and is not superseded by one — it applies whatever the profile, for
+# whatever bbd is left running (a load warning names a group whose profile's
+# stage list leaves bbd out, since reid does nothing there). See
+# docs/profile-authoring.md.
 tracking:
   max_unseen_ms: 3000
   max_live_tracks: 128

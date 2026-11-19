@@ -53,8 +53,8 @@ defmodule Cairn.Tracker.Stage.Bbd do
   A listed stage runs unconditionally — there is no flag test in here. What
   gates whether this stage is *listed* is `Cairn.Tracker`'s `batch_stages/1`
   translation, reading one of two sources: the global `tracking.bbd` boolean
-  for a camera whose plugin group has no hardware profile, or that profile's
-  own `tracking: bbd:` entry for one that does (`Cairn.Config.Profile`,
+  for a camera whose profile has no `tracking:` block, or that block's own
+  `bbd:` entry for one whose profile has it (`Cairn.Config.Profile`,
   `docs/profile-authoring.md`). A config that names neither produces an empty
   stage list and the pre-stage association bit for bit.
   """

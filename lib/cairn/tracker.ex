@@ -841,10 +841,11 @@ defmodule Cairn.Tracker do
   The host-side tracking policy for one camera.
 
   The four stage flags and the `stages` presence map are two forms of one
-  setting, and `context/3` resolves them: a policy carrying `stages` — a
-  profiled camera's, per `Cairn.Config.policy/2` — supersedes the booleans
-  entirely (presence decides listing, `twin_mint` included); a policy
-  without one reads the booleans exactly as before profiles existed. The
+  setting, and `context/3` resolves them: a policy carrying `stages`
+  (`Cairn.Config.policy/2` adds it for a camera whose profile has a
+  `tracking:` block) supersedes the booleans entirely (presence decides
+  listing, `twin_mint` included); a policy without one reads the booleans
+  exactly as before profiles existed. The
   paired `t:context/0` above carries only the resolved form.
   """
   @type policy :: %{
@@ -936,19 +937,19 @@ defmodule Cairn.Tracker do
       # Not a stage flag: `tracking.reid` modifies what the BBD admission
       # weighs (see "Appearance fusion" in `Cairn.Tracker.Stage.Bbd`) and
       # gates the per-track rolling-embedding writes, so it resolves as a
-      # plain boolean on both the boolean and the profiled path.
+      # plain boolean on both the boolean and the stage-list path.
       reid: Map.get(policy, :reid, false) == true
     }
   end
 
   # Booleans-or-stage-list, resolved to one representation: `false` (not
-  # listed), or a params map (listed). A policy with a `stages` presence map —
-  # a profiled camera's — supersedes the boolean pair entirely: a stage is
+  # listed), or a params map (listed). A policy with a `stages` presence map
+  # supersedes the booleans entirely: a stage is
   # listed exactly when its key is present, `twin_mint` included (a profile
   # says what runs; the default-on reading belongs to the boolean path alone).
   # Without one, the booleans read as they always have, `true` becoming the
-  # empty params map at the translation (`stage_list/4`), so an unprofiled
-  # caller's path is byte-identical in shape.
+  # empty params map at the translation (`stage_list/4`), so a caller without
+  # a stage list keeps a path byte-identical in shape.
   defp stage_setting(policy, key, default) do
     case Map.get(policy, :stages) do
       nil -> Map.get(policy, key, default)
@@ -2126,7 +2127,7 @@ defmodule Cairn.Tracker do
 
   # The `oru` setting spent into a list — `false` (or a caller that never
   # heard of the key) is no stage, `true` is the stage with default params,
-  # and a profiled camera's params map rides through as the stage's params.
+  # and a stage list's params map rides through as the stage's params.
   # The flag is spent here and only here — a listed stage runs
   # unconditionally (see "Gating" in `Cairn.Tracker.Stage.Oru`).
   defp per_object_stages(context), do: stage_list(context, :oru, Stage.Oru, false)

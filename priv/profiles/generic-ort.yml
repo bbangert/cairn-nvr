@@ -1,11 +1,10 @@
-# The migration target for an existing config: what cairn already does, named.
+# The baseline profile: detection on the CPU, with nothing opt-in.
 #
-# A group that adopts this profile keeps today's behaviour — yolox at 416 on
-# onnxruntime's CPU provider, the cold-start twin gate on, and none of the
-# opt-in association/filter/recovery stages — and gains what the global
-# `tracking.bbd`/`oru`/`ocr` booleans never had: one file per hardware class,
-# checked at load, expanding into both halves of the boundary at once. See
-# `docs/profile-authoring.md` for the migration, which is two config lines.
+# A group on this profile runs yolox at 416 on onnxruntime's CPU provider, the
+# cold-start twin gate on, and none of the opt-in association/filter/recovery
+# stages. Its `tracking:` block is the stage list, so the global
+# `tracking.bbd`/`oru`/`ocr` booleans do not reach its cameras; see
+# `docs/profile-authoring.md` for turning those stages on in a copy.
 #
 # The one shipped profile that is not experimental: `ort` is the backend that
 # executes today, and this file names no combination the capability table
@@ -28,15 +27,13 @@ labels: models/coco.names
 fps_band: [5, 5]
 tracking:
   # Presence, not defaults: this block *is* the stage list. `twin_mint` alone
-  # is the no-profile behaviour every existing deployment already has (D-P8) —
-  # `bbd` and `oru` ship off, and a migration target that listed them would
-  # change what a config does on the day it adopts a profile, which is the one
-  # thing this file must not do. Adding them is a per-profile decision — see
+  # is the pre-profile behaviour (D-P8) — `bbd` and `oru` ship off, and the
+  # baseline lists neither. Adding them is a per-profile decision — see
   # docs/profile-authoring.md on each stage — and note that bbd's measured
   # win needs the engine's track floor (`track_floor_json`) alongside it,
   # which no config key sets yet.
   twin_mint: true
-  # The globals, restated so that adopting this profile changes nothing.
+  # The global defaults, restated.
   max_unseen_ms: 3000
   max_live_tracks: 128
   stationary_after_ms: 10000
