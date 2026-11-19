@@ -25,7 +25,7 @@ defmodule Cairn.DataDir do
     File.mkdir_p!(data_dir)
     chmod(data_dir, 0o700)
     Enum.each(Enum.map(@subdirs, &Path.join(data_dir, &1)), &File.mkdir_p!/1)
-    # ffmpeg/plugin logs can echo credentialed URLs — keep them private
+    # ffmpeg logs can echo credentialed URLs — keep them private
     chmod(log_dir(data_dir), 0o700)
     secure_db(data_dir)
     :ok

@@ -42,8 +42,8 @@ defmodule Cairn.Native.Status do
   # The whole cost of a cycle against a wedged host, and the deadline whose expiry
   # is read as the wedge.
   @status_timeout_ms 2_000
-  # `plugin.status`'s own bound on `detail`: this surface must not carry a field a
-  # plugin's could not.
+  # The retired `plugin.status` contract's bound on `detail`, kept with its
+  # vocabulary.
   @max_detail_bytes 256
 
   @wedged_detail "A restart is not expected to clear this — NPU state survives kill -9 " <>
@@ -156,9 +156,8 @@ defmodule Cairn.Native.Status do
 
   `state` and `detail` are the headline an operator reads; `health` is the
   verdict itself, which is not recoverable from `state` (a saturated engine and
-  an idle one are both working, and neither is a fault). `health` is not a key
-  the protocol's status whitelist admits, so one on a stored status can only
-  have come from this node — which is what lets a reader branch on it.
+  an idle one are both working, and neither is a fault). Every stored status
+  is built here, so `health` is always present for a reader to branch on.
   """
   @spec payload(map(), String.t()) :: map()
   def payload(status, camera_id) do

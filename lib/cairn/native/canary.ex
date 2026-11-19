@@ -13,8 +13,9 @@ defmodule Cairn.Native.Canary do
   `ready` line the moment the detector and embedder are open, before it touches a
   socket, and a member that never receives a packet is normal there. Single-camera
   mode's `ready` line waits on the RTP stream opening, which never happens here,
-  so it would hang. `udp_port` is `0` because the schema requires the key and
-  nothing binds it.
+  so it would hang. `udp_port` is `0` because the schema requires the key; the
+  binary goes on to try an RTP open on it after `ready`, but the probe stops
+  it on reading `ready`.
 
   A missing binary is a failure and not a skip: a packaging or `PATH` mistake must
   refuse the load rather than quietly perform it unrehearsed. Loading without a

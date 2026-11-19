@@ -432,7 +432,7 @@ defmodule Cairn.Pipeline.Camera do
     )
   end
 
-  # No plugin configured is no detection, exactly as on the classic path.
+  # A camera with no `plugin:` gets no detect branch.
   defp detect_spec(_camera, nil, _head), do: []
 
   defp detect_spec(camera, detect, head) do

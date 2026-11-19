@@ -1,5 +1,17 @@
 # Storage and memory: comparison with Frigate
 
+> **Status (2026-11).** Cairn's half of this comparison was written against
+> the original design: an external inference plugin that owned its decode
+> pipeline, and ffmpeg piping fMP4 fragments to a port. Neither is how Cairn
+> runs now. Decode and inference are native libraries inside the node, with
+> decoded frames passing between the detect branch's elements in-process, and
+> the camera's Membrane pipeline cuts the fragments (ffmpeg, where a camera
+> is ingested through it, is a demuxer, or with `transcode: true` a hardware
+> re-encoder). `architecture.md` describes that. What the comparison
+> concludes still holds — one ring of encoded fragments, no `/dev/shm` region
+> for decoded frames, an event catalog rather than a segment catalog. The
+> sections on Frigate are unaffected.
+
 A side-by-side analysis of how Frigate handles fragment caching, recording, shared memory, and persistent state, contrasted with the in-BEAM ring-buffer architecture documented in `architecture.md`. The goal is to surface where the two approaches genuinely differ and why, so that decisions in our design are informed by Frigate's lessons (where applicable) rather than inheriting them by default.
 
 This report reflects Frigate's behavior as of release 0.16 (current stable, March 2026 source index), drawing primarily from the project's installation docs, recording docs, the `record/maintainer.py` and `video.py` source modules surfaced through DeepWiki, and a representative sample of community discussions about real-world failure modes.
