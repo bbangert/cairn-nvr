@@ -46,9 +46,10 @@ defmodule Cairn.ObservationClock do
       clock strictly increasing, which the tracker's arithmetic relies on
       (`Cairn.Tracker` floors no elapsed time at zero). It is also the only
       thing that can put `at_ms` *past* `now_ms`: that takes a stamp whose
-      predecessor is already at `now_ms` or past it, which starts with two
-      stamps that read the same `now_ms` and lasts until the host's clock
-      has gained the lead back.
+      predecessor is less than `@floor_ms` short of `now_ms`
+      (`prev + @floor_ms > now_ms`), which starts with two stamps less than
+      a millisecond of host time apart and lasts until the host's clock has
+      gained the lead back.
 
   The anchor is re-taken on an epoch change, on a backwards `media_ms` within
   one epoch, and on the first observation after `reset/1`, and those are the
