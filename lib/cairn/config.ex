@@ -76,7 +76,7 @@ defmodule Cairn.Config do
   # (`Cairn.Config.Profile`, D-P7). So this key's remaining job is the fallback
   # for a group whose profile runs a tracker and carries no `tracking:` block: a
   # profile's stage list supersedes it (`put_stages/2`), and setting it warns
-  # per group (`warn_superseded_flags/2`).
+  # per group whose profile carries one (`warn_superseded_flags/2`).
   @default_bbd false
   # Whether a track's motion filter is rebuilt across an unmatched gap, from
   # the two real boxes that bound it, instead of being corrected through it
@@ -518,8 +518,8 @@ defmodule Cairn.Config do
     # `tracking:` block ignores the first three entirely, `stages` below
     # superseding them. `reid` is not a stage and a profile cannot supersede
     # it; it applies under either form, for whatever its one seam (`bbd`) is
-    # left able to do (`warn_reid_without_bbd_stage/2` names the stage-list
-    # case where that is nothing).
+    # left able to do (`warn_reid_without_bbd_stage/2` and
+    # `warn_reid_global_bbd_off/2` name the two cases where that is nothing).
     |> Map.put(:bbd, config.bbd)
     |> Map.put(:oru, config.oru)
     |> Map.put(:ocr, config.ocr)
@@ -1294,8 +1294,8 @@ defmodule Cairn.Config do
   def native_model_config(%__MODULE__{} = config) do
     config.cameras
     |> Enum.map(&profile_for(config, &1))
-    # What a load lets through here is a camera with no plugin at all:
-    # `validate_camera_profiles/2` refuses one whose group resolved no profile.
+    # The `nil`s of a loaded config are cameras with no plugin at all: a group
+    # naming an unknown profile fails the load (`resolve_profiles/4`).
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq_by(&Profile.native_config/1)
     |> case do
@@ -1518,7 +1518,6 @@ defmodule Cairn.Config do
     |> validate_remux(config)
     |> validate_ha_token(config)
     |> validate_native_model(config)
-    |> validate_camera_profiles(config)
     |> validate_gate_ownership(config)
     |> warn_ladder_thresholds(config)
   end
@@ -1587,28 +1586,6 @@ defmodule Cairn.Config do
       {:ok, _model} -> acc
       {:error, message} -> add_error(acc, message)
     end
-  end
-
-  # A camera builds its detect branch from `plugin:` alone, but only a
-  # profile says which model the branch runs on. On a group whose profile did
-  # not resolve it would detect on whatever model another camera loaded, or on
-  # none.
-  defp validate_camera_profiles(acc, config) do
-    config.cameras
-    |> Enum.filter(&(&1.plugin != nil))
-    |> Enum.reject(&profile_for(config, &1))
-    |> Enum.reduce(acc, &add_error(&2, unprofiled_camera(&1)))
-  end
-
-  defp unprofiled_camera(%Camera{plugin: {:group, name}} = cam) do
-    "camera #{cam.id}: detection resolves no profile — its model comes from plugin " <>
-      "#{name}'s profile:, and that group has none in effect. Add a profile: to plugin #{name}"
-  end
-
-  defp unprofiled_camera(%Camera{} = cam) do
-    "camera #{cam.id}: detection resolves no profile — the camera detects in this node's " <>
-      "own engine and takes its model from a plugin group's profile:; name such a group " <>
-      "as this camera's plugin:"
   end
 
   defp validate_ha_token(acc, %{ha_token: nil}), do: acc
@@ -1691,6 +1668,8 @@ defmodule Cairn.Config do
     |> validate_reid_requires_bbd(config)
     |> warn_superseded_flags(config)
     |> warn_reid_without_bbd_stage(config)
+    |> warn_reid_global_bbd_off(config)
+    |> warn_reid_no_embedder(config)
   end
 
   # Every place a core can be named, refused at load: `Config.tracker/2`
@@ -1721,15 +1700,15 @@ defmodule Cairn.Config do
 
   # Reid's fusion has one seam into the tracker: the BBD admission
   # (`Cairn.Tracker.Reid`, `Cairn.Tracker.Stage.Bbd`). This refuses reid on
-  # with the global bbd flag off only when some camera's group resolved no
+  # with the global bbd flag off only when some camera's group names an unknown
   # profile, which is already a load error. A camera on a resolved profile is
   # never refused here: with a stage list it answers to
   # `warn_reid_without_bbd_stage/2`, and without one it reads the global bbd
-  # flag and loads with reid inert, unreported.
+  # flag — `warn_reid_global_bbd_off/2` names that case.
   defp validate_reid_requires_bbd(acc, config) do
-    # "Unprofiled" here is a camera on a group whose profile did not resolve
-    # (already its own load error). A camera with no plugin at all runs no
-    # tracker and holds no opinion.
+    # "Unprofiled" here is a camera on a group whose profile name was refused
+    # as unknown (`resolve_profiles/4`, already its own load error). A camera
+    # with no plugin at all runs no tracker and holds no opinion.
     unprofiled? =
       Enum.any?(config.cameras, fn
         %{plugin: {:group, _name}} = cam -> profile_for(config, cam) == nil
@@ -1775,13 +1754,13 @@ defmodule Cairn.Config do
   end
 
   # D-P7: a profile's stage list supersedes the global booleans, and setting
-  # both is legal but ambiguous enough to name. Warns for every group with a
-  # resolved profile — one with no stage list included, where the booleans
-  # stand, and a tier-1 one, which runs no tracker.
+  # both is legal but ambiguous enough to name. Warns only for a group whose
+  # profile carries a stage list: without one the booleans stand, and a tier-1
+  # profile never has one (`Profile` refuses its `tracking:` block).
   defp warn_superseded_flags(acc, config) do
     if config.bbd or config.oru or config.ocr do
       config.plugin_groups
-      |> Enum.filter(&match?(%Profile{}, &1.profile))
+      |> Enum.filter(&match?(%Profile{stages: %{}}, &1.profile))
       |> Enum.reduce(acc, fn group, acc ->
         add_warning(
           acc,
@@ -1799,8 +1778,7 @@ defmodule Cairn.Config do
   # way `warn_superseded_flags/2` warns about. But its one seam is the bbd
   # *stage*, and a group whose profile's stage list replaces the booleans and
   # leaves bbd out silences it for that group's cameras just as surely as the
-  # global bbd flag being off would — worth naming, since nothing else here
-  # would tell an operator reid is doing nothing on that hardware.
+  # global bbd flag being off would, so it gets a warning of its own.
   defp warn_reid_without_bbd_stage(acc, config) do
     if config.reid do
       config.plugin_groups
@@ -1819,13 +1797,48 @@ defmodule Cairn.Config do
 
   # A profile with no `tracking:` block at all (`stages: nil`) says nothing
   # about tracking, so the group's cameras fall back to the global `bbd` flag
-  # — not this function's case. Only a profile that
-  # *does* carry a stage list and leaves bbd off it silences reid.
+  # — `warn_reid_global_bbd_off/2`'s case. Only a profile that *does* carry a
+  # stage list and leaves bbd off it silences reid.
   defp reid_silenced_by_profile?(%PluginGroup{profile: %Profile{stages: stages}})
        when is_map(stages),
        do: not Map.has_key?(stages, :bbd)
 
   defp reid_silenced_by_profile?(_group), do: false
+
+  # The block-less counterpart of `warn_reid_without_bbd_stage/2`: the group's
+  # cameras read the global bbd flag, so with it off reid is just as inert. A
+  # warning where `validate_reid_requires_bbd/2` has an error: refusing would
+  # fail configs that have always loaded. A tier-1 profile runs no tracker, so
+  # reid has no seam there to lose.
+  defp warn_reid_global_bbd_off(acc, %{reid: true, bbd: false} = config) do
+    config.plugin_groups
+    |> Enum.filter(&match?(%Profile{stages: nil, tier: tier} when tier != 1, &1.profile))
+    |> Enum.reduce(acc, fn group, acc ->
+      add_warning(
+        acc,
+        "tracking.reid has no effect for group #{group.name}: its profile " <>
+          "#{group.profile.name} has no tracking: block, so its cameras read the global " <>
+          "tracking.bbd, which is off"
+      )
+    end)
+  end
+
+  defp warn_reid_global_bbd_off(acc, _config), do: acc
+
+  # Reid fuses embeddings, and the engine's embedder model is set by neither a
+  # config key nor a profile key. An engine config pinned on
+  # `Cairn.Native.Host` (its `:config` opt or application env) is the one
+  # route an embedder has, and config load cannot see it — hence "unless".
+  defp warn_reid_no_embedder(acc, %{reid: true}) do
+    add_warning(
+      acc,
+      "tracking.reid fuses embeddings, and no config or profile key selects the embedder " <>
+        "model that produces them — it has no effect unless the engine was pinned with " <>
+        "one outside this config"
+    )
+  end
+
+  defp warn_reid_no_embedder(acc, _config), do: acc
 
   defp validate_tracking_key(acc, config, key, min, max) do
     values =

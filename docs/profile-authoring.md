@@ -373,8 +373,10 @@ profile form yet — a profile can neither list nor delist it. It applies
 whatever the profile, through its one seam, the bbd admission, wherever that
 runs: a profile whose `tracking:` block carries no `bbd` silences it just as
 surely as the global `tracking.bbd: false` does under a profile with no
-block. The first case gets its own load warning saying so (below), separate
-from the bbd/oru/ocr one; the second gets none.
+block. Each case gets its own load warning saying so (below), separate from
+the bbd/oru/ocr one — the second only for a profile that runs a tracker. And
+`tracking.reid: true` warns on its own account: no config or profile key
+selects an embedder model yet, so there is nothing for it to fuse.
 
 `true` and an empty mapping mean the same thing. A params mapping is carried
 through to the stage, and **no stage cairn ships reads its params today** —
@@ -559,6 +561,11 @@ plugin detect: profile my-board supersedes the global tracking.bbd/oru/ocr
   flags for its cameras — the profile's stage list wins
 tracking.reid has no effect for group detect: its profile my-board lists no
   bbd stage
+tracking.reid has no effect for group detect: its profile my-board has no
+  tracking: block, so its cameras read the global tracking.bbd, which is off
+tracking.reid fuses embeddings, and no config or profile key selects the
+  embedder model that produces them — it has no effect unless the engine was
+  pinned with one outside this config
 camera front: track: has no effect at tier 1 — tier 1 runs no tracker and
   persists no track rows; record: gates presence recordings
 plugin detect: profile my-board names backend "rknn", which the <board> board
