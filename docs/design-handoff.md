@@ -12,7 +12,7 @@ bindings) exactly as specced; restyle everything else freely.
 ## Product in one paragraph
 
 Cairn is an event-clip NVR (network video recorder) for a home LAN.
-Cameras stream via RTSP; an AI plugin detects objects (person, cat, car…);
+Cameras stream via RTSP; a built-in detector finds objects (person, cat, car…);
 Cairn records one mp4 clip per event (with pre-roll) and indexes it.
 The UI is three pages: a live **Dashboard**, an **Events** browser with
 clip playback, and a read-only **Config** page. No auth in v1 (LAN-trusted).
@@ -105,9 +105,10 @@ Filterable, paginated list of recorded event clips, newest first.
 
 Read-only render of the active YAML config + reload workflow.
 
-- Sections: globals (data_dir, windows, retention, UDP range, thresholds),
+- Sections: globals (data_dir, windows, retention, thresholds),
   then per-camera cards: id, rtsp_url (mask password part —
-  server sends it pre-masked), plugin command, min_score map, windows,
+  server sends it pre-masked), plugin (the camera's detection group, or
+  "none"), min_score map, windows,
   retention, `transcode` flag.
 - **Per-camera probe results** (Phase 8): codec, resolution, fps, profile
   + warning states: non-H.264 camera → warning chip "switch camera to

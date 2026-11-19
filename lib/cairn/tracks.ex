@@ -584,13 +584,13 @@ defmodule Cairn.Tracks do
   # declares microseconds" has to hold at the call site, and the caller is a
   # lossy batch writer whose whole batch dies with it.
   #
-  # Wire time is padded where it enters the system
-  # (`Cairn.PluginProtocol`, which parses the plugin's three decimals). This
-  # restates that at the table so a second time source — a checkpoint restored
-  # from an older host, a fixture, a plugin variant — cannot turn a batch into
-  # a crash. It pads the declared precision only; the microsecond count is
-  # untouched. Anything that is not a `DateTime` passes through to fail on dump
-  # as it would have.
+  # Observation time is padded where it enters the system
+  # (`Cairn.Native.Observations` on the live path, `Cairn.PluginProtocol` for
+  # a recorded line's three decimals). This restates that at the table so
+  # another time source — a checkpoint restored from an older host, a fixture
+  # — cannot turn a batch into a crash. It pads the declared precision only;
+  # the microsecond count is untouched. Anything that is not a `DateTime`
+  # passes through to fail on dump as it would have.
   defp usec(%DateTime{microsecond: {value, _digits}} = at),
     do: %{at | microsecond: {value, 6}}
 

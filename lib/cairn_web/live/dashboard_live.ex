@@ -372,10 +372,9 @@ defmodule CairnWeb.DashboardLive do
     statuses |> Map.get(camera_id, %{}) |> Map.get(:plugin_status)
   end
 
-  # `health` is `Cairn.Native.Status`'s and only ever this node's: the protocol's
-  # status whitelist is `state`/`detail`/`fps`, so no plugin line can carry one.
-  # A plugin's `state` is a free string the contract forbids branching on, so it
-  # is shown verbatim and coloured neutrally.
+  # `Cairn.Native.Status` is the only writer of this status and always sets
+  # `health`, so the `state`-only clause below — shown verbatim, coloured
+  # neutrally — is reached only by a map without one.
   # `Cairn.Native.Status`'s `headline/1` derives most states from health —
   # ready, idle, saturated, wedged — where either key tells the same story and
   # health may answer. These are the ones it decides before health is consulted

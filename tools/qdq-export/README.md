@@ -53,7 +53,7 @@ Three venvs, deliberately separate:
 | family | FP32 source | license | HTP notes |
 |---|---|---|---|
 | yolox (nano/tiny/s/m) | release-asset download, `model/quantize-model.md` §2 | Apache-2.0 | quantizes as-is; Focus-layer Slices stay FP32 harmlessly (2 islands, reported by the gate) |
-| yolo26 (n/s/m), yolov10 | `export_ultralytics.py yolo26n yolo26s` | **AGPL-3.0**/Enterprise (code AND weights — HF model card) | export uses `end2end=False`: the default NMS-free tail segfaults QNN 2.4.0 quantized; the raw `[1, 4+nc, A]` head IS the yolov8 tensor contract, so the plugin decodes it under `--model-profile yolov8` with host-side NMS |
+| yolo26 (n/s/m), yolov10 | `export_ultralytics.py yolo26n yolo26s` | **AGPL-3.0**/Enterprise (code AND weights — HF model card) | export uses `end2end=False`: the default NMS-free tail segfaults QNN 2.4.0 quantized; the raw `[1, 4+nc, A]` head IS the yolov8 tensor contract, so it is decoded under the `yolov8` model profile with host-side NMS |
 | yolov8 (n) | `export_ultralytics.py yolov8n` | AGPL-3.0 | no tail; exports raw head natively |
 
 One checkpoint at two geometries needs `--suffix`, or the second export
@@ -114,9 +114,10 @@ Three checks, and only the third can see everything.
 - `run_verify_all.sh` — FP32-vs-QDQ **score distributions** per FPN
   level on the CPU EP (`score_parity.py`), over held-out frames and over
   the board clips. This is the accuracy oracle the pipeline lacked.
-- `verify_artifact.sh <model.onnx>` — the plugin's real decode path on a
-  loopback RTP feed, with a label histogram. It answers "does the decode
-  still work end to end", never "are the scores right".
+- `verify_artifact.sh <model.onnx>` — the `cairn-detect` binary's decode path
+  (the stage library the engine links) on a loopback RTP feed, with a label
+  histogram. It answers "does the decode still work end to end", never "are
+  the scores right".
 - **The board leg.** Same clips, `--backend qnn`, distributions compared
   against the CPU run. Defect 2 above is invisible to every local check
   by construction, so an artifact that has not run on an HTP has not

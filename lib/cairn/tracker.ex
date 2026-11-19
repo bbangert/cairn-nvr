@@ -10,19 +10,17 @@ defmodule Cairn.Tracker do
   constrain that one rule rather than adding a second. The one thing that
   loosens it is `tracking.bbd`, off by default and described under "A second
   admission" below; with it off — which is every camera that has not asked —
-  overlap is the whole of what a track will answer to. There is no
-  plugin-driven mode. A plugin's
-  `track_id`s and `ended_tracks` are still parsed off the wire, and so is its
-  `object_tracking` capability, but nothing here reads any of them — they are
-  accepted and reserved, and a plugin that declares the capability is tracked
-  host-side like every other.
+  overlap is the whole of what a track will answer to. No producer supplies
+  identity: the engine mints none, and the `track_id`s and `ended_tracks` a
+  recorded plugin line may carry are decoded onto the observation and read
+  by nothing here.
 
   Every decision here is taken on one clock, `at_ms`: the observation's own
   media time anchored to the host's monotonic clock and clamped against a pts
   that stalls, rewinds or jumps, computed once at ingestion by
   `Cairn.ObservationClock`. It behaves as media time within a stream — the
   bounds below are spaced by frames, not by batches — while being comparable
-  across an epoch boundary and unable to freeze, which is what a plugin's raw
+  across an epoch boundary and unable to freeze, which is what a stream's raw
   pts is neither of. No threshold here is measured on a wall clock:
   `observed_at` is carried onto the summaries as data (`started_at`,
   `last_seen_at`, `last_detected_at`, `stationary_since`) and reported as the
@@ -35,7 +33,7 @@ defmodule Cairn.Tracker do
   kill a track — and, as below, on a box the track refuses. Evidence policy is
   separate: a track whose last **detection** is older than `max_unseen_ms` is
   flagged `stale_predicted`, and `Cairn.CameraTracker` refuses it as event evidence
-  however long the plugin keeps predicting it.
+  however long the engine keeps re-reporting it.
 
   A track the tracker has judged **stationary** (see below) expires at
   `@stationary_unseen_factor` times that bound instead, and for as long as it
@@ -135,9 +133,9 @@ defmodule Cairn.Tracker do
   itself for as long as the detector goes on emitting it.
 
   What the grace does not require is *detections*: `last_seen_ms` moves on
-  predicted observations too and the stillness rule ignores them, so a plugin
-  that keeps predicting a box at the parked position holds the identity and
-  the stationary flag for as long as it predicts, no matter how long that is.
+  predicted observations too and the stillness rule ignores them, so an engine
+  that keeps re-reporting a box at the parked position holds the identity and
+  the stationary flag for as long as it does, no matter how long that is.
   That is the "slow inference must not kill a track" contract above, over a
   window the grace makes longer; `stale_predicted` is what keeps it from
   counting as evidence.
@@ -175,18 +173,18 @@ defmodule Cairn.Tracker do
   to resume an identity across a gap nothing watched, nor to refuse a detection
   on.
 
-  A seeded box — the plugin re-reporting an observation it already made — is
+  A seeded box — the engine re-reporting an observation it already made — is
   not an observation of motion, so it neither updates the filter nor steps it.
   Through a seeded stretch the filter is held exactly as it was, and the
   prediction the next detection is matched against is the one the last
   *detection* left. Everything else about a seeded box is unchanged: it
   refreshes liveness, it moves `bbox`, and it is no more evidence than before.
   It moves `bbox` to the same place, though — a seed re-reports the last
-  detected box byte for byte, the plugin replaying exactly what it emitted —
+  detected box byte for byte, the engine replaying exactly what it emitted —
   and the `tracking.oru` replay (`Cairn.Tracker.Stage.Oru`) anchors at `bbox`
-  on the strength of that: a plugin that ever seeded a *moved* box would
+  on the strength of that: an engine that ever seeded a *moved* box would
   silently break that anchor, which is why verbatim re-reporting is an
-  invariant here and not a detail of the current plugin.
+  invariant here and not a detail of the current engine.
 
   ## Rebuilding a filter across a gap: `tracking.oru`
 
@@ -207,13 +205,13 @@ defmodule Cairn.Tracker do
 
     * `bbox` is the last box the track was really *observed* at — the replay's
       anchor — and the byte-for-byte seed invariant above is what makes it the
-      last *detected* box too. A plugin that seeded a box it had moved would
+      last *detected* box too. An engine that seeded a box it had moved would
       put a box no detector produced at one end of the stage's interpolation,
       and the replay would learn motion nothing ever saw.
     * The unmatched gap the stage measures is `at_ms - last_matched_ms`, and a
       seed refreshes `last_matched_ms` like any other match — so a stretch the
-      plugin re-reported through never opens a gap, and no motion is
-      synthesized across a stretch the plugin's own account says was
+      engine re-reported through never opens a gap, and no motion is
+      synthesized across a stretch the engine's own account says was
       motionless.
     * `revive/3` drops an adopted track's filter while carrying `bbox` and
       `last_matched_ms` across the cut untouched, which is the whole of what
@@ -323,8 +321,8 @@ defmodule Cairn.Tracker do
   at the constant enforces the ordering).
 
   Adoption is refused for a predicted box: an identity nothing confirmed for
-  the length of the outage may not be resumed by the plugin's extrapolation of
-  where it would have been.
+  the length of the outage may not be resumed by a box the model did not
+  produce on that frame.
 
   What resumes with the identity is nearly all of it: `at_ms` spans the cut, so
   nothing has to be re-based to stay comparable, and `last_seen_ms` still dates
@@ -485,9 +483,9 @@ defmodule Cairn.Tracker do
   gap is ended by the unseen bound or by suspension, not by this.
 
   Every stationary update is gated on `Cairn.Observation.detected?/1`, for the
-  same reason as `stale_predicted`: a predicted box repeats the plugin's own
-  extrapolation, so counting it would manufacture stillness out of the plugin's
-  guesses. A seeded stretch leaves the still run, the drift and every stationary
+  same reason as `stale_predicted`: a predicted box repeats what the engine
+  last reported, so counting it would manufacture stillness out of an echo.
+  A seeded stretch leaves the still run, the drift and every stationary
   field exactly as it found them — which is also why a settle window that
   elapsed during one is credited whole at the next detection: the run's start is
   an instant, not a stopwatch that seeds can pause.
@@ -509,8 +507,8 @@ defmodule Cairn.Tracker do
   `Cairn.CameraTracker` refuses it as event evidence for as long as it
   is set.
 
-  Bboxes are `[x, y, w, h]` **normalized to the frame**, which is what the
-  plugin protocol delivers. The IoU arithmetic here is scale-free and would not
+  Bboxes are `[x, y, w, h]` **normalized to the frame**, which is what an
+  observation carries. The IoU arithmetic here is scale-free and would not
   care, but `Membrane.MOTTracker.Kalman` is not: it caps the width and height
   of the boxes it predicts at one frame, so a track fed pixel coordinates is
   matched against a prediction shrunk to a sliver of its box and will not
@@ -1494,8 +1492,8 @@ defmodule Cairn.Tracker do
   # actually saw it at, and not against a prediction: a suspended track has no
   # live filter to predict from, and the moduledoc's rule is that an
   # extrapolation may not resume an identity in any case. That is the same
-  # refusal the `Observation.detected?/1` gate below makes of the plugin's
-  # extrapolations, applied to the host's own.
+  # refusal the `Observation.detected?/1` gate below makes of a predicted
+  # box, applied to the host's own extrapolation.
   #
   # One threshold and no clock: how long the track had been absent does not
   # enter into it. The only time bound is the adoption window, and `track/3`
@@ -1503,11 +1501,10 @@ defmodule Cairn.Tracker do
   # this same batch's `at_ms`, so everything still in `suspended` here is
   # inside its window.
   #
-  # Only detections. A predicted box is the plugin extrapolating where the
-  # object would be if it were still there, and across a gap nothing observed
-  # that is precisely the question — resuming an identity on it would let a
-  # plugin talk a departed object back into existence for as long as it keeps
-  # guessing.
+  # Only detections. A predicted box says where the object would be if it
+  # were still there, and across a gap nothing observed that is precisely the
+  # question — resuming an identity on it would talk a departed object back
+  # into existence for as long as such boxes keep arriving.
   defp adopt(%{suspended: suspended} = tracker, indexed, matched, context)
        when map_size(suspended) > 0 do
     {_assignments, objects, _tracks} = matched
@@ -2152,10 +2149,10 @@ defmodule Cairn.Tracker do
   # being two facts that can drift apart.
   #
   # A seeded box advances nothing at all — not the state, not the covariance.
-  # It is the plugin re-reporting a sighting it already made, so treating it as
+  # It is the engine re-reporting a sighting it already made, so treating it as
   # an observation would let one detection be counted as many, and merely
   # predicting on it would inflate the filter's uncertainty over a stretch
-  # where by the plugin's own account nothing has happened. Held is the honest
+  # where by the engine's own account nothing has happened. Held is the honest
   # reading, and it is what the moduledoc promises.
   #
   # The nil case is a track `revive/3` cleared and no stage re-filled: the
@@ -2200,7 +2197,7 @@ defmodule Cairn.Tracker do
 
   # -- stillness --------------------------------------------------------------
 
-  # A predicted box is the plugin repeating itself, so it neither advances nor
+  # A predicted box is the engine repeating itself, so it neither advances nor
   # resets stillness — a pending exit included, which is what makes a detection
   # gap unable to complete one. See the moduledoc, and `failed/4`.
   defp stillness(tracked, _object, false, _previous_detected_ms, _context), do: tracked

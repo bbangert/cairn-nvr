@@ -459,8 +459,9 @@ defmodule Cairn.Native.Health do
 
   defp escalate(state, _verdict, _probe, _streams), do: state
 
-  # Completed model passes per second, per camera — the `fps` a plugin reports for
-  # itself, measured over the window that has just closed rather than since boot.
+  # Completed model passes per second, per camera — what `Cairn.Native.Status`
+  # publishes as `fps`, measured over the window that has just closed rather
+  # than since boot.
   defp stream_fps(window, elapsed_ms) do
     Map.new(window, fn {id, entry} -> {id, Float.round(entry.count * 1000 / elapsed_ms, 2)} end)
   end

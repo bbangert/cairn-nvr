@@ -18,7 +18,9 @@ defmodule Cairn.Track do
     * `score` is the latest observation's score, `best_score` the highest
       seen over the track's life.
     * `stale_predicted` — the track is alive but has not been *detected*
-      recently (the plugin keeps predicting it). Never event evidence.
+      recently: something other than a detection is holding it, such as
+      boxes the engine re-reports or a stationary track's longer grace.
+      Never event evidence.
     * `stationary` — the object's box has held still for the camera's
       `stationary_after_ms` of the tracking clock (`Cairn.ObservationClock`);
       `stationary_since` is the

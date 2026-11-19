@@ -165,7 +165,11 @@ criterion live there and in
   then `SessionBuilder::with_devices` over the devices the plugin exposes
   (`AppendExecutionProvider_V2` underneath). The `qnn` cargo feature /
   `system` build strategy researched earlier was never needed.
-- **Flags**: `--qnn-library` (the plugin EP .so, required), and
+- **Flags** (the `cairn-detect` binary's, which the canary and the bench
+  harnesses pass; the in-VM engine takes the same node facts from
+  `CAIRN_QNN_LIBRARY`, `CAIRN_QNN_SOC_MODEL`, `CAIRN_QNN_HTP_ARCH`,
+  `CAIRN_QNN_PERFORMANCE_MODE` and `CAIRN_QNN_VTCM_MB`): `--qnn-library`
+  (the plugin EP .so, required), and
   `--qnn-soc-model 35 --qnn-htp-arch 68` (required in practice on
   QCS6490 — platform detection fails without them), plus optional
   `--qnn-performance-mode`, `--qnn-vtcm-mb`. `backend_type=htp` is always
@@ -182,7 +186,7 @@ criterion live there and in
   CPU fallback after a successful open is still possible and *invisible*
   in logs — the only accepted proof of HTP execution is a latency delta
   vs the `ort` backend (D-P5, ≥3×), which the board-bench harness
-  enforces. The plugin's own surface for that check is the
+  enforces. The stage library's own surface for that check is the
   `infer latency: backend=… p50=… p95=…` stderr line `Detector::detect`
   emits every 100 runs. The in-VM host runs the same check unattended:
   `Cairn.Native.Host` measures the CPU pass once per engine load, in a

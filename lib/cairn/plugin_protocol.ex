@@ -19,8 +19,9 @@ defmodule Cairn.PluginProtocol do
       `"version": 1`, with `frame.objects`, `plugin.hello` and
       `plugin.status` message types.
     * **v0** — the original untagged `{"pts": _, "dets": [_]}` line, still
-      supported. It carries no epoch and no time, so the port completes the
-      `Cairn.Observation` with arrival-quality timing.
+      supported. It carries no epoch and no time, so it decodes with neither
+      and its `time_quality` is `:arrival`; a harness that needs one supplies
+      its own.
 
   Forward compatibility is one-directional: unknown top-level fields and
   unknown `type` values are ignored, but a *malformed* known field drops the
@@ -31,8 +32,7 @@ defmodule Cairn.PluginProtocol do
   bound (a JSON integer decodes at arbitrary precision, and a bignum in
   `Observation.media_ms/2` raises `ArithmeticError`), and the `hello` and
   `status` bodies are whitelisted and byte-capped rather than passed
-  through — a status is retained per camera and broadcast to every
-  subscriber on every line.
+  through.
   """
 
   alias Cairn.Observation
@@ -62,18 +62,16 @@ defmodule Cairn.PluginProtocol do
   @max_pts 4_611_686_018_427_387_904
   @max_sequence 4_611_686_018_427_387_904
   @max_time_base 1_000_000_000
-  # hello is plugin-controlled, held in port state and interpolated into logs.
+  # hello is plugin-controlled, so what survives of it is bounded.
   @max_hello_bytes 64
   @max_supported_versions 16
   @max_protocol_version 1_000
   @max_capabilities 32
   @max_capability_key_bytes 32
-  # status is retained per camera in ETS and broadcast to every dashboard and
-  # SSE client, so it is a whitelist rather than a passthrough. `camera_id` is
-  # part of the shaped status too, but only as routing for the caller — it is
-  # only ever taken from the envelope (a payload-supplied one would let a
-  # plugin address a member it was not talking about) and the port drops it
-  # before storing.
+  # A whitelist rather than a passthrough, so no other key of a recorded
+  # status leaves this module. `camera_id` rides along on the shaped status,
+  # taken only from the envelope (a payload-supplied one would let a plugin
+  # address a member it was not talking about).
   @status_keys ~w(state detail fps)
   @max_status_state_bytes 32
   @max_status_detail_bytes 256
@@ -179,8 +177,8 @@ defmodule Cairn.PluginProtocol do
     end
   end
 
-  # Whitelist, not passthrough: what survives here is stored per camera and
-  # fanned out to every status subscriber on every line.
+  # Whitelist, not passthrough: only these keys of a recorded status leave
+  # this module.
   defp shape_status(payload) do
     case Map.take(payload, @status_keys) do
       %{"state" => state} = status when is_binary(state) ->
@@ -210,9 +208,8 @@ defmodule Cairn.PluginProtocol do
 
   defp shape_status_fps(status), do: Map.delete(status, "fps")
 
-  # `hello` is held in port state and interpolated into logs. Malformed
-  # fields are dropped rather than dropping the line: a plugin that
-  # mis-declares its name is still a plugin worth running.
+  # Malformed fields are dropped rather than dropping the line: a recording
+  # whose hello mis-declares its name still decodes.
   defp shape_hello(hello) do
     %{}
     |> shape_hello_string(hello, "name")
@@ -445,8 +442,8 @@ defmodule Cairn.PluginProtocol do
 
   # -- v0 ---------------------------------------------------------------------
 
-  # No epoch and no timestamp on the wire: the port completes both, which is
-  # why `time_quality` is `:arrival` for everything decoded here.
+  # No epoch and no timestamp on the wire, so both stay `nil` and
+  # `time_quality` is `:arrival` for everything decoded here.
   defp decode_v0(%{"pts" => pts, "dets" => dets} = msg, mode)
        when is_number(pts) and pts >= -@max_pts and pts <= @max_pts and is_list(dets) do
     with {:ok, camera_id} <- camera_id(msg, mode) do
@@ -504,11 +501,10 @@ defmodule Cairn.PluginProtocol do
 
   A list longer than #{@max_dets} entries is a contract violation rather than
   a crowded frame: it is rejected whole (every entry counts as a drop). The
-  cost of one batch in `Cairn.Tracker.track/3` is `O(dets × objects)`, paid in
-  the camera's tracker element, so an unbounded list wedges that camera's
-  detect branch. Decoding it is paid earlier and elsewhere — in the
-  port, which for a plugin group is shared by every member — so the cap is
-  also what keeps one member's plugin off its neighbours' lines.
+  cost of one batch in `Cairn.Tracker.track/3` is `O(dets × objects)`, so an
+  unbounded list would stall a replay that tracks what it decodes. Live
+  batches never pass through here: `Cairn.Native.Observations` caps them
+  itself (`@max_objects`).
 
   Total on any term: a non-list counts as a single drop.
   """
@@ -516,8 +512,8 @@ defmodule Cairn.PluginProtocol do
   def validate_dets(dets) when is_list(dets) do
     count = length(dets)
 
-    # An over-cap batch is still cast as an empty one, which is the plugin's
-    # liveness signal.
+    # An over-cap v0 batch still decodes, as an observation with no objects
+    # (an over-cap v1 line is dropped whole — `objects/1`).
     if count > @max_dets, do: {[], count}, else: reduce_dets(dets)
   end
 

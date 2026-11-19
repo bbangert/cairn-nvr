@@ -659,7 +659,7 @@ defmodule Cairn.CameraTracker do
   # `stale_predicted` is not checked here and must not be: the tracker sets it
   # from the last *detection*, so an object that is detected in this batch
   # always carries `false`. The staleness rule bites through `detected?/1`
-  # instead — a track the plugin keeps predicting arrives as `"tracked"`.
+  # instead — a track the engine keeps re-reporting arrives as `"tracked"`.
   #
   # The `record:` half is `Cairn.Config.earns_video?/4`, shared with the
   # presence lane so the two cannot disagree on what a tier admits. The two

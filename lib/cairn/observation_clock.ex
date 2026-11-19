@@ -2,12 +2,13 @@ defmodule Cairn.ObservationClock do
   @moduledoc """
   Derives `Cairn.Observation.at_ms`, the one clock the tracker decides on.
 
-  A plugin's `media_ms` is its stream's own `pts`: it restarts with every
-  ffmpeg run, it can stall or rewind while the plugin keeps emitting, and it is
-  the plugin's to move. The host's monotonic clock has none of those problems
-  and knows nothing about which frame a line describes. `at_ms` is the first
-  anchored to the second: media time carries the *spacing* between frames, and
-  the host clock carries the *bound*.
+  An observation's `media_ms` is its stream's own `pts`: it is not comparable
+  from one stream epoch to the next, it can stall or rewind while observations
+  keep arriving, and it is the source's to move. The host's monotonic clock
+  has none of those problems and knows nothing about which frame an
+  observation describes. `at_ms` is the first anchored to the second: media
+  time carries the *spacing* between frames, and the host clock carries the
+  *bound*.
 
   One of these per camera, held by what ingests that camera's detections —
   `Cairn.Pipeline.ObservationStamper`, whose detect branch now outlives session
@@ -27,7 +28,7 @@ defmodule Cairn.ObservationClock do
   re-anchorings `at_ms` advances exactly as media time does. That is what keeps
   every bound the tracker is tuned with (`max_unseen_ms`,
   `stationary_after_ms`) meaning what it meant when they were media-time
-  bounds. The two clamps bound the two ways a plugin's pts lies:
+  bounds. The two clamps bound the two ways a pts lies:
 
     * `min(…, now_ms)` — media time may not run ahead of the host. A pts that
       jumps forward, or a stream replayed faster than real time, would
@@ -41,12 +42,13 @@ defmodule Cairn.ObservationClock do
       tracks of a dead stream would live forever. The floor costs the guarantee
       its precision — on a fully stalled pts `at_ms` creeps by a millisecond per
       *observation* rather than at the host's rate, so a track still retires but
-      no faster than the plugin's frame rate lets it — and it is what makes the
+      no faster than the observation rate lets it — and it is what makes the
       clock strictly increasing, which the tracker's arithmetic relies on
       (`Cairn.Tracker` floors no elapsed time at zero). It is also the only
-      thing that can put `at_ms` *past* `now_ms`, and only for a plugin
-      emitting two lines inside one host millisecond — more than a thousand a
-      second.
+      thing that can put `at_ms` *past* `now_ms`: that takes a stamp whose
+      predecessor is already at `now_ms` or past it, which starts with two
+      stamps that read the same `now_ms` and lasts until the host's clock
+      has gained the lead back.
 
   The anchor is re-taken on an epoch change, on a backwards `media_ms` within
   one epoch, and on the first observation after `reset/1`, and those are the
@@ -66,7 +68,7 @@ defmodule Cairn.ObservationClock do
       identities for what is still standing there. The rewind is caught here
       rather than left to the floor because `anchored` otherwise sits below
       `at_ms` for as long as it takes media time to climb back, which is
-      minutes of creeping a millisecond a line.
+      minutes of creeping a millisecond an observation.
     * **An epoch change** anchors at `now_ms`. Nothing observed that gap:
       `Membrane.MOTTracker` suspends the live set at the cut, and the
       suspension and adoption windows it then waits out are elapsed times on
@@ -78,12 +80,12 @@ defmodule Cairn.ObservationClock do
 
   `at_ms` is derived from the host's monotonic clock, and nothing but the
   floor's creep can put it ahead of one, which is what makes stamps comparable
-  across an epoch change, a plugin respawn and a port restart. A respawn carries `at_ms` over
-  (`reset/1`), and a clock from `new/0` takes its first stamp at `now_ms` — at
-  or past anything a clock that ran before it could have stamped, there being
-  no earlier stamp of its own to continue from. That is what lets a tracker
-  core — which outlives every one of them — subtract two `at_ms` from either
-  side of a stream reset and get an elapsed time rather than garbage.
+  across an epoch change and across a replaced clock. A clock from `new/0`
+  takes its first stamp at `now_ms` — at or past anything a clock that ran
+  before it could have stamped, there being no earlier stamp of its own to
+  continue from — and a holder that swaps its producer carries `at_ms` over
+  instead (`reset/1`). That is what lets a tracker subtract two `at_ms` from
+  either side of a stream reset and get an elapsed time rather than garbage.
   """
 
   alias Cairn.Observation
@@ -93,7 +95,7 @@ defmodule Cairn.ObservationClock do
   # stalled or rewound pts, since a stream at even 1000 fps advances a full
   # millisecond per frame, and — where `min(…, now_ms)` is the binding one, a
   # pts ahead of the host or a replay faster than real time — a host clock that
-  # has not ticked a millisecond since the previous line.
+  # has not ticked a millisecond since the previous observation.
   @floor_ms 1
 
   @typedoc """
@@ -124,10 +126,11 @@ defmodule Cairn.ObservationClock do
   @doc """
   Drops the anchor and the previous `media_ms`, keeping `epoch` and `at_ms`.
 
-  For where the plugin process is replaced: its successor continues nobody's
-  pts, so the pair the clock was pinned with describes a timeline that no
-  longer exists — but tracking time is not the plugin's, and the tracks it
-  stamps are the same tracks. The first observation after this re-anchors at
+  For a holder whose producer is replaced (none on the live path — see the
+  moduledoc): the successor continues nobody's pts, so the pair the clock was
+  pinned with describes a timeline that no longer exists — but tracking time
+  is not the producer's, and the tracks it stamps are the same tracks. The
+  first observation after this re-anchors at
   continuity if it carries the epoch the clock already had, and at `now_ms` if
   it carries a new one, exactly as a rewind and an epoch change do.
   """

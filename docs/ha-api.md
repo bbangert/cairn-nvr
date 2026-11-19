@@ -77,8 +77,9 @@ media URLs → Media Browser resolution; WHEP → native WebRTC camera
 }
 ```
 
-`id` is stable — use it as the HA device identifier. `detection` is whether an
-inference plugin is configured. **`rtsp_url` is never emitted** (it embeds
+`id` is stable — use it as the HA device identifier. `detection` is whether
+the camera is configured to detect (its `plugin:` names a group under
+`plugins:`). **`rtsp_url` is never emitted** (it embeds
 credentials). `control.min_score` is a runtime override (see below) or `null`
 when the configured `min_score` applies. `plugin_status` is the detector's own
 status object, the same one the `camera_status` SSE frame carries, or `null`
@@ -166,7 +167,7 @@ frames are not replayed, so re-fetch state on every reconnect. Event kinds:
 | `event_snapshot_ready` / `event_snapshot_failed` | artifact object (below), with `snapshot_url` |
 | `track_started` / `track_updated` / `track_ended` | track object (below) |
 | `presence_started` / `presence_cleared` | `{camera_id, zone, label, state, score, first_seen_at, at}` — tier-1 cameras only (see `profile-authoring.md` on the capability ladder). **The client state key is `(camera_id, zone, label)`.** `zone` is always present: the stable `id` of one of the camera's zones (`/api/cameras` lists them), or `null` for whole-frame presence on a camera that has no zones. `state` is `"present"` or `"cleared"`; `score` is the best detection score over the stay so far; `first_seen_at` survives into the clearing frame, so dwell is `at - first_seen_at` off that frame alone. **The transitions are edge-only**: a `presence_*` frame carries no event id and has no `/api/events` row of its own, and a client connecting mid-presence sees nothing until the next transition — track current state client-side from the transitions. A presence history/snapshot surface is future work. Recordings are a separate thing and are ordinary events — see below |
-| `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` is the detector's own `{state, detail, fps}` ([`plugin.status`](archive/plugin-contract.md#pluginstatus)), `null` until it reports one. A camera detected on by the in-VM native block reports here too, adding `health` (`healthy` / `saturated` / `wedged` / `idle` / `unknown` / `not_applicable`), `stream_health`, `engine`, `nif`, `canary`, `model` (the model file's **name**, never its path), `backend`, `p50_ms` (one model pass, median over the last check window), `cpu_baseline_ms` (the CPU cost of one pass on the same model — or its FP32 ONNX twin, for a backend whose artifact the CPU cannot run — measured once per engine load in a separate process; `null` on a CPU backend, where there is no accelerator to compare against, and while the measurement is pending or when it failed) and `inferences`; those keys never appear on a plugin's status, which is whitelisted to the three above. A camera configured to detect reports here even with no stream open — that is how a refused canary or a failed model load reaches a client |
+| `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` (the name predates the in-VM engine) is the detector's status, `null` until the first is published: `state`, `detail` and `fps` in the vocabulary of the retired [`plugin.status`](archive/plugin-contract.md#pluginstatus), plus `health` (`healthy` / `saturated` / `wedged` / `idle` / `unknown` / `not_applicable`), `stream_health`, `engine`, `nif`, `canary`, `model` (the model file's **name**, never its path), `backend`, `p50_ms` (one model pass, median over the last check window), `cpu_baseline_ms` (the CPU cost of one pass on the same model — or its FP32 ONNX twin, for a backend whose artifact the CPU cannot run — measured once per engine load in a separate process; `null` on a CPU backend, where there is no accelerator to compare against, and while the measurement is pending or when it failed) and `inferences`. A camera configured to detect reports here even with no stream open — that is how a refused canary or a failed model load reaches a client |
 | `camera_control` | `{camera_id, detection_enabled, recording_enabled, min_score}` |
 | `disk_alert` | `{active, free_mb, threshold_mb}` |
 
@@ -312,9 +313,8 @@ Recommended client flow:
 #### Track frames
 
 A **track** is one physical object followed through time. Cairn assigns the
-identity itself (IoU on the detections); a plugin's own `track_id`s are
-accepted on the wire but ignored. The producing side of this — how identity is
-scoped and what bounds it — is
+identity itself (IoU on the detections); the detector supplies none. How
+identity is scoped and what bounds it is written up in the archived contract:
 [`docs/archive/plugin-contract.md` → Track identity](archive/plugin-contract.md#track-identity).
 
 ```json
@@ -413,8 +413,10 @@ Same schema for all three kinds:
   for rows recorded before the removal.
 - `score` is the latest observation, `best_score` the best over the track's life.
 - `stale_predicted: true` means the track is alive but has not actually been
-  *detected* recently — the plugin is predicting it. Cairn never treats such an
-  object as evidence, and neither should an automation.
+  *detected* recently — it is alive on something other than a new detection,
+  such as boxes the detector re-reports or the longer grace a stationary
+  track gets. Cairn never treats such an object as evidence, and neither
+  should an automation.
 - A track is not an event: tracks come and go inside one event, and exist even
   when recording is off. Events remain the thing to drive `binary_sensor` state
   from.

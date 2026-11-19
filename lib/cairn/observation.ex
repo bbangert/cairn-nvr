@@ -9,17 +9,20 @@ defmodule Cairn.Observation do
       live path, where there is no line and no plugin process: `sequence`
       and `plugin_instance` are `nil`, and the byte-level revalidation the
       ndjson path needs is deliberately absent (see that module).
-    * `Cairn.PluginProtocol.decode_line/2` from recorded plugin ndjson,
-      completed by the harness replaying it (`camera_id`,
-      `plugin_instance`, and — for v0 lines, which carry none of it —
-      `epoch` and `observed_at`). Since the external plugin path was
-      deleted (membrane port phase 6) this producer feeds only the parity,
-      golden-replay and MOT harnesses.
+    * `Cairn.PluginProtocol.decode_line/2` from recorded plugin ndjson.
+      What a line does not carry stays `nil` — `plugin_instance` always, and
+      for a v0 line `epoch`, `sequence` and `observed_at` — and a harness
+      that needs one supplies its own. Since the external plugin path was
+      deleted (membrane port phase 6) this producer feeds the parity,
+      golden-replay and MOT harnesses, and the tests that hold the live
+      builder to a decoded line.
 
-  Timing has two qualities. A v1 line carries `observed_at` from the plugin,
-  captured next to the frame it describes (`:source`); a v0 line has no time
-  at all, so the port stamps arrival (`:arrival`) and every offset derived
-  from it inherits the plugin's queueing and scheduling latency.
+  Timing has two qualities. `:source` is an `observed_at` captured next to
+  the frame it describes: by the decoder on the live path, by the plugin on a
+  recorded v1 line. `:arrival` marks an observation that came without one: a
+  v0 line carries no time at all, so its `observed_at` is `nil` unless a
+  replaying harness supplies one, and a live frame gets the host's wall
+  clock in the one case its own instant cannot be represented.
 
   `media_ms` is `pts` in milliseconds of the stream's own clock. It is not
   comparable across epochs, and it is *not* an address into the recording:
@@ -27,10 +30,11 @@ defmodule Cairn.Observation do
 
   `at_ms` is what the tracker decides on: `media_ms` anchored to the host's
   monotonic clock and clamped against a pts that stalls, rewinds or jumps —
-  see `Cairn.ObservationClock`, which the port stamps it with. It *is*
-  comparable across epochs, which `media_ms` is not, and it is not a wall
-  instant: `observed_at` is the only field that dates an observation in terms
-  anything outside this host can read.
+  see `Cairn.ObservationClock`, which `Cairn.Pipeline.ObservationStamper`
+  stamps it with on the live path; a harness replaying a recording stamps its
+  own. It *is* comparable across epochs, which `media_ms` is not, and it is
+  not a wall instant: `observed_at` is the only field that dates an
+  observation in terms anything outside this host can read.
 
   An object's `track_id` and the line's `ended_tracks` are decoded and carried
   here for wire compatibility, but nothing consumes them: `Cairn.Tracker`
@@ -45,7 +49,7 @@ defmodule Cairn.Observation do
           :bbox => [number()],
           :track_id => String.t() | nil,
           :observation_kind => String.t(),
-          # Present only when the plugin ran an embedder: 1..512 raw bytes,
+          # Present only when an embedder ran: 1..512 raw bytes,
           # each a two's-complement signed int8 (dequantize component i as
           # int8(byte_i) / 127). Absence, not nil, is the embedder-less
           # spelling — see `Cairn.PluginProtocol.validate_object`.
@@ -91,10 +95,12 @@ defmodule Cairn.Observation do
   @doc """
   Whether an object is evidence: `observation_kind == "detected"`.
 
-  A `"tracked"` object is the plugin's own prediction for a track it did not
-  detect in this frame. It keeps track state alive but must never be taken as
-  proof that something is there. Takes a plain map so it also answers for
-  tracker-tagged objects (and for v0 objects, which carry no kind).
+  A `"tracked"` object is not this frame's detection: it is a box an earlier
+  model pass found, re-reported — by the engine on the live path, by the
+  `cairn-detect` binary in a recording. It keeps track state alive but must
+  never be taken as proof that something is there. Takes a plain map so it
+  also answers for tracker-tagged objects (and for v0 objects, which carry no
+  kind).
   """
   @spec detected?(map()) :: boolean()
   def detected?(object), do: Map.get(object, :observation_kind, "detected") == "detected"

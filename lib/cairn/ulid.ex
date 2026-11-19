@@ -42,7 +42,7 @@ defmodule Cairn.ULID do
   `held` epoch (first argument), i.e. the announcement should be ignored.
 
   This is how every stream-epoch consumer decides to ignore an announcement:
-  an older epoch delivered after a newer one (a port's spawn-time ETS pull
+  an older epoch delivered after a newer one (a consumer's init-time ETS pull
   racing a queued broadcast, or `Cairn.StreamEpochs`' degraded caller-side
   broadcast, which has no ordering relation to the server's) would otherwise
   put the consumer back on a stream that no longer exists.

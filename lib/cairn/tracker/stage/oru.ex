@@ -55,9 +55,9 @@ defmodule Cairn.Tracker.Stage.Oru do
 
   The trigger is the **unmatched gap**, `at_ms - last_matched_ms`, and never
   a seeded stretch — a seed refreshes `last_matched_ms` like any other match,
-  so a stretch the plugin was re-reporting through never opens a gap for this
+  so a stretch the engine was re-reporting through never opens a gap for this
   to fire on. That is load-bearing rather than incidental: through a seeded
-  stretch the plugin's own account is that the object did not move and the
+  stretch the engine's own account is that the object did not move and the
   filter is deliberately held, so replaying synthesized motion across one
   would manufacture the very velocity the stillness rule reads to decide the
   object is parked.
@@ -66,7 +66,7 @@ defmodule Cairn.Tracker.Stage.Oru do
   `Cairn.Tracker`'s seed invariants (its moduledoc's "detection, seed,
   prediction" section) that make that the last *detected* box rather than
   merely the last observed one: a seed re-reports its box **byte for byte**,
-  so a seeded stretch cannot have moved the anchor, and a plugin that ever
+  so a seeded stretch cannot have moved the anchor, and an engine that ever
   seeded a moved box would put a box no detector produced at one end of the
   interpolation — the replay would learn motion nothing ever saw. This stage
   is a second underwriter of that invariant, not a second copy of it.
@@ -161,9 +161,9 @@ defmodule Cairn.Tracker.Stage.Oru do
 
   The gap is measured from `last_matched_ms`, which is what keeps a seeded
   stretch out of this altogether — see the moduledoc: a seed refreshes that
-  clock, so no gap opens across a stretch the plugin was re-reporting
+  clock, so no gap opens across a stretch the engine was re-reporting
   through, and the motion this would otherwise synthesize is motion the
-  plugin's own account says did not happen.
+  engine's own account says did not happen.
   """
   @impl true
   def per_object(tracked, object, detected?, context, _params) do

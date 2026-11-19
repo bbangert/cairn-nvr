@@ -8,8 +8,8 @@ defmodule Cairn.TrackPath do
   # nothing a viewer could see.
   @keyframe_delta 20
   @max_gap_ms 2_000
-  # Precedent: `@max_label_entries` in `Cairn.CameraTracker`. At the
-  # ~10 obs/s the plugin sustains this is over eight minutes of an unbroken,
+  # Precedent: `@max_label_entries` in `Cairn.CameraTracker`. At 10 obs/s,
+  # twice the default `sample_fps`, this is over eight minutes of an unbroken,
   # never-still path — a track that reaches it is a scene artifact, and the
   # earliest samples are the ones a viewer opened the clip for.
   @max_samples_per_track 5_000
@@ -171,9 +171,9 @@ defmodule Cairn.TrackPath do
   ## Coordinates
 
   Boxes arrive as normalized `[x, y, w, h]` floats and are stored as
-  `round(v * 10_000)`. That is lossless, not a size trade-off: the plugin
-  rounds every coordinate to four decimals before it reaches the wire
-  (`wire_bbox/1` in `plugins/cairn-detect/src/infer/heads.rs`), so a wire value
+  `round(v * 10_000)`. That is lossless, not a size trade-off: the engine
+  rounds every coordinate to four decimals before a box leaves it
+  (`wire_bbox/1` in `plugins/cairn-detect/src/infer/heads.rs`), so a value
   has no fifth decimal to lose.
 
   Every numeric column — `"ts"`, and each track's `"ti"`, `"x"`, `"y"`, `"w"`,
@@ -221,7 +221,7 @@ defmodule Cairn.TrackPath do
       a viewer interpolating across more than `@max_gap_ms`. It bounds only the
       gaps this selection creates: the rule can force a keeper where a sample
       exists, not conjure one out of a silence, so a stretch nobody observed
-      (a stalled plugin, an empty tagged list, the caller's own cap) is still
+      (a stalled engine, an empty tagged list, the caller's own cap) is still
       two adjacent samples with a straight line between them.
 
   A per-track cap of `@max_samples_per_track` (#{@max_samples_per_track})

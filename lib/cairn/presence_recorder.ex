@@ -912,7 +912,7 @@ defmodule Cairn.PresenceRecorder do
   # sidecar used — so a reader keying on it sees no new world; extra
   # concurrent boxes suffix their slot. `identity: "label"` readers colour
   # and select by `label` either way.
-  # A plugin-predicted box rides the dense-capture rule like any other
+  # A re-reported (`"tracked"`) box rides the dense-capture rule like any other
   # (drawn, never evidence), but its score is the last real detection's —
   # forwarding it would re-stamp a stale claim, so it writes the same
   # no-score sentinel the tracked lane's coasted boxes do. The numeric

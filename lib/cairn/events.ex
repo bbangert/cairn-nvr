@@ -212,7 +212,7 @@ defmodule Cairn.Events do
   defp filter_label(query, ""), do: query
 
   defp filter_label(query, label) do
-    # labels come from plugins ([\w -] in practice); anything else would
+    # labels come from the detector ([\w -] in practice); anything else would
     # make json_extract raise on a malformed JSONPath — match nothing instead
     if label =~ ~r/^[a-zA-Z0-9_ -]+$/ do
       path = "$.max_scores.#{label}"
