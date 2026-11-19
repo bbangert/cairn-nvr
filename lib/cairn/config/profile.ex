@@ -128,14 +128,15 @@ defmodule Cairn.Config.Profile do
 
   An unset field is dropped: `Cairn.Native.Config.normalize/1` defaults
   `decoder` and `sample_fps` and leaves `model_profile`, `input_size` and
-  `labels` `nil`, which the engine reads as: sniff the family, take the input
-  size the model declares, load no labels. A model that leaves the family or the
-  size unanswered is refused rather than guessed at. `sample_fps` is the one
-  field `fps_band:` never fills in: the band only validates a declared
-  `sample_fps:` (D-P4) — it is never the source of the value, so a profile with
-  a band and no `sample_fps:` samples at that default. The profile is the
-  **single source** of those six (D-P4); the motion and track-floor scene knobs
-  are not among them and stay operator-owned (D-P6).
+  `labels` `nil`. The engine sniffs a family that is not named and loads no
+  labels without a file. An unset `input_size` is the size the model declares,
+  or else the named family's default; a model that declares none is refused when
+  no family is named or the named one has no single size (rfdetr). `sample_fps`
+  is the one field `fps_band:` never fills in: the band only validates a
+  declared `sample_fps:` (D-P4) — it is never the source of the value, so a
+  profile with a band and no `sample_fps:` samples at `normalize/1`'s 5. The
+  profile is the **single source** of those six (D-P4); the motion and
+  track-floor scene knobs are not among them and stay operator-owned (D-P6).
 
   Four things `Cairn.Config` refuses at load, which is where an operator
   reads diagnostics: a `model:` artifact that is not on disk (for a fetched
