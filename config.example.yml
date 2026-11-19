@@ -71,7 +71,8 @@ events:
 # this is on) feeds a rolling per-track appearance, and the bbd admission
 # gains an appearance veto and a cost tiebreak from it. Its only seam into the tracker
 # is that admission, so reid: true acts only on a camera where bbd runs — and
-# no config key selects an embedder model yet, so today it changes nothing.
+# no config key selects an embedder model yet, so today it changes nothing,
+# and setting it warns at load.
 # Off by default: the fusion is unmeasured until phase-6 E2E and its veto
 # threshold is provisional until then.
 #
@@ -84,7 +85,8 @@ events:
 # entirely, with a warning at load when one is set. reid does not have a profile
 # form yet and is not superseded by one — it applies whatever the profile, for
 # whatever bbd is left running (a load warning names a group whose profile's
-# stage list leaves bbd out, since reid does nothing there). See
+# stage list leaves bbd out, and one whose profile runs a tracker with no
+# tracking: block while bbd here is off, since reid does nothing there). See
 # docs/profile-authoring.md.
 tracking:
   max_unseen_ms: 3000

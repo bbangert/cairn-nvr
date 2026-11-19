@@ -348,7 +348,9 @@ defmodule Cairn.ConfigTest do
         |> Config.from_map()
 
       [cam_a, cam_b] = config.cameras
-      refute Enum.any?(warnings, &(&1 =~ "reid"))
+      # Known key: the only reid warning is the inert-embedder one.
+      assert [warning] = Enum.filter(warnings, &(&1 =~ "reid"))
+      assert warning =~ "no config or profile key selects the embedder"
 
       # every camera or none: reid is one decision for the fleet, so unlike
       # the three bounds beside it there is no per-camera form of it
@@ -1318,6 +1320,11 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "unknown profile \"no-such\""))
     end
 
+    test "a camera on an unknown-profile group is refused once, at the group" do
+      assert {:error, [error]} = Config.from_map(profiled_map("no-such"))
+      assert error =~ "plugin det: unknown profile \"no-such\""
+    end
+
     test "a later dir shadows an earlier one, with a warning" do
       map = Map.update!(profiled_map(), "profile_dirs", &(&1 ++ [@shadow_dir]))
 
@@ -1543,6 +1550,71 @@ defmodule Cairn.ConfigTest do
                warnings,
                &(&1 =~ "profile rk-test supersedes the global tracking.bbd/oru")
              )
+    end
+
+    test "the supersede warning needs a stage list: a block-less or tier-1 profile gets none" do
+      globals = %{"bbd" => true}
+
+      for yaml <- [ort_yaml("tier: 2"), ort_yaml("tier: 1")] do
+        map = Map.put(tiered_map(yaml), "tracking", globals)
+        assert {:ok, _config, warnings} = Config.from_map(map)
+        refute Enum.any?(warnings, &(&1 =~ "supersedes the global"))
+      end
+
+      map = Map.put(tiered_map(ort_yaml("tier: 2\ntracking:\n  oru: true")), "tracking", globals)
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      assert Enum.any?(warnings, &(&1 =~ "profile tiered supersedes the global"))
+    end
+
+    test "reid with the global bbd off warns for a block-less tracker-running profile" do
+      reid_off = %{"reid" => true, "bbd" => false}
+      map = Map.put(tiered_map(ort_yaml("tier: 2")), "tracking", reid_off)
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+
+      assert Enum.any?(
+               warnings,
+               &(&1 =~
+                   "tracking.reid has no effect for group det: its profile tiered has no " <>
+                     "tracking: block, so its cameras read the global tracking.bbd, which is off")
+             )
+
+      on = Map.put(map, "tracking", %{"reid" => true, "bbd" => true})
+      assert {:ok, _config, warnings} = Config.from_map(on)
+      refute Enum.any?(warnings, &(&1 =~ "so its cameras read the global"))
+
+      listed =
+        Map.put(tiered_map(ort_yaml("tier: 2\ntracking:\n  oru: true")), "tracking", reid_off)
+
+      assert {:ok, _config, warnings} = Config.from_map(listed)
+      assert Enum.any?(warnings, &(&1 =~ "its profile tiered lists no bbd stage"))
+      refute Enum.any?(warnings, &(&1 =~ "so its cameras read the global"))
+
+      tierless = Map.put(tiered_map(ort_yaml("")), "tracking", reid_off)
+      assert {:ok, _config, warnings} = Config.from_map(tierless)
+      assert Enum.any?(warnings, &(&1 =~ "so its cameras read the global"))
+
+      tier1 = Map.put(tiered_map(ort_yaml("tier: 1")), "tracking", reid_off)
+      assert {:ok, _config, warnings} = Config.from_map(tier1)
+      refute Enum.any?(warnings, &(&1 =~ "so its cameras read the global"))
+    end
+
+    test "reid warns once that no key selects its embedder, however many groups" do
+      two_groups =
+        profiled_map()
+        |> put_in(["plugins", "other"], %{"profile" => "rk-test", "allow_experimental" => true})
+        |> put_plugin(1, "other")
+
+      for map <- [profiled_map(), two_groups] do
+        map = Map.put(map, "tracking", %{"reid" => true, "bbd" => true})
+        assert {:ok, _config, warnings} = Config.from_map(map)
+        assert [_one] = Enum.filter(warnings, &(&1 =~ "no config or profile key selects"))
+      end
+
+      assert {:ok, _config, warnings} =
+               profiled_map() |> Map.put("tracking", %{"bbd" => true}) |> Config.from_map()
+
+      refute Enum.any?(warnings, &(&1 =~ "no config or profile key selects"))
     end
   end
 
