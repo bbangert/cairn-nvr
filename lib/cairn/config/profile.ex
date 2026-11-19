@@ -17,7 +17,7 @@ defmodule Cairn.Config.Profile do
   backend that cannot run the op, and an rknn conversion not measured to
   detect, which `experimental: true` turns from an error into a warning (see
   `check_capabilities/5`).
-  `Cairn.Config` rejects a profiled group whose model artifact or labels file
+  `Cairn.Config` rejects a group's profile whose model artifact or labels file
   is missing, that names no CPU twin its backend needs (a named twin missing
   on disk only warns), or whose backend is unproven (see "The model half"
   below).
@@ -55,8 +55,8 @@ defmodule Cairn.Config.Profile do
   decoder: auto              # the video decode path, not the backend
   labels: models/coco.names
   fps_band: [4, 8]           # declared, not measured (D-P5)
-  sample_fps: 6              # optional; emits --sample-fps when set. fps_band
-                             # validates it but a band alone emits nothing (D-P4)
+  sample_fps: 6              # optional; the cameras' sample rate when set. fps_band
+                             # validates it but a band alone supplies nothing (D-P4)
   tracking:                  # stage presence + params, plus band-tuned bounds
     bbd: true                # listed; a params mapping lists it too (and no
                              # shipped stage reads one — see `stages/1`)
@@ -126,13 +126,16 @@ defmodule Cairn.Config.Profile do
   (Until membrane port phase 6 the same table also rendered a plugin argv;
   that path is gone.)
 
-  An unset field is dropped, leaving the crate's own default or its
-  sniffing in force. `sample_fps` is the one field `fps_band:` never fills
-  in: the band only validates a declared `sample_fps:` (D-P4) — it is
-  never the source of the value, so a profile with a band and no
-  `sample_fps:` still passes nothing. The profile is the **single source**
-  of those six (D-P4); the motion and track-floor scene knobs are not among
-  them and stay operator-owned (D-P6).
+  An unset field is dropped: `Cairn.Native.Config.normalize/1` defaults
+  `decoder` and `sample_fps` and leaves `model_profile`, `input_size` and
+  `labels` `nil`, which the engine reads as: sniff the family, take the input
+  size the model declares, load no labels. A model that leaves the family or the
+  size unanswered is refused rather than guessed at. `sample_fps` is the one
+  field `fps_band:` never fills in: the band only validates a declared
+  `sample_fps:` (D-P4) — it is never the source of the value, so a profile with
+  a band and no `sample_fps:` samples at that default. The profile is the
+  **single source** of those six (D-P4); the motion and track-floor scene knobs
+  are not among them and stay operator-owned (D-P6).
 
   Four things `Cairn.Config` refuses at load, which is where an operator
   reads diagnostics: a `model:` artifact that is not on disk (for a fetched
@@ -160,13 +163,13 @@ defmodule Cairn.Config.Profile do
                           tracker)
   # The Rust catalog's model families, row for row with `PROFILES` in
   # `plugins/cairn-detect/src/infer/catalog.rs` — family names included, so
-  # `model_profile:` is checked against the same set the plugin's own
+  # `model_profile:` is checked against the same set the stage library's
   # `ModelProfile::parse` accepts — plus the two columns profile validation
   # reads:
   #
   #   * `nms:` — where suppression happens. `:none` is an NMS-free head (Rust's
   #     `nms: None`: yolov10's end-to-end head, rfdetr's queries); `:host_side`
-  #     is cairn's own suppression in the plugin's `heads` (`DEFAULT_NMS`),
+  #     is cairn's own suppression in the library's `heads` (`DEFAULT_NMS`),
   #     which runs on the CPU whatever executed the model; `:fused` is a family
   #     whose export carries the NMS op *inside the graph*. **No shipped family
   #     is `:fused`** — every catalog row is one of the first two — so the
@@ -327,8 +330,8 @@ defmodule Cairn.Config.Profile do
   The catalog family `name` resolves to (family names included), or `nil` for a name
   no family claims.
 
-  Trimmed and downcased exactly as the plugin's `ModelProfile::parse` does, so
-  a name this accepts is one the plugin accepts.
+  Trimmed and downcased exactly as the stage library's `ModelProfile::parse`
+  does, so a name this accepts is one the engine accepts.
   """
   @spec family(term()) :: {String.t(), family()} | nil
   def family(name) when is_binary(name) do
@@ -383,9 +386,8 @@ defmodule Cairn.Config.Profile do
   # Where a twin is named: the key `ort`'s own artifact goes under.
   @twin_key "onnx"
 
-  # The six model decisions a profile owns. `--motion-json`/
-  # `--track-floor-json` equivalents are absent on purpose: they describe
-  # the scene, not the model (D-P6).
+  # The six model decisions a profile owns. The motion and track-floor knobs
+  # are absent on purpose: they describe the scene, not the model (D-P6).
   @model_fields [
     :model,
     :model_profile,
@@ -413,9 +415,9 @@ defmodule Cairn.Config.Profile do
   The model decisions in `Cairn.Native.Config.normalize/1`'s vocabulary, for
   the in-VM engine.
 
-  An unset field is dropped rather than passed as `nil`: `normalize/1` then
-  defaults it, and the two of the six with a default (`decoder: "auto"`,
-  `sample_fps: 5`) take the crate's own clap values.
+  An unset field is dropped rather than passed as `nil`, and `normalize/1`
+  then fills in its default: `decoder: "auto"` and `sample_fps: 5`, the values
+  the `cairn-detect` binary's clap gives, and `nil` for the rest.
 
   `backend:` rides along here; it is not one of the six model fields, and
   nor is `cpu_twin`, the `model.onnx` path, carried only when the backend's
@@ -723,7 +725,7 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  # Aliases shown against the family they resolve to, in the plugin's own
+  # Aliases shown against the family they resolve to, in the library's own
   # `catalog::names` *format*, so an error says what `yolo11` will do. The
   # ordering differs on purpose: Rust renders `PROFILES` declaration order,
   # while a map here has none, so this menu sorts for a deterministic message.
@@ -757,7 +759,7 @@ defmodule Cairn.Config.Profile do
 
   # The two rules `docs/npu-backends.md` §"Known-broken combinations"
   # turns into validation. Both need a backend *and* a family to read: a
-  # profile that names no `model_profile:` leaves the family to the plugin's
+  # profile that names no `model_profile:` leaves the family to the engine's
   # own sniffing, and there is nothing here to check it against — which is
   # itself a reason to name the family on a non-ort backend (the authoring
   # guide says so).
@@ -1419,10 +1421,10 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  # D-P4, the band-validates-never-emits rule: absent `sample_fps:` is not an
-  # error at any `fps_band`, and mirrors clap's own `1..30` bound on the
-  # plugin's `--sample-fps` (`plugins/cairn-detect`) so a value this side
-  # accepts is one the process would too. A present-but-out-of-range integer
+  # D-P4, the band-validates-never-supplies rule: absent `sample_fps:` is not
+  # an error at any `fps_band`. The `1..30` bound is the one
+  # `Cairn.Stage.SampleGate.new/1` requires, so a value this side accepts is
+  # one the gate takes. A present-but-out-of-range integer
   # falls straight into the fallback clause below — 0 and 31 fail the guard
   # the same way a float or a string does — so one message covers all three
   # shapes of "not a legal sample_fps" rather than three near-duplicates.

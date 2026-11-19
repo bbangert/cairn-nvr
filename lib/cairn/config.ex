@@ -73,10 +73,10 @@ defmodule Cairn.Config do
   # That argument is against a per-*camera* knob, and hardware profiles do not
   # reintroduce one: a profile splits the fleet by plugin group, i.e. by the
   # hardware a group runs on, and names the board it is talking about in a file
-  # (`Cairn.Config.Profile`, D-P7). So this key's remaining job is the
-  # unprofiled path — the whole answer for a homogeneous fleet, and superseded
-  # by the stage list of any group that has a profile, with a load warning
-  # naming which side won (`warn_superseded_flags/2`).
+  # (`Cairn.Config.Profile`, D-P7). So this key's remaining job is the fallback
+  # for a group whose profile runs a tracker and carries no `tracking:` block: a
+  # profile's stage list supersedes it (`put_stages/2`), and setting it warns
+  # per group (`warn_superseded_flags/2`).
   @default_bbd false
   # Whether a track's motion filter is rebuilt across an unmatched gap, from
   # the two real boxes that bound it, instead of being corrected through it
@@ -88,8 +88,8 @@ defmodule Cairn.Config do
   #
   # No per-camera form, for `@default_bbd`'s reason and with its footnote: this
   # describes the motion filter rather than a scene, so it is one answer for
-  # every camera not covered by a profile, and a profiled group's stage list
-  # supersedes it.
+  # every camera whose profile carries no `tracking:` block, and a profile's
+  # stage list supersedes it.
   @default_oru false
   # Off by default: the soak baseline was measured without OCR recovery, and
   # turning it on is phase-6 E2E's to decide, not this default's.
@@ -514,13 +514,12 @@ defmodule Cairn.Config do
     )
     # Straight off the config and not through a `cam` reader: there is no
     # per-camera form of these four (see `@default_bbd`/`@default_oru`/
-    # `@default_ocr`/`@default_reid`) — a *profiled* camera ignores the first
-    # three entirely, `stages` below superseding them (the load-time warning
-    # in `validate_tracking/2` says which wins). `reid` is not a stage and a
-    # profile cannot supersede it; it keeps applying to a profiled camera too,
-    # for whatever the group's stage list leaves its one seam (`bbd`) able to
-    # do (`warn_reid_without_bbd_stage/2` names the case where that is
-    # nothing).
+    # `@default_ocr`/`@default_reid`) — a camera whose profile has a
+    # `tracking:` block ignores the first three entirely, `stages` below
+    # superseding them. `reid` is not a stage and a profile cannot supersede
+    # it; it applies under either form, for whatever its one seam (`bbd`) is
+    # left able to do (`warn_reid_without_bbd_stage/2` names the stage-list
+    # case where that is nothing).
     |> Map.put(:bbd, config.bbd)
     |> Map.put(:oru, config.oru)
     |> Map.put(:ocr, config.ocr)
@@ -595,8 +594,8 @@ defmodule Cairn.Config do
   def tracker_names, do: @trackers |> Map.keys() |> Enum.sort()
 
   # The whole of what a profile changes about tracking policy: the stage
-  # presence map replaces the boolean flags for every camera on the profiled
-  # group. Unprofiled cameras — and cameras on a profile that had no
+  # presence map replaces the boolean flags for every camera on the profile's
+  # group. Cameras with no `plugin:` — and cameras on a profile that had no
   # `tracking:` block, which said nothing about tracking — get no `stages`
   # key at all, which is what keeps their path (through
   # `Cairn.Pipeline.ObservationStamper`'s `tracking_policy/2` and
@@ -624,7 +623,7 @@ defmodule Cairn.Config do
   `min_score` its wire-floor map — the `min_score` field, which always carries
   a `"default"` key.
 
-    * tier absent (`nil`) — today's behaviour, where everything the plugin
+    * tier absent (`nil`) — today's behaviour, where everything the engine
       emits qualifies, so the answer is the label's own wire floor.
     * tier present — the label's own rule, else the tier's `"default"` rule,
       else `:excluded`. A present tier lists what it wants; an unlisted label
@@ -634,7 +633,7 @@ defmodule Cairn.Config do
   A returned number is a floor to compare a detection's score against. Given a
   camera's *configured* `min_score` it never comes back below that label's
   wire floor: a config where a tier resolves under `min_score` is rejected at
-  load time, because the plugin never emits that band and the rule could only
+  load time, because the engine never emits that band and the rule could only
   ever fire zero times. A runtime override (`Cairn.CameraControl`'s
   `min_score`) goes through no such validation and can sit above a tier —
   `earns_video?/4` resolves the clash by demanding both, so an
@@ -1224,7 +1223,7 @@ defmodule Cairn.Config do
 
   @doc """
   The profile resolved for a camera's plugin group, or `nil` for a camera on
-  no group or on an unprofiled one.
+  no group or on one whose profile did not resolve.
 
   This is the group→camera hop `policy/2` reads: cameras do not know their
   group's profile, but they do know their group (`cam.plugin` is resolved to
@@ -1296,7 +1295,7 @@ defmodule Cairn.Config do
     config.cameras
     |> Enum.map(&profile_for(config, &1))
     # What a load lets through here is a camera with no plugin at all:
-    # `validate_camera_profiles/2` refuses every other unprofiled one.
+    # `validate_camera_profiles/2` refuses one whose group resolved no profile.
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq_by(&Profile.native_config/1)
     |> case do
@@ -1338,9 +1337,8 @@ defmodule Cairn.Config do
   # acknowledgement, the profile's own `experimental:` and the operator's
   # `allow_experimental:`. Both execute (qnn on the generic board, rknn on
   # the Rockchip one) and neither has soaked: non-ort means experimental
-  # until this comment says otherwise. Refused at load rather than at group
-  # start because this is where an operator reads diagnostics; a start-time
-  # refusal is a respawn loop in a log file nobody is tailing.
+  # until this comment says otherwise. Refused at load rather than when the
+  # engine opens, because load is where an operator reads diagnostics.
   defp check_backend_implemented(acc, _group, %Profile{backend: "ort"}), do: acc
 
   defp check_backend_implemented(acc, group, %Profile{experimental: false} = profile) do
@@ -1592,8 +1590,9 @@ defmodule Cairn.Config do
   end
 
   # A camera builds its detect branch from `plugin:` alone, but only a
-  # profile says which model the branch runs on. Unprofiled, it detects on
-  # whatever model another camera loaded, or on none.
+  # profile says which model the branch runs on. On a group whose profile did
+  # not resolve it would detect on whatever model another camera loaded, or on
+  # none.
   defp validate_camera_profiles(acc, config) do
     config.cameras
     |> Enum.filter(&(&1.plugin != nil))
@@ -1721,20 +1720,16 @@ defmodule Cairn.Config do
   end
 
   # Reid's fusion has one seam into the tracker: the BBD admission
-  # (`Cairn.Tracker.Reid`, `Cairn.Tracker.Stage.Bbd`). The global bbd flag
-  # governs exactly the cameras on *unprofiled* groups (D-P7), so the refusal
-  # is scoped to them: reid on, global bbd off, and at least one camera the
-  # global flag actually reaches is a configuration that can never act there
-  # — refused rather than accepted and left inert. A fully-profiled config
-  # answers to its profiles' own stage lists instead, where the per-group
-  # warning (`warn_reid_without_bbd_stage/2`) names any profile that
-  # silences reid — legitimately reid-capable profiles must not be refused
-  # over a global flag their cameras never read.
+  # (`Cairn.Tracker.Reid`, `Cairn.Tracker.Stage.Bbd`). This refuses reid on
+  # with the global bbd flag off only when some camera's group resolved no
+  # profile, which is already a load error. A camera on a resolved profile is
+  # never refused here: with a stage list it answers to
+  # `warn_reid_without_bbd_stage/2`, and without one it reads the global bbd
+  # flag and loads with reid inert, unreported.
   defp validate_reid_requires_bbd(acc, config) do
     # "Unprofiled" here is a camera on a group whose profile did not resolve
-    # (that is already its own load error; this avoids piling on a
-    # misleading one). A camera with no plugin at all runs no tracker and
-    # holds no opinion.
+    # (already its own load error). A camera with no plugin at all runs no
+    # tracker and holds no opinion.
     unprofiled? =
       Enum.any?(config.cameras, fn
         %{plugin: {:group, _name}} = cam -> profile_for(config, cam) == nil
@@ -1779,9 +1774,10 @@ defmodule Cairn.Config do
     end
   end
 
-  # D-P7: the global booleans keep working for cameras on unprofiled groups,
-  # a profiled group ignores them, and setting both is legal but ambiguous
-  # enough to name — one warning per profiled group, saying which side wins.
+  # D-P7: a profile's stage list supersedes the global booleans, and setting
+  # both is legal but ambiguous enough to name. Warns for every group with a
+  # resolved profile — one with no stage list included, where the booleans
+  # stand, and a tier-1 one, which runs no tracker.
   defp warn_superseded_flags(acc, config) do
     if config.bbd or config.oru or config.ocr do
       config.plugin_groups
@@ -1801,7 +1797,7 @@ defmodule Cairn.Config do
   # `reid` is not a stage — a profile has no key for it and cannot list or
   # delist it (see the comment on `policy/2`) — so it is never superseded the
   # way `warn_superseded_flags/2` warns about. But its one seam is the bbd
-  # *stage*, and a profiled group whose stage list replaces the booleans and
+  # *stage*, and a group whose profile's stage list replaces the booleans and
   # leaves bbd out silences it for that group's cameras just as surely as the
   # global bbd flag being off would — worth naming, since nothing else here
   # would tell an operator reid is doing nothing on that hardware.
@@ -1823,7 +1819,7 @@ defmodule Cairn.Config do
 
   # A profile with no `tracking:` block at all (`stages: nil`) says nothing
   # about tracking, so the group's cameras fall back to the global `bbd` flag
-  # like any unprofiled camera — not this function's case. Only a profile that
+  # — not this function's case. Only a profile that
   # *does* carry a stage list and leaves bbd off it silences reid.
   defp reid_silenced_by_profile?(%PluginGroup{profile: %Profile{stages: stages}})
        when is_map(stages),
@@ -1847,15 +1843,15 @@ defmodule Cairn.Config do
   end
 
   # Per label, effective `record >= track >= min_score`. A tier below the wire
-  # floor can never fire — the plugin drops that band and the host never sees
-  # it — so a `record.person` of 0.6 under a `min_score.person` of 0.7 is a
+  # floor can never fire — the engine drops that band and nothing downstream
+  # sees it — so a `record.person` of 0.6 under a `min_score.person` of 0.7 is a
   # rule that silently records nothing. The check runs over the union of labels
   # across all three maps, each resolved through its own default chain, so a
   # tier's catch-all `default:` under a per-label floor is caught as well.
   #
   # "Effective" is what makes the record side asymmetric: an absent `record:`
   # block resolves to the wire floor rather than to nothing, because absent
-  # means everything the plugin emits records. A `track:` raised above that
+  # means everything the engine emits records. A `track:` raised above that
   # floor with no `record:` block therefore leaves a band that films but is
   # never written down. A *present* block that excludes the label is the
   # opposite case and imposes nothing: rows without video is the tier working.

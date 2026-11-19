@@ -30,9 +30,9 @@ defmodule Cairn.Tracker.Stage.TwinMint do
   legitimate close same-label pairs common enough that the gate would eat
   real objects.
 
-  The default belongs to the **boolean** path. A camera whose plugin group
-  carries a hardware profile is listed by presence alone — a profile whose
-  `tracking:` block does not name `twin_mint:` delists the gate. No shipped
+  The default belongs to the **boolean** path. A camera whose profile carries
+  a `tracking:` block is listed by presence alone — a block that does not
+  name `twin_mint:` delists the gate. No shipped
   profile makes that trade today (the one that did, the retired `qcs6490.yml`
   placeholder, gave way to a tier-1 file that runs no tracker at all), but
   the tension it argued stands for any NMS-free profile an operator writes:

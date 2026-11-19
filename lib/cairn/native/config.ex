@@ -81,7 +81,7 @@ defmodule Cairn.Native.Config do
   @doc """
   A model config in the shape `CairnOrt.init/1` decodes.
 
-  An unknown key is an error: a misspelled `--backend` that silently kept the
+  An unknown key is an error: a misspelled `:backend` that silently kept the
   default would run every camera on the CPU and report nothing wrong.
   """
   @spec normalize(map() | keyword()) :: {:ok, t()} | {:error, String.t()}
@@ -99,7 +99,7 @@ defmodule Cairn.Native.Config do
   def normalize(other),
     do: {:error, "config must be a map or keyword list, got #{inspect(other)}"}
 
-  @doc "The rate a config that names none samples at — the crate's own clap value."
+  @doc "The rate a config that names none samples at — also the `cairn-detect` binary's."
   @spec default_sample_fps() :: pos_integer()
   def default_sample_fps, do: @model_defaults.sample_fps
 

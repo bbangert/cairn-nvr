@@ -8,8 +8,8 @@ into *both* halves of the boundary — the in-VM engine's model config and the
 host's tracker stage list — so the two cannot disagree with each other.
 
 A profile is **data composing curated code**. Every field names something that
-already exists: a family the Rust catalog ships, a backend the plugin can
-name, a stage the tracker implements. There are no free knobs here — a value
+already exists: a family the Rust catalog ships, a backend the release's board
+offers, a stage the tracker implements. There are no free knobs here — a value
 this file does not accept is one nothing in cairn implements.
 
 A camera needs a profile only to detect: one with no `plugin:` key runs
@@ -26,7 +26,7 @@ come from the release's board.
 
 ## Attaching one
 
-Three config keys, none of which existed before profiles:
+Three config keys:
 
 ```yaml
 # Where your own profiles live. Cairn's shipped dir is searched first, then
@@ -71,12 +71,12 @@ backend: rknn              # which runtime executes the model
 model:                     # one artifact path per backend, not one model
   onnx: models/yolox_tiny.onnx
   rknn: models/yolox_tiny_rk3566.rknn
-model_profile: yolox       # the detector family, from the plugin's catalog
+model_profile: yolox       # the detector family, from the Rust catalog
 input_size: 416            # square N; the model's own geometry when omitted
 decoder: auto              # the *video* decode path — not the backend
 labels: models/coco.names  # class names, indexed positionally
 fps_band: [2, 4]           # declared, not measured
-sample_fps: 3              # optional; fps_band only validates it, never emits it
+sample_fps: 3              # optional; fps_band only validates it, never supplies it
 
 tracking:                  # the stage list, plus band-tuned tracker bounds
   bbd: true
@@ -89,16 +89,16 @@ tracking:                  # the stage list, plus band-tuned tracker bounds
 ```
 
 Paths are taken **verbatim** and resolved by the OS against the working
-directory cairn itself was started from — the same one the plugin is spawned
-into. Nothing here rewrites a path, because a rewrite would check one file and
-hand the plugin another.
+directory cairn itself was started from — where config load checks them and
+where the engine opens them. Nothing here rewrites a path, because a rewrite
+would check one file and hand the engine another.
 
 `model:` is keyed per backend rather than being a single path because backends
 consume different files. An `.rknn` is compiled from an `.onnx` by a host-side
 toolchain; a QNN profile loads a QDQ-quantized graph which is still an `.onnx`
 by format but is not the same file as the fp32 export. One profile can
 therefore carry the artifacts for several backends, and its own `backend:`
-picks which one becomes `--model`.
+picks which one the engine loads.
 
 A backend whose artifact the CPU cannot run (`rknn` on a Rockchip release)
 also needs `onnx:`: the FP32 export the `.rknn` was converted from, its **CPU
@@ -301,9 +301,10 @@ config load: the Rockchip board warns when a profile names `rkmpp` and
 
 `labels:` is indexed positionally, so the file has to match the family's class
 space: 80 lines for yolox and the Ultralytics families, 91 for rfdetr, which
-indexes logits by raw COCO category id (`coco91.names`). The plugin refuses to
-start on a count mismatch rather than emit every detection under a neighbour's
-name.
+indexes logits by raw COCO category id (`coco91.names`). The engine refuses a
+model on a count mismatch rather than emit every detection under a neighbour's
+name. Config load does not count the lines, so the refusal comes after the
+config has loaded.
 
 `fps_band` is **declared, not measured** (D-P5). It is the rate this hardware
 is expected to sustain, written down so stage sets and defaults can be chosen
@@ -316,26 +317,26 @@ A band is only ever replaced by measurement **on a deployment target**, which
 means an SBC. The x86 box in this repo's development loop is a test host: it
 runs the gates, the parity harness and the accuracy work, and it never gets a
 measured band, because nothing ships there and a number from it would describe
-hardware no deployment has. That is why `generic-ort.yml` — a migration alias
-rather than a hardware class — keeps a declared `[5, 5]` and is expected to keep
-it. Neither board file has a band to measure: both are ladders, which derive
-the rate per rung, and what a ladder owes measurement instead is each rung's
-`engine_budget` (D-L6). A measurement records the cpufreq governor it ran
-under: on QCS6490 the default one makes a plausible-looking wrong number
-(`docs/npu-backends.md`), and RK3566's budgets were taken under the governors
-as found.
+hardware no deployment has. That is why `generic-ort.yml` — a profile for any
+host's CPU rather than a hardware class — keeps a declared `[5, 5]` and is
+expected to keep it. Neither board file has a band to measure: both are ladders,
+which derive the rate per rung, and what a ladder owes measurement instead is
+each rung's `engine_budget` (D-L6). A measurement records the cpufreq governor
+it ran under: on QCS6490 the default one makes a plausible-looking wrong number
+(`docs/npu-backends.md`), and RK3566's budgets were taken under the governors as
+found.
 
-`sample_fps` is optional, and **the band validates it, the band never emits
-it** (D-P4): leave `sample_fps:` unset and no `--sample-fps` flag is written
-regardless of what `fps_band:` says, and the plugin keeps its own default of
-5. Set it and it becomes `--sample-fps <value>`, checked at load against the
-same `1..30` bound the plugin's own flag parsing enforces. If the profile also
+`sample_fps` is optional, and **the band validates it, the band never supplies
+it** (D-P4): leave `sample_fps:` unset and the group's cameras are sampled at
+the default of 5, whatever `fps_band:` says. Set it and it is the rate they
+are sampled at, checked at load against `1..30`, the range the sample gate
+accepts. If the profile also
 declares an `fps_band:`, `sample_fps:` must fall inside it — a value outside
 the band is a config error naming both, since a profile that both bounds a
 rate and then names a value outside that bound is contradicting itself, not
 expressing a choice. A profile with `fps_band:` and no `sample_fps:` is
 unaffected either way: no profile cairn ships sets `sample_fps:`, and
-`generic-ort`'s band emits nothing.
+`generic-ort`'s band supplies nothing.
 
 The one profile shape this paragraph does not describe is a `model_ladder:`
 profile, which may declare neither key (both are refused alongside a
@@ -368,12 +369,12 @@ Three states, and the difference between the last two matters:
   anything.
 
 `tracking.reid` (Re-ID appearance fusion) is not part of this block and has no
-profile form yet — a profile can neither list nor delist it. It keeps applying
-to a profiled camera the same as an unprofiled one, for whatever the group's
-own stage list leaves its one seam, the bbd admission, able to do: a profiled
-group whose stage list carries no `bbd` silences it just as surely as the
-global `tracking.bbd: false` would, and gets its own load warning saying so
-(below), separate from the bbd/oru/ocr one.
+profile form yet — a profile can neither list nor delist it. It applies
+whatever the profile, through its one seam, the bbd admission, wherever that
+runs: a profile whose `tracking:` block carries no `bbd` silences it just as
+surely as the global `tracking.bbd: false` does under a profile with no
+block. The first case gets its own load warning saying so (below), separate
+from the bbd/oru/ocr one; the second gets none.
 
 `true` and an empty mapping mean the same thing. A params mapping is carried
 through to the stage, and **no stage cairn ships reads its params today** —
@@ -406,8 +407,9 @@ against.
 The release's board carries a static table of what each backend accepts
 (`Cairn.Stage.Board.backends/0`), each row a mirror of its
 `BackendKind::capabilities` row on the Rust side. It is static because
-config load has to answer these questions with no plugin running and, for a
-board profile written ahead of its hardware, no such device attached.
+config load has to answer these questions before the engine has loaded a
+model and, for a board profile written ahead of its hardware, with no such
+device attached.
 
 | backend | artifact key | runs a fused-NMS export | takes dynamic shapes | needs a CPU twin |
 |---|---|---|---|---|
@@ -458,7 +460,7 @@ Two rules come out of it, both from `docs/npu-backends.md`:
    `tools/rknn-export/README.md` in the source tree has the measurements.
 
 Both rules need a family to read. A profile that leaves `model_profile:` unset
-lets the plugin sniff the family from the model's own tensor shapes, which is
+lets the engine sniff the family from the model's own tensor shapes, which is
 fine — but then there is nothing here to check, so name the family explicitly
 on a non-`ort` backend.
 
@@ -484,7 +486,7 @@ its probe-load refuses a model whose own shape contradicts the size it was
 given, after the config has loaded, and no camera detects. Set it
 to the geometry you converted at. On `ort` the same field means something looser — RF-DETR
 exports leave their spatial axes dynamic, which is why `rfdetr` needs an
-explicit `--input-size` and why the plugin refuses to guess one.
+explicit `input_size:` and why the engine refuses to guess one.
 
 ## Errors you will meet
 
@@ -513,8 +515,7 @@ profile my-board: model_profile yolov10 is not a proven rknn conversion: its
   that head — experimental: true loads it regardless (measurements:
   tools/rknn-export/README.md)
 profile my-board: model artifact models/gone.rknn does not exist or is not a
-  regular file (relative paths resolve against the working directory the plugin
-  is spawned from)
+  regular file (relative paths resolve against this node's working directory)
 profile my-board: labels file models/gone.names does not exist or is not a
   regular file …
 profile my-board: model_ladder rung 1 names a file to fetch (sha256:/url:),
@@ -616,38 +617,39 @@ Changing a *shipped* profile is a behaviour change for everyone running that
 board. Adding a comment or correcting a band is cheap; changing a stage set
 should carry the measurement that justifies it.
 
-## Migrating from `tracking.bbd` / `tracking.oru` / `tracking.ocr`
+## The global `tracking.bbd` / `tracking.oru` / `tracking.ocr` booleans
 
-Nothing breaks and there is no deadline. The three global booleans keep working
-exactly as they did for every camera whose group has no profile.
+The three global booleans predate profiles and still load. What they reach is
+narrow: the cameras of a group whose profile runs a tracker and has no
+`tracking:` block. No profile cairn ships is one — `generic-ort` carries a
+block and the two ladders are tier 1 — so on a shipped profile they change
+nothing.
 
-What changes is what they are *for*. They were introduced as fleet-wide rollout
+They were introduced as fleet-wide rollout
 switches for matcher/filter/recovery behaviours, global-only because a fleet
 where half the cameras associate one way and half the other was not something
 an operator could reason about. A profile is that reasoning: it splits the
 fleet by *hardware*, per plugin group, with a file naming which board it is
-talking about. So the booleans are now the unprofiled path — still the whole
-answer for a homogeneous fleet, and superseded per group by anything that
-names a profile.
+talking about. So a profile's `tracking:` block is where the answer lives, and
+the booleans are the fallback for a profile that carries none.
 
-For a **profiled** group the booleans are ignored entirely; the profile's
-`tracking:` block is the stage list. Setting both is legal and produces a
-warning per profiled group saying which side wins. The rule is presence: a
-stage the profile does not list does not run, whatever the global flags say.
+For a group whose profile has a `tracking:` block the booleans are ignored
+entirely; the block is the stage list. The rule is presence: a stage the block
+does not list does not run, whatever the global flags say. Setting a global
+boolean is legal and produces a load warning per group.
 
-To migrate a fleet that runs `tracking.bbd: true` / `oru: true` today:
+To run `bbd` and `oru` on a group that names `generic-ort`:
 
 1. Copy `priv/profiles/generic-ort.yml` into a `profile_dirs:` directory under
    a name of your own, and point its `model:`/`labels:` at your artifacts.
 2. Add `bbd: true` and `oru: true` to its `tracking:` block — the shipped
-   `generic-ort` deliberately lists neither, since it is the profile that
-   changes nothing on adoption.
+   `generic-ort` deliberately lists neither.
 3. Name it from the group (`profile: my-fleet`).
 4. Reload. Check the warnings: if you left the global booleans set you will be
    told, per group, that the profile won.
 
-Then remove the globals when every group is profiled — or leave them, if some
-group is not.
+Then remove the globals, unless a profile of yours has no `tracking:` block
+and relies on them.
 
 ## What cairn ships
 
@@ -656,8 +658,8 @@ the release that can run it:
 
 | profile | where | backend | rate | stages | notes |
 |---|---|---|---|---|---|
-| `generic-ort` | `priv/profiles/` | `ort` | band 5–5 | twin gate only | today's behaviour, named; the migration target and the one non-experimental profile |
-| `qcs6490-tier1` | `priv/profiles/generic/` (generic board) | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: six rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
+| `generic-ort` | `priv/profiles/` | `ort` | band 5–5 | twin gate only | yolox at 416 on the CPU; the one non-experimental profile |
+| `qcs6490-tier1` | `priv/profiles/generic/` (generic board) | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: seven rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
 | `rk3566-tier1` | `boards/cairn_rockchip/priv/profiles/` | `rknn` | derived per rung | none (tier 1) | two fetched Apache YOLOX rungs with baked CPU twins, `decoder: rkmpp`, claim 9 cameras; both budgets boundary-measured (`docs/evidence/rk3566-capacity-20261118.md`) |
 
 The two ladders are `experimental: true` because their backends have not

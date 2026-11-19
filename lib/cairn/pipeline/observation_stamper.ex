@@ -216,10 +216,10 @@ defmodule Cairn.Pipeline.ObservationStamper do
       min_score: effective_min_score(state.camera, control)
     }
 
-    # A profiled camera's policy carries a stage presence map, and it rides
-    # this hop unmodified — `Cairn.Tracker.context/3` is where it supersedes
-    # the booleans above. Absent for every unprofiled camera, whose map stays
-    # exactly the pre-profile one.
+    # The policy of a camera whose profile has a `tracking:` block carries a
+    # stage presence map, and it rides this hop unmodified —
+    # `Cairn.Tracker.context/3` is where it supersedes the booleans above.
+    # Absent for every other camera, whose map stays exactly the boolean one.
     case Map.get(policy, :stages) do
       nil -> base
       stages -> Map.put(base, :stages, stages)
