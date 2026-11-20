@@ -54,6 +54,22 @@ defmodule CairnWeb.WebRTC.SessionTest do
     assert_receive {:DOWN, ^ref, :process, ^session, :normal}, 2_000
   end
 
+  # A `:normal` exit does not propagate over the link, so the session has to
+  # end these itself: left alone they stay for the node's life, per viewer.
+  test "an ended session takes its PeerConnection and transports with it" do
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+    # unlinked, so a failure before the kill below would leave it for the suite
+    on_exit(fn -> Process.exit(owner, :kill) end)
+    {:ok, session} = Session.start_link(camera_id: "cam_a", owner: owner)
+    %{pc: pc} = :sys.get_state(session)
+    %{ice_pid: ice, dtls_transport: dtls} = :sys.get_state(pc)
+
+    refs = for pid <- [session, pc, ice, dtls], do: Process.monitor(pid)
+    Process.exit(owner, :kill)
+
+    for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _pid, _reason}, 2_000)
+  end
+
   # A gather timeout already delivered when its timer was cancelled must not
   # answer the *next* deferred offer: only the current timer's ref does.
   test "a stale gather timeout does not answer the current deferred offer" do

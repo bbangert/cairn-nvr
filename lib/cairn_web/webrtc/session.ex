@@ -221,11 +221,14 @@ defmodule CairnWeb.WebRTC.Session do
 
   @impl true
   def terminate(_reason, state) do
-    PeerConnection.close(state.pc)
+    # `stop/1`, not `close/1`: close leaves the process alive, and this
+    # session's `:normal` exit does not take a linked process with it — the
+    # PeerConnection and its ICE and DTLS processes would outlive every viewer.
+    PeerConnection.stop(state.pc)
     :ok
   catch
     # The PeerConnection is linked and may already be gone (or stopping) —
-    # closing it is then a call that exits, and there is nothing left to close.
+    # stopping it is then a call that exits, and there is nothing left to stop.
     :exit, _ -> :ok
   end
 
