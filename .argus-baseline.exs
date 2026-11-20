@@ -108,9 +108,9 @@
     title: "terminate/2 does work a supervisor shutdown will skip",
     at_label: "a supervisor shutdown skips this",
     detail:
-      "CairnWeb.WebRTC.Session does not trap exits, so a GenServer shutdown from its supervisor kills it outright and terminate/2 never runs. CairnWeb.WebRTC.Session.terminate/2 calls ExWebRTC.PeerConnection.close/1, which the effect model cannot classify — so this cannot say WHAT is skipped, only that terminate/2 does more than log and none of it will happen on the normal stop path. If that call releases a lease, closes a session or flushes a buffer, it is silently not happening in production.",
+      "CairnWeb.WebRTC.Session does not trap exits, so a GenServer shutdown from its supervisor kills it outright and terminate/2 never runs. CairnWeb.WebRTC.Session.terminate/2 calls ExWebRTC.PeerConnection.stop/1, which the effect model cannot classify — so this cannot say WHAT is skipped, only that terminate/2 does more than log and none of it will happen on the normal stop path. If that call releases a lease, closes a session or flushes a buffer, it is silently not happening in production.",
     reason:
-      "Benign: on a supervisor shutdown the session is killed, and its ExWebRTC.PeerConnection is started with start_link, so the linked PeerConnection exits with it and its sockets close; the explicit close/1 in terminate/2 only matters on a normal stop, where terminate/2 does run."
+      "Benign: on a supervisor shutdown the session is killed, and its ExWebRTC.PeerConnection is started with start_link, so the linked PeerConnection exits with it and its sockets close; the explicit stop/1 in terminate/2 is for a normal stop, which does not propagate over the link and where terminate/2 does run."
   },
   %{
     analysis: "failure",
