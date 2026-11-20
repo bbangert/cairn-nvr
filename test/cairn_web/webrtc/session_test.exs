@@ -58,6 +58,8 @@ defmodule CairnWeb.WebRTC.SessionTest do
   # end these itself: left alone they stay for the node's life, per viewer.
   test "an ended session takes its PeerConnection and transports with it" do
     owner = spawn(fn -> Process.sleep(:infinity) end)
+    # unlinked, so a failure before the kill below would leave it for the suite
+    on_exit(fn -> Process.exit(owner, :kill) end)
     {:ok, session} = Session.start_link(camera_id: "cam_a", owner: owner)
     %{pc: pc} = :sys.get_state(session)
     %{ice_pid: ice, dtls_transport: dtls} = :sys.get_state(pc)
