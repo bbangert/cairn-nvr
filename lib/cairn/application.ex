@@ -116,9 +116,9 @@ defmodule Cairn.Application do
     :ok
   end
 
-  # Off in the test env: a Rockchip test boot would otherwise download into
-  # `data/` and point `CAIRN_RKNN_LIBRARY` there for the whole VM. Suites
-  # start their own against a tmp dir.
+  # Off in the test env: a test boot on a board with artifacts would otherwise
+  # download into `data/` and point the artifact's `env` variable there for
+  # the whole VM. Suites start their own against a tmp dir.
   defp artifacts?, do: Application.get_env(:cairn, :artifacts, true)
 
   defp skip_migrations? do

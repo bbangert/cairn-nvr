@@ -11,6 +11,7 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
     alias Cairn.Native.Drain
     alias Cairn.Pipeline.DetectChain
     alias Cairn.Rockchip.{DecodeScale, Download}
+    alias Cairn.Stage.Capabilities
 
     @stub_rknn "test/support/fixtures/models/stub.rknn"
     @stub_onnx "test/support/fixtures/models/stub.onnx"
@@ -162,7 +163,7 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
 
       # The family the operator wrote, not its canonical: yolo11 and yolo26
       # are refused by name, not as "yolov8". The reasons' own wording is
-      # pinned in config_test.exs.
+      # pinned in the board library's suite.
       expected =
         for {where, family} <- [
               {"rknn-rfdetr", "rfdetr"},
@@ -173,7 +174,8 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
               # a rung's own family, over a profile whose family is proven
               {"rknn-rung: model_ladder rung 1", "yolo11"}
             ] do
-          {_canonical, %{rknn_conversion: {:unproven, why}}} = Profile.family(family)
+          {canonical, _row} = Profile.family(family)
+          {:unproven, why} = Capabilities.conversion(Profile.capabilities("rknn"), canonical)
 
           "profile #{where}: model_profile #{family} is not a proven rknn conversion: " <>
             "#{why} — experimental: true loads it regardless " <>
@@ -187,11 +189,11 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
                &(&1 =~ "profile rknn-truthy-experimental: experimental must be true or false")
              )
 
-      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :proven}}
+      fused = {"fusednet", "fusednet", %{families: [], nms: :fused}}
       acc = %{errors: [], warnings: []}
+      rknn = {"rknn", Profile.capabilities("rknn")}
 
-      assert %{errors: [error]} =
-               Profile.check_capabilities(acc, "profile s", "rknn", true, fused)
+      assert %{errors: [error]} = Profile.check_capabilities(acc, "profile s", rknn, true, fused)
 
       assert error =~ "profile s: rknn backend requires an NMS-free family or host-side-NMS"
     end

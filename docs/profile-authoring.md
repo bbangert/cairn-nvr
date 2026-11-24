@@ -531,9 +531,8 @@ And the ones about attaching it, which name the plugin group instead:
 ```
 plugin detect: unknown profile "rk3566" — no such file in priv/profiles, the
   board's profiles or any profile_dirs entry
-plugin detect: profile my-board uses backend rknn, which is experimental
-  — only ort is proven in soak, and a profile naming another backend must
-  declare experimental: true
+plugin detect: profile my-board uses backend rknn, which is experimental on
+  the rockchip board — a profile naming it must declare experimental: true
 plugin detect: profile my-board uses backend rknn, which is experimental
   — set allow_experimental: true on this plugin group to run it anyway
 plugin detect: profile my-board names no model.rknn artifact for its rknn

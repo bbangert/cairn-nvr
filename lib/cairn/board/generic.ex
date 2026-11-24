@@ -19,8 +19,7 @@ defmodule Cairn.Board.Generic do
   def decoders, do: ~w(auto vaapi qsv nvdec v4l2 videotoolbox sw)
 
   # The host-side mirror of `BackendKind::capabilities`' ort and qnn rows in
-  # `plugins/cairn-detect/src/infer/backend.rs`, whose rows carry the evidence
-  # (rknn's is `Cairn.Rockchip.Board`'s).
+  # `plugins/cairn-detect/src/infer/backend.rs`, whose rows carry the evidence.
   # Claims, not probes: config load answers them with no engine running and,
   # for a profile written ahead of its hardware, no device attached.
   #
@@ -35,14 +34,28 @@ defmodule Cairn.Board.Generic do
   #
   # `cpu_twin` has no Rust mirror — the baseline is the host's concern — and
   # is false on both rows: the CPU baseline runs qnn's QDQ `.onnx` itself.
-  # No `rknn`: no engine in a generic release runs it, so a profile naming it
-  # is refused with this board's name. `Cairn.Rockchip.Board` is where `rknn`
-  # executes.
+  #
+  # Only ort has soaked.
+  #
+  # Only these two: a profile naming another backend is refused with this
+  # board's name, because no engine in this release runs it.
   @impl true
   def backends do
     %{
-      "ort" => %{artifact: "onnx", fused_nms: true, dynamic_shapes: true, cpu_twin: false},
-      "qnn" => %{artifact: "qnn", fused_nms: false, dynamic_shapes: false, cpu_twin: false}
+      "ort" => %{
+        artifact: "onnx",
+        fused_nms: true,
+        dynamic_shapes: true,
+        cpu_twin: false,
+        experimental: false
+      },
+      "qnn" => %{
+        artifact: "qnn",
+        fused_nms: false,
+        dynamic_shapes: false,
+        cpu_twin: false,
+        experimental: true
+      }
     }
   end
 
@@ -58,7 +71,8 @@ defmodule Cairn.Board.Generic do
   @impl true
   def artifacts(_context), do: []
 
-  # The QCS6490's ladder: it names `qnn`, which the Rockchip board refuses.
+  # The QCS6490's ladder, kept out of the base's `priv/profiles` because it
+  # names `qnn`, which a board without that backend refuses.
   @impl true
   def profiles_dir, do: Application.app_dir(:cairn, "priv/profiles/generic")
 end

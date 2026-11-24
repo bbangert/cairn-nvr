@@ -129,8 +129,8 @@ defmodule Cairn.SoakMonitor do
       # The two halves separately: decode and inference libraries load
       # independently, and a report that aggregated them would say "loaded"
       # while the inference half silently wasn't. Each half is every library
-      # the board names for it, so a Rockchip release whose board NIF failed
-      # reads false although CairnOrt loaded. The keys keep their names for
+      # the board names for it, so a release whose board NIF failed reads
+      # false although CairnOrt loaded. The keys keep their names for
       # sample-file continuity.
       native_available: loaded?(Enum.map(board.decoders(), &board.decoder_backend/1)),
       ort_available:

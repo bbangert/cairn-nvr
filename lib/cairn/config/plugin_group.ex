@@ -10,9 +10,9 @@ defmodule Cairn.Config.PluginGroup do
   error, and a group is now nothing but a profile reference.
 
   `allow_experimental` is the operator's acknowledgement that a profile
-  naming a non-ort backend — not yet proven in soak (rknn, qnn) — may run
-  anyway (the profile must declare `experimental: true` too — `Cairn.Config`
-  enforces both halves).
+  naming a backend the board marks experimental may run anyway (the profile
+  must declare `experimental: true` too — `Cairn.Config` enforces both
+  halves).
   """
 
   alias Cairn.Config

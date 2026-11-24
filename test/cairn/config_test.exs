@@ -3023,13 +3023,15 @@ defmodule Cairn.ConfigTest do
     # The mirror itself. A row that drifts from
     # `BackendKind::capabilities` in plugins/cairn-detect/src/infer/backend.rs
     # is a change to what a profile may declare, not a refactor — the Rust side
-    # has the same test over the same values.
+    # has the same test over the same values. `experimental` has no Rust
+    # mirror: only ort has soaked.
     test "the table carries a row per backend, matching the plugin's own" do
       assert Profile.capabilities("ort") == %{
                artifact: "onnx",
                fused_nms: true,
                dynamic_shapes: true,
-               cpu_twin: false
+               cpu_twin: false,
+               experimental: false
              }
 
       # The documented near-collision: Rust reports `.onnx` as qnn's artifact
@@ -3040,7 +3042,8 @@ defmodule Cairn.ConfigTest do
                artifact: "qnn",
                fused_nms: false,
                dynamic_shapes: false,
-               cpu_twin: false
+               cpu_twin: false,
+               experimental: true
              }
     end
 
@@ -3079,11 +3082,8 @@ defmodule Cairn.ConfigTest do
       assert {"yolov8", _row} = Profile.family("yolo26")
       assert {"rfdetr", _row} = Profile.family("RF-DETR ")
       # hyphens are spelling, so the split contracts resolve either way
-      assert {"yolov8split", %{nms: :host_side, rknn_conversion: :proven}} =
-               Profile.family("yolov8-split")
-
-      assert {"yolo26split", %{nms: :host_side, rknn_conversion: :proven}} =
-               Profile.family("YOLO26-Split")
+      assert {"yolov8split", %{nms: :host_side}} = Profile.family("yolov8-split")
+      assert {"yolo26split", %{nms: :host_side}} = Profile.family("YOLO26-Split")
 
       assert Profile.family("yolov12") == nil
     end
@@ -3092,17 +3092,20 @@ defmodule Cairn.ConfigTest do
     # catalog row is NMS-free or host-side — so the reject side cannot be built
     # from a real profile, and the rule is exercised against the row a future
     # catalog addition would have. Coverage composes: rule 2's fixture tests
-    # (rockchip_release_test.exs, where rknn is on the menu) run the public
-    # parse path through the same `check_capabilities/5`, so
-    # the wiring is proven there and only this branch needs the direct call —
-    # giving the two rules separate entry points breaks that composition and
-    # needs a public-path test for each.
+    # (rockchip_release_test.exs, where a backend on the menu has
+    # `conversions`) run the public parse path through the same
+    # `check_capabilities/5`, so the wiring is proven there and only the
+    # branches need direct calls — giving the two rules separate entry points
+    # breaks that composition and needs a public-path test for each.
+    @fused {"fusednet", "fusednet", %{families: [], nms: :fused}}
+
+    defp caps(backend), do: {backend, Profile.capabilities(backend)}
+
     test "a fused-NMS family is refused on a backend that cannot run the op" do
       acc = %{errors: [], warnings: []}
-      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :proven}}
 
       assert %{errors: [error]} =
-               Profile.check_capabilities(acc, "profile synthetic", "qnn", true, fused)
+               Profile.check_capabilities(acc, "profile synthetic", caps("qnn"), true, @fused)
 
       assert error =~ "profile synthetic: qnn backend requires an NMS-free family"
       assert error =~ "model_profile fusednet fuses the suppression op"
@@ -3110,9 +3113,9 @@ defmodule Cairn.ConfigTest do
 
     test "the same family is accepted on ort, which implements the op" do
       acc = %{errors: [], warnings: []}
-      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :proven}}
 
-      assert Profile.check_capabilities(acc, "profile synthetic", "ort", true, fused) == acc
+      assert Profile.check_capabilities(acc, "profile synthetic", caps("ort"), true, @fused) ==
+               acc
     end
 
     test "an NMS-free family and a host-side-NMS one both load on qnn" do
@@ -3123,22 +3126,69 @@ defmodule Cairn.ConfigTest do
       assert config.profiles["qnn-host-side-nms"].model_profile == "yolox"
     end
 
-    # Rule 2 itself runs where rknn is on the menu, in rockchip_release_test.exs.
-    test "each unproven rknn conversion says what was measured, and where" do
-      # The verdict is per decode contract: yolo26's whole head shares it.
-      for name <- ~w(yolov8 yolov9 yolo11 yolov11 yolo26) do
-        assert {"yolov8", %{rknn_conversion: {:unproven, why}}} = Profile.family(name)
-        assert why =~ "one INT8 scale zeroes the scores"
-        assert why =~ "detected nothing in the toolkit's simulator"
-        assert why =~ "model_profile yolov8split for v8 and v11, yolo26split for yolo26"
+    # Rule 2's branches, on a backend no generic board offers: one whose
+    # board lists conversions. The verdicts and their wording are the board's.
+    @converted {"npu",
+                %{
+                  artifact: "npu",
+                  fused_nms: false,
+                  dynamic_shapes: false,
+                  cpu_twin: true,
+                  conversions: %{
+                    evidence: "docs/npu.md",
+                    contracts: %{"yolox" => :proven, "rfdetr" => {:unproven, "no op"}}
+                  }
+                }}
+
+    defp converted(experimental, {written, canonical}) do
+      {_canonical, row} = Profile.family(canonical)
+      acc = %{errors: [], warnings: []}
+
+      Profile.check_capabilities(
+        acc,
+        "profile p",
+        @converted,
+        experimental,
+        {written, canonical, row}
+      )
+    end
+
+    test "a proven conversion passes; an unproven one errors, naming the evidence" do
+      assert converted(false, {"yolox", "yolox"}) == %{errors: [], warnings: []}
+
+      assert %{errors: [error], warnings: []} = converted(false, {"rf-detr", "rfdetr"})
+
+      assert error ==
+               "profile p: model_profile rf-detr is not a proven npu conversion: no op — " <>
+                 "experimental: true loads it regardless (measurements: docs/npu.md)"
+    end
+
+    test "an unproven conversion acknowledged loads with a warning that gives the reason" do
+      assert %{errors: [], warnings: [warning]} = converted(true, {"rfdetr", "rfdetr"})
+
+      assert warning ==
+               "profile p: experimental: true loads model_profile rfdetr, which is not a " <>
+                 "proven npu conversion: no op"
+    end
+
+    # By the contract, under its canonical name, not the spelling written.
+    test "a contract the board does not list is unproven" do
+      assert %{errors: [error]} = converted(false, {"yolo11", "yolov8"})
+
+      assert error =~
+               "model_profile yolo11 is not a proven npu conversion: not listed by the board"
+    end
+
+    test "a backend with no conversion step has no conversion rule" do
+      for backend <- ~w(ort qnn) do
+        assert Profile.check_capabilities(
+                 %{errors: [], warnings: []},
+                 "profile p",
+                 caps(backend),
+                 false,
+                 {"rfdetr", "rfdetr", %{families: [], nms: :none}}
+               ) == %{errors: [], warnings: []}
       end
-
-      assert {"yolov10", %{rknn_conversion: {:unproven, why}}} = Profile.family("yolov10")
-      assert why =~ "wrong boxes in FP16 on the board"
-      assert why =~ "measured on yolo26's export of that head"
-
-      assert {"rfdetr", %{rknn_conversion: {:unproven, why}}} = Profile.family("rfdetr")
-      assert why =~ "no INT8 build ran on the board, where its FP16 build crashed librknnrt 2.3.2"
     end
 
     test "an unknown model_profile is refused, naming the menu it must come from" do
