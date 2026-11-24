@@ -87,7 +87,7 @@ pub(crate) fn runtime() -> OsString {
 /// cites puts an NMS op on the RKNN NPU either. Refusing an export we may not
 /// be able to run costs an operator a profile edit; accepting one that
 /// silently does not run costs a deployment.
-pub static RKNN: Descriptor = Descriptor {
+static RKNN: Descriptor = Descriptor {
     name: "rknn",
     capabilities: Capabilities {
         supports_fused_nms: false,
@@ -706,11 +706,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering::SeqCst};
     use std::sync::{Mutex, MutexGuard};
 
-    /// The rules `docs/npu-backends.md` turns into profile validation for
-    /// this backend, in the form `Cairn.Rockchip.Board.backends/0` mirrors. A
-    /// change here is a change to what a profile may declare, not a refactor.
+    /// The descriptor's values, in the form `Cairn.Rockchip.Board.backends/0`
+    /// mirrors; [`RKNN`]'s note says which are established and which are a
+    /// conservative reading. A change here is a change to what a profile may
+    /// declare, not a refactor.
     #[test]
-    fn the_descriptor_matches_the_researched_rules() {
+    fn the_descriptor_pins_what_a_profile_may_declare() {
         assert_eq!(RKNN.name, "rknn");
         assert!(!RKNN.capabilities.supports_fused_nms);
         assert!(!RKNN.capabilities.supports_dynamic_shapes);

@@ -5,16 +5,17 @@
 //! model lock is held for one pass, so two cameras serialize on inference and not
 //! on each other's decode, motion measurement or gate state.
 //!
-//! One lock over detector *and* embedder rather than one each: [`Embedder::open`]
-//! takes the detector's backend kind, so both halves of a pass submit to the same
-//! execution provider, and splitting them would only interleave two cameras on
-//! that one provider.
+//! One lock over detector *and* embedder rather than one each: an embedder opens
+//! only beside a detector on this crate's `ort` ([`infer::embedder_backend`]),
+//! so both halves of a pass submit to the same execution provider, and splitting
+//! them would only interleave two cameras on that one provider.
 //!
 //! This lock is a leaf — nothing taken under it takes another in this crate — and
 //! `push_au`'s order is always stream -> model, so the cycle a deadlock needs
 //! does not exist. The registry is never touched under it.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use cairn_detect::decode::ModelInput;
@@ -51,6 +52,7 @@ pub struct Engine {
 impl Engine {
     pub fn open(config: InitConfig) -> Result<Self> {
         let backend = core_backend(&config.backend)?;
+        let embedder = embedder(&config, &Selected::Core(backend))?;
         let labels = Labels::load(config.labels.as_deref())
             .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
         // Deliberately no sidecar load on the core backends: their uint8-IO
@@ -90,7 +92,7 @@ impl Engine {
             None,
         )
         .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
-        Self::assemble(&config, detector, labels)
+        Self::assemble(&config, detector, embedder, labels)
     }
 
     /// An engine on a board library's backend: what the binary's
@@ -98,7 +100,8 @@ impl Engine {
     ///
     /// The library serves that one backend, so any other `backend` is refused
     /// rather than opened on the core's backends — a host sending one here has
-    /// routed it to the wrong library. The sidecar is loaded and checked as
+    /// routed it to the wrong library. So is an embedder, as the binary refuses
+    /// one beside any provider. The sidecar is loaded and checked as
     /// the binary loads it: whether one may sit next to the artifact is the
     /// backend's input contract to decide ([`Detector::with_backend`]).
     pub fn with_provider(config: InitConfig, provider: &Provider) -> Result<Self> {
@@ -112,6 +115,7 @@ impl Engine {
                 Err(_) => format!("backend: this library's engine runs {runs}, not {wanted:?}"),
             }));
         }
+        let embedder = embedder(&config, &Selected::Provided(provider))?;
         let model_load = |e: anyhow::Error| NativeError::ModelLoad(chain(&e));
         let labels = Labels::load(config.labels.as_deref()).map_err(model_load)?;
         let options = SessionOptions {
@@ -119,11 +123,13 @@ impl Engine {
             io_quant: IoQuant::load_for(&config.model).map_err(model_load)?,
         };
         let backend = (provider.open)(&config.model, &options).map_err(model_load)?;
-        // The `up:` line names the backend's own descriptor.
-        let opened = backend.descriptor().name;
-        if opened != runs {
+        // The `up:` line renders the backend's own descriptor.
+        let opened = backend.descriptor();
+        if !std::ptr::eq(opened, provider.descriptor) {
             return Err(NativeError::ModelLoad(format!(
-                "the provider for backend {runs} opened backend {opened}"
+                "the provider for backend {runs} opened backend {} under a descriptor \
+                 it did not register",
+                opened.name
             )));
         }
         let detector = Detector::with_backend(
@@ -136,14 +142,19 @@ impl Engine {
             options.io_quant.as_ref(),
         )
         .map_err(model_load)?;
-        Self::assemble(&config, detector, labels)
+        Self::assemble(&config, detector, embedder, labels)
     }
 
     /// Everything after the detector is open, for both constructors.
-    fn assemble(config: &InitConfig, detector: Detector, labels: Labels) -> Result<Self> {
+    fn assemble(
+        config: &InitConfig,
+        detector: Detector,
+        embedder: Option<(&Path, BackendKind)>,
+        labels: Labels,
+    ) -> Result<Self> {
         let input_spec = detector.input_spec();
-        let embedder = match config.embedder_model.as_deref() {
-            Some(path) => {
+        let embedder = match embedder {
+            Some((path, kind)) => {
                 // Here, not at the first person in `detect`: the crops are cut
                 // from the detector's packed tensor, read as f32 NCHW planes,
                 // and only the opened artifact says whether it is fed that.
@@ -161,8 +172,8 @@ impl Engine {
                         input_spec.layout
                     )));
                 }
-                let embedder = Embedder::open(path, core_backend(&config.backend)?)
-                    .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
+                let embedder =
+                    Embedder::open(path, kind).map_err(|e| NativeError::ModelLoad(chain(&e)))?;
                 if !labels.contains("person") {
                     note!(
                         "cairn-native: an embedder is configured but the label set has no \
@@ -274,6 +285,20 @@ fn core_backend(name: &str) -> Result<BackendKind> {
         Ok(Selected::Provided(_)) => unreachable!("`select` was handed no providers"),
         Err(error) => Err(NativeError::Config(format!("backend: {}", chain(&error)))),
     }
+}
+
+/// The embedder's model and the backend it opens on beside a detector on
+/// `detector`, refused as config before any model access.
+fn embedder<'a>(
+    config: &'a InitConfig,
+    detector: &Selected<'_>,
+) -> Result<Option<(&'a Path, BackendKind)>> {
+    let Some(path) = config.embedder_model.as_deref() else {
+        return Ok(None);
+    };
+    let kind = infer::embedder_backend(detector)
+        .map_err(|error| NativeError::Config(format!("embedder_model: {}", chain(&error))))?;
+    Ok(Some((path, kind)))
 }
 
 /// Median CPU-side model-pass latency, milliseconds: the number
@@ -546,15 +571,96 @@ mod tests {
             assert!(observed[0].inferred);
         }
 
+        /// Refused by the name `backend` resolved to, before the provider
+        /// opens anything — `ort` included, when a provider holds that name —
+        /// while core `ort` goes on to the model load.
         #[test]
-        fn an_embedder_beside_a_pixel_byte_detector_is_refused_at_open() {
-            let error = match Engine::with_provider(config(Some("osnet.onnx")), &provider()) {
-                Ok(_) => panic!("an embedder opened over a u8-packed detector"),
+        fn an_embedder_beside_a_provided_backend_is_config_before_any_load() {
+            let unopened = |descriptor| Provider {
+                descriptor,
+                open: |_, _| unreachable!("refused before the provider opens"),
+            };
+            for (backend, provider) in [
+                ("board", unopened(&BOARD)),
+                ("ort", unopened(BackendKind::Ort.descriptor())),
+            ] {
+                let config = InitConfig {
+                    backend: backend.into(),
+                    ..config(Some("osnet.onnx"))
+                };
+                let error = match Engine::with_provider(config, &provider) {
+                    Ok(_) => panic!("an embedder opened beside provided {backend}"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.reason(), "config", "{backend}");
+                assert_eq!(
+                    error.message(),
+                    format!(
+                        "embedder_model: the embedder does not run on a board library's \
+                         backend ({backend})"
+                    )
+                );
+            }
+
+            let error = match Engine::open(InitConfig {
+                backend: "ort".into(),
+                ..config(Some("osnet.onnx"))
+            }) {
+                Ok(_) => panic!("a model that does not exist opened"),
+                Err(error) => error,
+            };
+            assert_eq!(error.reason(), "model_load", "{error:?}");
+        }
+
+        /// On the core path the backend resolves first, so an unknown name is
+        /// refused as that and not as the embedder's.
+        #[test]
+        fn an_embedder_off_core_ort_is_config_naming_the_first_refusal() {
+            for (backend, refusal) in [
+                (
+                    "qnn",
+                    "embedder_model: the embedder does not run on qnn yet",
+                ),
+                (
+                    "tensorrt",
+                    r#"backend: backend "tensorrt" is not one this build carries (ort, qnn)"#,
+                ),
+            ] {
+                let error = match Engine::open(InitConfig {
+                    backend: backend.into(),
+                    ..config(Some("osnet.onnx"))
+                }) {
+                    Ok(_) => panic!("{backend} opened with an embedder"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.reason(), "config", "{backend}");
+                assert!(error.message().starts_with(refusal), "{error:?}");
+            }
+        }
+
+        /// Identity, not the name: a backend reporting a copy of the
+        /// registered descriptor is refused.
+        #[test]
+        fn a_provider_must_open_under_the_descriptor_it_registered() {
+            static BOARD_COPY: Descriptor = Descriptor {
+                name: "board",
+                capabilities: BOARD.capabilities,
+            };
+            let provider = Provider {
+                descriptor: &BOARD_COPY,
+                ..provider()
+            };
+            let error = match Engine::with_provider(config(None), &provider) {
+                Ok(_) => panic!("a backend opened under another descriptor"),
                 Err(error) => error,
             };
             assert_eq!(error.reason(), "model_load");
-            assert!(error.message().contains("embedder_model"), "{error:?}");
-            assert!(error.message().contains("uint8 Nhwc"), "{error:?}");
+            assert!(
+                error
+                    .message()
+                    .contains("under a descriptor it did not register"),
+                "{error:?}"
+            );
         }
 
         /// The core path still refuses a uint8-IO artifact by its sidecar,

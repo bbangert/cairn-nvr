@@ -3,8 +3,8 @@
 //! A destructor runs on whichever thread released the last reference, and for a
 //! collected term that is a normal scheduler. What is dropped is a stream's
 //! state and, for the last engine handle, the model session — an ORT session
-//! release that on QNN gives back an HTP context, or an NPU context in the board
-//! library hosting this engine: work bounded by nothing this crate controls.
+//! release that on QNN gives back an HTP context, or a board library's runtime
+//! giving back an NPU context: work bounded by nothing this crate controls.
 //! Calling `close_stream` does not avoid it, since nothing stops the BEAM from
 //! collecting a term. [`defer`] is public so a library linking this crate can
 //! defer its own resources too.

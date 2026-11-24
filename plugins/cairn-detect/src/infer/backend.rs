@@ -72,9 +72,10 @@ impl BackendKind {
 /// such hardware attached. Each board's `backends/0` mirrors the descriptors
 /// of the backends it runs — [`ORT`] and [`QNN`] here, a board library's in
 /// its own crate (`Cairn.Board.Generic` runs `ort` and `qnn`): `fused_nms` feeds
-/// `Cairn.Config.Profile`'s `check_capabilities` rule, `artifact` picks
-/// the `model:` key a profile is read by, and `dynamic_shapes` is mirrored
-/// but read by no rule on either side (an `input_size:` disagreeing with a
+/// `Cairn.Config.Profile`'s `check_capabilities` rule, the Elixir row's
+/// `artifact` is the `model:` key a profile is read by (not the extension
+/// [`Capabilities::artifact`] carries — see [`QNN`]), and `dynamic_shapes`
+/// is mirrored but read by no rule on either side (an `input_size:` disagreeing with a
 /// compiled artifact is a fact about a file the host cannot open — the
 /// authoring guide carries it instead). Every copy is a claim about the
 /// runtime, not an observation of it — see the per-backend notes for which
@@ -86,10 +87,10 @@ pub struct Descriptor {
     pub capabilities: Capabilities,
 }
 
-// Both yes, and both load-bearing in this crate rather than inferred: every
-// RF-DETR export leaves its spatial dims dynamic and ort runs them (that is
-// why `--input-size` exists), and onnxruntime implements the ONNX
-// `NonMaxSuppression` op on CPU, so an export with the head fused in loads.
+// Both established on ort rather than inferred: every RF-DETR export leaves
+// its spatial dims dynamic and ort runs them (that is why `--input-size`
+// exists), and onnxruntime implements the ONNX `NonMaxSuppression` op on
+// CPU, so an export with the head fused in loads.
 // No shipped profile feeds it one — `catalog` pairs every grid family with
 // `DEFAULT_NMS`, i.e. host-side suppression in `heads` — so this flag says
 // what the backend would accept, not what cairn sends it.
@@ -156,10 +157,12 @@ impl fmt::Display for Capabilities {
     }
 }
 
-/// A backend this crate does not carry, under the name its descriptor gives.
+/// A board library's backend, registered under its descriptor's name.
 ///
 /// [`select`] consults providers before this crate's own names, so a provider
-/// named `ort` or `qnn` replaces that backend.
+/// named `ort` or `qnn` replaces that backend: the detector opens on the
+/// provider, and an embedder, which opens only on this crate's backends, is
+/// refused beside it ([`embedder_backend`](super::embedder_backend)).
 pub struct Provider {
     pub descriptor: &'static Descriptor,
     pub open: fn(&Path, &SessionOptions) -> Result<Box<dyn Backend>>,
@@ -173,10 +176,11 @@ pub enum Selected<'a> {
 
 /// `name` is `--backend` or the NIF config's `backend`, as sent.
 ///
-/// The host refuses a non-`ort` profile at config load unless the profile and
-/// its group both acknowledge it as experimental, so a miss here is a name
-/// that got this far anyway: the error lists what this build runs, so it reads
-/// as a backend the build lacks rather than as a mistyped flag.
+/// At config load the host refuses a profile whose backend is not a key of its
+/// board's `backends/0` (`check_backend` in `Cairn.Config.Profile`), so a miss
+/// here is a board menu that disagrees with the library it routed to, or a
+/// hand-typed `--backend`. The error lists what this build runs, so it reads as
+/// a backend the build lacks rather than as a mistyped flag.
 pub fn select<'a>(name: &str, providers: &'a [Provider]) -> Result<Selected<'a>> {
     if let Some(provider) = providers.iter().find(|p| p.descriptor.name == name) {
         return Ok(Selected::Provided(provider));
@@ -385,8 +389,8 @@ pub trait Backend: Send {
     /// Which backend this is, and what it accepts.
     ///
     /// Nothing checks that the capabilities a backend reports are true of its
-    /// runtime; a provided backend's name is checked against the one its
-    /// [`Provider`] registered.
+    /// runtime; a provided backend's descriptor is checked to be the very
+    /// static its [`Provider`] registered (by address, not by name).
     fn descriptor(&self) -> &'static Descriptor;
 
     /// The model's inputs and outputs as settled at [`Backend::open`].

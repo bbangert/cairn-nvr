@@ -11,10 +11,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use cairn_detect::infer::{
-    self, BackendKind, InputSize, ModelProfile, QnnOptions, ScoreFloors, Selected,
-    TrackFloorOverrides,
-};
+use cairn_detect::infer::{InputSize, ModelProfile, QnnOptions, ScoreFloors, TrackFloorOverrides};
 use cairn_detect::motion::{self, MotionConfig, MotionOverrides};
 use rustler::NifMap;
 
@@ -54,38 +51,14 @@ pub struct InitConfig {
     pub input_size: Option<InputSize>,
     pub labels: Option<PathBuf>,
     pub allow_label_mismatch: bool,
+    /// Checked in each [`Engine`](crate::Engine) constructor once `backend`
+    /// resolves, so an unknown name is refused as that, not as the embedder's.
     pub embedder_model: Option<PathBuf>,
     pub qnn: QnnOptions,
 }
 
 impl RawInitConfig {
     pub fn resolve(self) -> Result<InitConfig> {
-        let embedder_model = self.embedder_model.map(PathBuf::from);
-        // The embedder's own open refuses these, but only after the detector's
-        // load — on qnn a multi-second HTP graph compile. `cli.rs`'s `serve`
-        // refuses them up front as well, so the hosts answer the same profile
-        // the same way. The embedder opens on core backends only, so any name
-        // but core's `ort` is refused, a board's included.
-        if embedder_model.is_some() {
-            match infer::select(&self.backend, &[]) {
-                Ok(Selected::Core(BackendKind::Ort)) => {}
-                Ok(Selected::Core(BackendKind::Qnn)) => {
-                    return Err(NativeError::Config(
-                        "the embedder does not run on qnn yet (no QDQ embedder artifact) \
-                         — drop embedder_model or use the ort backend"
-                            .to_string(),
-                    ))
-                }
-                _ => {
-                    return Err(NativeError::Config(format!(
-                        "the embedder runs on ort only, not {} — drop embedder_model \
-                         or use the ort backend",
-                        self.backend
-                    )))
-                }
-            }
-        }
-
         Ok(InitConfig {
             model: PathBuf::from(self.model),
             backend: self.backend,
@@ -103,7 +76,7 @@ impl RawInitConfig {
                 .map_err(|message| NativeError::Config(format!("input_size: {message}")))?,
             labels: self.labels.map(PathBuf::from),
             allow_label_mismatch: self.allow_label_mismatch,
-            embedder_model,
+            embedder_model: self.embedder_model.map(PathBuf::from),
             qnn: QnnOptions {
                 library: self.qnn.library.map(PathBuf::from),
                 soc_model: self.qnn.soc_model,
@@ -232,21 +205,6 @@ mod tests {
             let error = config.resolve().unwrap_err();
             assert_eq!(error.reason(), "config", "{field}");
             assert!(error.message().contains(field), "{}", error.message());
-        }
-    }
-
-    #[test]
-    fn an_embedder_off_ort_is_refused_before_the_model_load() {
-        for backend in ["qnn", "board", "tensorrt"] {
-            let error = RawInitConfig {
-                backend: backend.into(),
-                embedder_model: Some("osnet.onnx".into()),
-                ..init()
-            }
-            .resolve()
-            .unwrap_err();
-            assert_eq!(error.reason(), "config");
-            assert!(error.message().contains(backend), "{}", error.message());
         }
     }
 

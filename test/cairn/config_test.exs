@@ -3021,8 +3021,9 @@ defmodule Cairn.ConfigTest do
     end
 
     # The mirror itself. A row that drifts from its descriptor in
-    # plugins/cairn-detect/src/infer/backend.rs is a change to what a profile may declare, not a refactor — the Rust side
-    # has the same test over the same values.
+    # plugins/cairn-detect/src/infer/backend.rs is a change to what a profile
+    # may declare, not a refactor — the Rust side has the same test over the
+    # same values.
     test "the table carries a row per backend, matching the plugin's own" do
       assert Profile.capabilities("ort") == %{
                artifact: "onnx",

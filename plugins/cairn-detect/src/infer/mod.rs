@@ -59,7 +59,7 @@ pub use baseline::{
     cpu_baseline_ms, measure_cpu_baseline, open_baseline_detector, BASELINE_PASSES,
 };
 pub use detector::Detector;
-pub use embedder::{embed_persons, quantize_base64, Embedder};
+pub use embedder::{embed_persons, embedder_backend, quantize_base64, Embedder};
 pub use geometry::{Fit, InputSize, Projection};
 pub use heads::Raw;
 pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};

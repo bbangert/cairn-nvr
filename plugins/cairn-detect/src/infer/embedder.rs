@@ -27,7 +27,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::backend::onnxruntime::OrtBackend;
-use super::backend::{Backend, BackendKind, InputElement, InputTensor, SessionOptions};
+use super::backend::{Backend, BackendKind, InputElement, InputTensor, Selected, SessionOptions};
 use super::encoding::{TensorEncoding, TensorLayout, TensorValues};
 use super::geometry::{InputSize, Projection};
 use super::profile::InputSpec;
@@ -199,6 +199,26 @@ impl Embedder {
             return Ok(None);
         }
         Ok(Some(raw.values.iter().map(|v| v / norm).collect()))
+    }
+}
+
+/// The backend an embedder opens on beside a detector on `detector`, or why
+/// there is none. Shared by the binary and the NIF so both refuse from the
+/// resolved name, before any model load, in the same words.
+///
+/// [`Embedder::open`] reaches only this crate's backends, so a provided
+/// detector is refused under any name, `ort` included: core ort beside it
+/// would run half of each pass on a runtime the name did not select.
+pub fn embedder_backend(detector: &Selected<'_>) -> Result<BackendKind> {
+    match detector {
+        Selected::Core(BackendKind::Ort) => Ok(BackendKind::Ort),
+        Selected::Core(BackendKind::Qnn) => {
+            bail!("the embedder does not run on qnn yet (no QDQ embedder artifact)")
+        }
+        Selected::Provided(provider) => bail!(
+            "the embedder does not run on a board library's backend ({})",
+            provider.descriptor.name
+        ),
     }
 }
 

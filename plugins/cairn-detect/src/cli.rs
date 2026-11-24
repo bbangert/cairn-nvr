@@ -45,8 +45,8 @@ use decode::{DecoderKind, Sample};
 use emit::Publisher;
 use gate::Gate;
 use infer::{
-    BackendKind, Detector, Embedder, InputSize, InputSpec, IoQuant, Labels, ModelProfile, Provider,
-    QnnOptions, ScoreFloors, Selected, SessionOptions, TensorLayout, TrackFloorOverrides,
+    Detector, Embedder, InputSize, InputSpec, IoQuant, Labels, ModelProfile, Provider, QnnOptions,
+    ScoreFloors, Selected, SessionOptions, TensorLayout, TrackFloorOverrides,
 };
 use motion::{MotionConfig, MotionOverrides};
 
@@ -158,8 +158,9 @@ struct Args {
     /// input size and one static feature output). When given, every emitted
     /// `person` detection carries a base64 int8 `embedding`, cropped from the
     /// detection pass's own input tensor. Shares `--backend` — which means it
-    /// is refused with anything but `ort`: with `qnn` until a QDQ embedder
-    /// artifact exists, and with a board library's backend.
+    /// is refused with anything but this build's own `ort`: with `qnn` until a
+    /// QDQ embedder artifact exists, and with any board library's backend, one
+    /// registered as `ort` included.
     #[arg(long)]
     embedder_model: Option<PathBuf>,
 
@@ -224,6 +225,9 @@ pub fn run(providers: &[Provider]) -> ExitCode {
 
 fn serve(providers: &[Provider]) -> Result<()> {
     let args = Args::parse();
+    // Before everything, as clap's own refusals are: the baseline ignores the
+    // backend it names, but a name the build lacks is a broken argv either way.
+    let backend = infer::select(&args.backend, providers).context("--backend")?;
 
     if let Some(passes) = args.cpu_baseline {
         let labels = Labels::load(args.labels.as_deref())?;
@@ -240,18 +244,11 @@ fn serve(providers: &[Provider]) -> Result<()> {
         return Ok(());
     }
 
-    // Before the hello, as clap's own refusals are; `open_detector` resolves
-    // it again for the open.
-    infer::select(&args.backend, providers).context("--backend")?;
-    // `open_embedder` refuses qnn and any provider's name too, but it runs
-    // after the detector's open — on qnn a multi-second HTP graph compile.
-    // An argv combination that is going down either way should say so before
-    // that, not after.
-    if args.embedder_model.is_some() && embedder_backend(&args.backend)? == BackendKind::Qnn {
-        anyhow::bail!(
-            "the embedder does not run on qnn yet (no QDQ embedder artifact) \
-             — drop --embedder-model or use --backend ort"
-        );
+    // `open_embedder` asks the same question, but after the detector's open —
+    // on qnn a multi-second HTP graph compile. An argv combination that is
+    // going down either way should say so before that, not after.
+    if args.embedder_model.is_some() {
+        infer::embedder_backend(&backend).context("--embedder-model")?;
     }
     // The early case, before the detector's open, of the refusal
     // `open_embedder` makes for any uint8-fed detector: the embedder crops
@@ -273,8 +270,8 @@ fn serve(providers: &[Provider]) -> Result<()> {
     emit::stdout_line(&emit::hello_line())?;
 
     match args.cameras_json.as_deref() {
-        Some(json) => run_multiplexed(&args, json, providers),
-        None => run_single(&args, providers),
+        Some(json) => run_multiplexed(&args, json, &backend),
+        None => run_single(&args, &backend),
     }
 }
 
@@ -293,7 +290,7 @@ fn start_control<'a>(camera_ids: impl IntoIterator<Item = &'a str>) -> Result<Ar
 }
 
 /// One process, a whole plugin group: see [`multiplex`] for the error policy.
-fn run_multiplexed(args: &Args, cameras_json: &str, providers: &[Provider]) -> Result<()> {
+fn run_multiplexed(args: &Args, cameras_json: &str, backend: &Selected<'_>) -> Result<()> {
     let specs = multiplex::parse_specs(cameras_json)?;
     // Every argument check before the control thread and the model load: a
     // malformed argument is a start-up failure the operator should see
@@ -316,8 +313,8 @@ fn run_multiplexed(args: &Args, cameras_json: &str, providers: &[Provider]) -> R
     let labels = Labels::load(args.labels.as_deref())?;
     // Before any decoder: every scaler and GPU filter graph is built for the
     // size the model resolves to.
-    let detector = open_detector(args, &labels, providers)?;
-    let embedder = open_embedder(args, &labels, detector.input_spec())?;
+    let detector = open_detector(args, &labels, backend)?;
+    let embedder = open_embedder(args, &labels, backend, detector.input_spec())?;
     note!(
         "cairn-detect up: cameras=[{}] {} {}",
         specs
@@ -347,23 +344,24 @@ fn run_multiplexed(args: &Args, cameras_json: &str, providers: &[Provider]) -> R
     )
 }
 
-/// The detector `args` describe, from a provider when one carries
-/// `--backend`, otherwise from the core's own backends.
-fn open_detector(args: &Args, labels: &Labels, providers: &[Provider]) -> Result<Detector> {
+/// The detector `args` describe, on the backend `--backend` resolved to.
+fn open_detector(args: &Args, labels: &Labels, backend: &Selected<'_>) -> Result<Detector> {
     let options = SessionOptions {
         qnn: qnn_options(args),
         io_quant: IoQuant::load_for(&args.model)?,
     };
-    match infer::select(&args.backend, providers).context("--backend")? {
+    match *backend {
         Selected::Provided(provider) => {
             let backend = (provider.open)(&args.model, &options)?;
-            // The startup line names the backend's own descriptor, so without
-            // this it would report a runtime `--backend` did not ask for.
-            let opened = backend.descriptor().name;
-            if opened != provider.descriptor.name {
+            // The startup line renders the backend's own descriptor, so without
+            // this it could describe a runtime `--backend` did not ask for.
+            let opened = backend.descriptor();
+            if !std::ptr::eq(opened, provider.descriptor) {
                 bail!(
-                    "the provider registered for --backend {} opened backend {opened}",
+                    "the provider registered for --backend {} opened backend {} \
+                     under a descriptor it did not register",
                     provider.descriptor.name,
+                    opened.name,
                 );
             }
             Detector::with_backend(
@@ -415,7 +413,7 @@ fn track_floor_overrides(args: &Args) -> Result<TrackFloorOverrides> {
 /// One process, one camera. Any stream failure is fatal by design: the
 /// contract's host restarts a plugin that exits, and there is nothing else
 /// running here to keep alive.
-fn run_single(args: &Args, providers: &[Provider]) -> Result<()> {
+fn run_single(args: &Args, backend: &Selected<'_>) -> Result<()> {
     let camera_id = args
         .camera_id
         .clone()
@@ -441,9 +439,9 @@ fn run_single(args: &Args, providers: &[Provider]) -> Result<()> {
     let motion = motion::resolve(&motion_overrides(args)?, &MotionOverrides::default());
     let labels = Labels::load(args.labels.as_deref())?;
     // Before the stream opens: `decode::open` below needs the resolved size.
-    let detector = open_detector(args, &labels, providers)?;
+    let detector = open_detector(args, &labels, backend)?;
     let input_spec = detector.input_spec();
-    let embedder = open_embedder(args, &labels, input_spec)?;
+    let embedder = open_embedder(args, &labels, backend, input_spec)?;
     note!(
         "cairn-detect up: camera={camera_id} udp={udp_port} {} {}",
         model_summary(args, &detector),
@@ -618,7 +616,12 @@ fn infer_loop(
 /// it and the crop reads that as float NCHW planes, so any other layout or a
 /// uint8 input is refused here for every backend, before the embedder's
 /// session load — [`serve`] makes the sidecar-answerable uint8 case earlier.
-fn open_embedder(args: &Args, labels: &Labels, spec: InputSpec) -> Result<Option<Embedder>> {
+fn open_embedder(
+    args: &Args,
+    labels: &Labels,
+    backend: &Selected<'_>,
+    spec: InputSpec,
+) -> Result<Option<Embedder>> {
     let Some(model) = args.embedder_model.as_deref() else {
         return Ok(None);
     };
@@ -637,7 +640,8 @@ fn open_embedder(args: &Args, labels: &Labels, spec: InputSpec) -> Result<Option
              — drop the embedder"
         );
     }
-    let embedder = Embedder::open(model, embedder_backend(&args.backend)?)?;
+    let kind = infer::embedder_backend(backend).context("--embedder-model")?;
+    let embedder = Embedder::open(model, kind)?;
     if !labels.contains("person") {
         note!(
             "cairn-detect: --embedder-model is set but the label set has no \
@@ -645,19 +649,6 @@ fn open_embedder(args: &Args, labels: &Labels, spec: InputSpec) -> Result<Option
         );
     }
     Ok(Some(embedder))
-}
-
-/// The core backend the embedder opens on, by `--backend`'s name: its open
-/// reaches only this crate's backends, so a provider registered as `ort`
-/// leaves it on this crate's `ort`, and any other provider's name has none.
-fn embedder_backend(name: &str) -> Result<BackendKind> {
-    match infer::select(name, &[]) {
-        Ok(Selected::Core(kind)) => Ok(kind),
-        _ => bail!(
-            "the embedder runs on ort only, not {name} — \
-             drop --embedder-model or use --backend ort"
-        ),
-    }
 }
 
 /// The embedder's half of the `up:` line — `embedder=off` when none is
@@ -672,6 +663,7 @@ fn embedder_summary(embedder: &Option<Embedder>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infer::BackendKind;
 
     const MODEL: &[&str] = &["cairn-detect", "--model", "m.onnx"];
 
@@ -878,8 +870,9 @@ mod tests {
     }
 
     /// A provider replaces the core's backend of the same name, and is
-    /// trusted for nothing but an open: one that hands back another
-    /// backend is refused before the model is resolved.
+    /// trusted for nothing but an open: one whose backend reports any
+    /// descriptor but the one it registered is refused before the model is
+    /// resolved.
     #[test]
     fn a_provider_is_consulted_first_and_must_open_its_own_backend() {
         use infer::{Backend, Capabilities, Descriptor, InputTensor, ModelIo, Tensors};
@@ -908,19 +901,19 @@ mod tests {
                 unreachable!("refused before any run")
             }
         }
+        fn io(declared_input_size: Option<InputSize>) -> ModelIo {
+            ModelIo {
+                input_name: "images".to_string(),
+                declared_input_size,
+                declared_input_batch: None,
+                outputs: Vec::new(),
+                input_element: infer::InputElement::F32,
+                u8_outputs: Vec::new(),
+                input_layout: TensorLayout::Nhwc,
+            }
+        }
         fn fake(declared_input_size: Option<InputSize>) -> Box<dyn Backend> {
-            Box::new(Fake(
-                BackendKind::Ort.descriptor(),
-                ModelIo {
-                    input_name: "images".to_string(),
-                    declared_input_size,
-                    declared_input_batch: None,
-                    outputs: Vec::new(),
-                    input_element: infer::InputElement::F32,
-                    u8_outputs: Vec::new(),
-                    input_layout: TensorLayout::Nhwc,
-                },
-            ))
+            Box::new(Fake(BackendKind::Ort.descriptor(), io(declared_input_size)))
         }
         fn mislabelled(_: &Path, _: &SessionOptions) -> Result<Box<dyn Backend>> {
             Ok(fake(None))
@@ -930,11 +923,15 @@ mod tests {
         }
         let labels = Labels::load(None).unwrap();
         // Not `unwrap_err`: `Detector` has no `Debug`, deliberately.
-        let fail =
-            |args: &Args, providers: &[Provider]| match open_detector(args, &labels, providers) {
+        let fail = |args: &Args, providers: &[Provider]| {
+            let opened = infer::select(&args.backend, providers)
+                .context("--backend")
+                .and_then(|backend| open_detector(args, &labels, &backend));
+            match opened {
                 Ok(_) => panic!("the open succeeded"),
                 Err(err) => format!("{err:#}"),
-            };
+            }
+        };
 
         let args = parse(&[
             "--camera-id",
@@ -953,6 +950,29 @@ mod tests {
             }],
         );
         assert!(msg.contains("--backend board opened backend ort"), "{msg}");
+
+        // Identity, not the name: a copy under the registered name is refused.
+        static BOARD_COPY: Descriptor = Descriptor {
+            name: "board",
+            capabilities: Capabilities {
+                supports_fused_nms: true,
+                ..BOARD.capabilities
+            },
+        };
+        fn copied(_: &Path, _: &SessionOptions) -> Result<Box<dyn Backend>> {
+            Ok(Box::new(Fake(&BOARD_COPY, io(None))))
+        }
+        let msg = fail(
+            &args,
+            &[Provider {
+                descriptor: &BOARD,
+                open: copied,
+            }],
+        );
+        assert!(
+            msg.contains("--backend board opened backend board under a descriptor"),
+            "{msg}"
+        );
 
         // The core's ort backend would have failed on the missing file.
         let args = parse(&["--camera-id", "front", "--udp-port", "17000"]).unwrap();
@@ -983,15 +1003,27 @@ mod tests {
         );
     }
 
-    /// The embedder opens on this crate's backends only, and follows
-    /// `--backend` by name.
+    /// The embedder opens on this crate's `ort` only: a provider registered
+    /// under that name is refused like any other, by the name it resolved to.
     #[test]
-    fn the_embedder_backend_is_a_core_one_or_refused() {
-        assert_eq!(embedder_backend("ort").unwrap(), BackendKind::Ort);
-        assert_eq!(embedder_backend("qnn").unwrap(), BackendKind::Qnn);
-        let msg = embedder_backend("board").unwrap_err().to_string();
-        assert!(msg.contains("ort only, not board"), "{msg}");
-        assert!(msg.contains("--embedder-model"), "{msg}");
+    fn the_embedder_backend_is_core_ort_or_refused() {
+        let provider = Provider {
+            descriptor: BackendKind::Ort.descriptor(),
+            open: |_, _| unreachable!("refused before any open"),
+        };
+        let providers = [provider];
+        let embedder_on = |name: &str, providers: &[Provider]| {
+            infer::embedder_backend(&infer::select(name, providers).unwrap())
+                .map_err(|err| err.to_string())
+        };
+        assert_eq!(embedder_on("ort", &[]), Ok(BackendKind::Ort));
+        let msg = embedder_on("ort", &providers).unwrap_err();
+        assert!(
+            msg.contains("does not run on a board library's backend (ort)"),
+            "{msg}"
+        );
+        let msg = embedder_on("qnn", &[]).unwrap_err();
+        assert!(msg.contains("does not run on qnn yet"), "{msg}");
     }
 
     /// Refused on the spec alone, before the embedder's model is touched —
@@ -1017,10 +1049,11 @@ mod tests {
             layout: TensorLayout::Nhwc,
         };
         let labels = Labels::load(None).unwrap();
-        let refusal = |spec| match open_embedder(&args, &labels, spec) {
-            Ok(_) => panic!("an embedder opened over {spec:?}"),
-            Err(err) => format!("{err:#}"),
-        };
+        let refusal =
+            |spec| match open_embedder(&args, &labels, &Selected::Core(BackendKind::Ort), spec) {
+                Ok(_) => panic!("an embedder opened over {spec:?}"),
+                Err(err) => format!("{err:#}"),
+            };
         assert!(refusal(spec)
             .contains("--embedder-model cannot run with a detector whose input is Nhwc"),);
         let uint8 = InputSpec {
