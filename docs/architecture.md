@@ -168,7 +168,7 @@ A board obeys these rules:
 - It implements no protocol the release ships: the release's protocols are consolidated, so a board's `defimpl` of one never dispatches. The task refuses it.
 - The directory is trusted code. Every application under `lib/` is loaded and every `on_load` runs with the node's privileges, in an eval VM too, so the directory must not be writable by the service's user. The contract number is a compatibility check, not a signature.
 
-`test/fixture_board` is a board built this way, with a stub NIF and no hardware; `tools/ci/build-fixture-board.sh` writes its directory. `tools/ci/board-boot-test.sh`, CI's `board-loader` job, boots the prod release with it attached, and with broken copies of it that must be refused.
+`test/fixture_board` is a board built this way, with a stub NIF and no hardware; `tools/ci/build-fixture-board.sh` writes its directory. `tools/ci/board-boot-test.sh`, CI's `board-loader` job, boots the prod release with it attached, and with broken copies of it that must be refused. `tools/ci/external-board-test.sh`, CI's `external-board` job, builds it outside the tree from this commit by git alone — `cairn_stage` as a sparse Mix git dependency with its lock seeded from core's — boots the release with it, and checks that `cairn-detect` and `cairn-ort` taken by Cargo git dependencies at one ref resolve to one copy each, and to two when the ref is spelled two ways.
 
 ## The ring buffer
 

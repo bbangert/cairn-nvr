@@ -279,6 +279,44 @@ jobs:
         env:
           CAIRN_FIXTURE_BOARD_DIR: ${{ runner.temp }}/board-boot/board
 
+  external-board:
+    name: External board (core by git ref, booted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # test/fixture_board copied out of the tree and built as a board in
+    # another repository would be: cairn_stage as a sparse Mix git
+    # dependency on this checkout, cairn-detect and cairn-ort as Cargo git
+    # dependencies resolving to one copy each, then booted on the prod
+    # release. Its own job, not board-loader's steps, so branch protection
+    # can require it by name; the price is a second release build.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          version-file: mise.toml
+          version-type: strict
+
+      # Not ~/.cargo/git: what it would hold is this commit's checkout.
+      - name: Cache deps, build and the crates.io index and crates
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+            ~/.cargo/registry
+          key: mix-external-board-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock', 'plugins/*/Cargo.lock', 'test/fixture_board/native/cairn_fixture_board/Cargo.lock') }}
+          restore-keys: |
+            mix-external-board-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      - run: tools/ci/external-board-test.sh
+        env:
+          WORK: ${{ runner.temp }}/external-board
+
   audit:
     name: Hex audit · Unused deps
     runs-on: ubuntu-latest
