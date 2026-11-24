@@ -101,7 +101,7 @@ defmodule Cairn.MixProject do
       # (ratio only defines Coerce protocols over Decimal), while ecto_sqlite3
       # requires ~> 3.0. Override until ratio lifts the cap.
       {:decimal, "~> 3.0", override: true},
-      {:membrane_mp4_plugin, "~> 0.36.10"},
+      {:membrane_mp4_plugin, "~> 0.37.0"},
       {:membrane_h26x_plugin, "~> 0.11.2"},
       # D-C2: the decoder element's stream format is `%Membrane.RawVideo{}`,
       # the ecosystem's one raw-frame vocabulary — never a custom struct.
