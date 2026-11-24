@@ -23,7 +23,8 @@ use super::super::resolve::{
     declared_input_batch, declared_input_size, static_output_dims, Declared,
 };
 use super::{
-    Backend, BackendKind, InputElement, InputTensor, ModelIo, QnnOptions, SessionOptions, Tensors,
+    Backend, BackendKind, Descriptor, InputElement, InputTensor, ModelIo, QnnOptions,
+    SessionOptions, Tensors,
 };
 
 /// The reused input buffer, in the dtype the artifact's contract picked at
@@ -132,8 +133,8 @@ impl Backend for OrtBackend {
         Self::from_session(session, model, options)
     }
 
-    fn kind(&self) -> BackendKind {
-        BackendKind::Ort
+    fn descriptor(&self) -> &'static Descriptor {
+        BackendKind::Ort.descriptor()
     }
 
     fn io(&self) -> &ModelIo {
@@ -361,8 +362,8 @@ impl Backend for QnnBackend {
         Ok(Self(OrtBackend::from_session(session, model, options)?))
     }
 
-    fn kind(&self) -> BackendKind {
-        BackendKind::Qnn
+    fn descriptor(&self) -> &'static Descriptor {
+        BackendKind::Qnn.descriptor()
     }
 
     fn io(&self) -> &ModelIo {

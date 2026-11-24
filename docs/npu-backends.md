@@ -2,7 +2,8 @@
 
 The research record behind the boards' backend-capability tables
 (`backends/0` in `Cairn.Board.Generic` and `Cairn.Rockchip.Board`) and the
-stage library's `BackendKind::capabilities`.
+Rust descriptors they mirror (`ORT` and `QNN` in the stage library, `RKNN` in
+the Rockchip board's crate).
 
 It began as second-cycle research (2026-08-05, 11 sources), and what a board
 has since measured replaced the research in place and says so. The RKNN
@@ -89,7 +90,7 @@ hides the cause. The add-on sets `devicetree: true` for it.
   one model do overlap (measured, below); Cairn's engine holds one. No
   perf-mode API equivalent to QNN's, and none was needed: every budget was
   taken under the governors as found (`schedutil`, `rknpu_ondemand`).
-  `rknn_set_core_mask` is bound, and no config key sets it.
+  `rknn_set_core_mask` is not bound: nothing would set it.
 - Frames in and out are copies. Input goes through `rknn_inputs_set`.
   Importing the scaler's dma-buf instead (`rknn_set_io_mem`) gave
   bit-identical outputs over 200 frames and needed no sync, but saved about
@@ -141,11 +142,12 @@ research asked of the seam, as built:
 
 - **Per-backend session options.** Neither backend's are profile keys. QNN's
   (`soc_model`, `htp_arch`, performance mode, VTCM) are facts about the node,
-  read from its environment (`config/runtime.exs`). RKNN's one option, the
-  core mask, is set by nothing.
+  read from its environment (`config/runtime.exs`). RKNN takes none through
+  the seam: its one setting, the runtime's path, is a NIF argument or
+  `CAIRN_RKNN_LIBRARY`.
 - **A capability report profile validation consumes.**
-  `BackendKind::capabilities`, mirrored by each board's `backends/0`: the
-  artifact (its format in Rust, the `model:` key in Elixir), fused NMS,
+  Each backend's `Descriptor`, mirrored by each board's `backends/0`: the
+  artifact (its extension in Rust, the `model:` key in Elixir), fused NMS,
   dynamic shapes, and on the Elixir side whether the CPU baseline needs an
   FP32 twin.
 - **The artifact format.** A profile's `model:` is keyed per backend

@@ -27,7 +27,7 @@
 //! ([`control`]). stdout carries protocol lines and nothing else — every
 //! diagnostic, here and in the stages, goes to stderr.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
@@ -45,8 +45,8 @@ use decode::{DecoderKind, Sample};
 use emit::Publisher;
 use gate::Gate;
 use infer::{
-    Backend, BackendKind, Detector, Embedder, InputSize, InputSpec, IoQuant, Labels, ModelProfile,
-    QnnOptions, ScoreFloors, SessionOptions, TensorLayout, TrackFloorOverrides,
+    BackendKind, Detector, Embedder, InputSize, InputSpec, IoQuant, Labels, ModelProfile, Provider,
+    QnnOptions, ScoreFloors, Selected, SessionOptions, TensorLayout, TrackFloorOverrides,
 };
 use motion::{MotionConfig, MotionOverrides};
 
@@ -122,12 +122,11 @@ struct Args {
     model: PathBuf,
 
     /// Inference runtime. `ort` (CPU) and `qnn` (Qualcomm HTP, needs
-    /// `--qnn-library` and a QDQ model) execute in every build; `rknn` executes
-    /// only in a build whose board library provides it, and elsewhere is
-    /// refused when the model opens with a message about the backend rather
-    /// than a usage error about the flag.
-    #[arg(long, value_enum, default_value_t = BackendKind::Ort)]
-    backend: BackendKind,
+    /// `--qnn-library` and a QDQ model) in every build, plus any a board
+    /// library's binary registers. A name the build does not carry is
+    /// refused before the model opens, listing the ones it does.
+    #[arg(long, default_value = "ort")]
+    backend: String,
 
     /// The QNN plugin execution-provider library
     /// (`libonnxruntime_providers_qnn.so`). Required with `--backend qnn`:
@@ -159,7 +158,8 @@ struct Args {
     /// input size and one static feature output). When given, every emitted
     /// `person` detection carries a base64 int8 `embedding`, cropped from the
     /// detection pass's own input tensor. Shares `--backend` — which means it
-    /// is refused with `qnn` until a QDQ embedder artifact exists.
+    /// is refused with anything but `ort`: with `qnn` until a QDQ embedder
+    /// artifact exists, and with a board library's backend.
     #[arg(long)]
     embedder_model: Option<PathBuf>,
 
@@ -205,15 +205,6 @@ struct Args {
     sample_fps: u32,
 }
 
-/// A backend the core does not carry, opened for the kind it names.
-///
-/// [`run`] consults its providers before the core's own backends, so a
-/// provider for a kind the core also opens replaces it.
-pub struct Provider {
-    pub kind: BackendKind,
-    pub open: fn(&Path, &SessionOptions) -> Result<Box<dyn Backend>>,
-}
-
 /// Everything a binary's `main` does: argv in, exit code out, with a failure
 /// reported on stderr as `fatal: …`.
 pub fn run(providers: &[Provider]) -> ExitCode {
@@ -249,22 +240,18 @@ fn serve(providers: &[Provider]) -> Result<()> {
         return Ok(());
     }
 
-    // The embedder's own open refuses qnn and rknn too, but it runs after
-    // the detector's — which on qnn is a multi-second HTP graph compile. An
-    // argv combination that is going down either way should say so before
+    // Before the hello, as clap's own refusals are; `open_detector` resolves
+    // it again for the open.
+    infer::select(&args.backend, providers).context("--backend")?;
+    // `open_embedder` refuses qnn and any provider's name too, but it runs
+    // after the detector's open — on qnn a multi-second HTP graph compile.
+    // An argv combination that is going down either way should say so before
     // that, not after.
-    if args.embedder_model.is_some() {
-        match args.backend {
-            BackendKind::Ort => {}
-            BackendKind::Qnn => anyhow::bail!(
-                "the embedder does not run on qnn yet (no QDQ embedder artifact) \
-                 — drop --embedder-model or use --backend ort"
-            ),
-            kind @ BackendKind::Rknn => anyhow::bail!(
-                "the embedder runs on ort only, not {kind} — \
-                 drop --embedder-model or use --backend ort"
-            ),
-        }
+    if args.embedder_model.is_some() && embedder_backend(&args.backend)? == BackendKind::Qnn {
+        anyhow::bail!(
+            "the embedder does not run on qnn yet (no QDQ embedder artifact) \
+             — drop --embedder-model or use --backend ort"
+        );
     }
     // The early case, before the detector's open, of the refusal
     // `open_embedder` makes for any uint8-fed detector: the embedder crops
@@ -366,18 +353,17 @@ fn open_detector(args: &Args, labels: &Labels, providers: &[Provider]) -> Result
     let options = SessionOptions {
         qnn: qnn_options(args),
         io_quant: IoQuant::load_for(&args.model)?,
-        ..SessionOptions::default()
     };
-    match providers.iter().find(|p| p.kind == args.backend) {
-        Some(provider) => {
+    match infer::select(&args.backend, providers).context("--backend")? {
+        Selected::Provided(provider) => {
             let backend = (provider.open)(&args.model, &options)?;
-            // The startup line names the backend's own kind, so without this
-            // it would report a runtime `--backend` did not ask for.
-            if backend.kind() != provider.kind {
+            // The startup line names the backend's own descriptor, so without
+            // this it would report a runtime `--backend` did not ask for.
+            let opened = backend.descriptor().name;
+            if opened != provider.descriptor.name {
                 bail!(
-                    "the provider registered for --backend {} opened backend {}",
-                    provider.kind,
-                    backend.kind()
+                    "the provider registered for --backend {} opened backend {opened}",
+                    provider.descriptor.name,
                 );
             }
             Detector::with_backend(
@@ -390,9 +376,9 @@ fn open_detector(args: &Args, labels: &Labels, providers: &[Provider]) -> Result
                 options.io_quant.as_ref(),
             )
         }
-        None => Detector::open(
+        Selected::Core(kind) => Detector::open(
             &args.model,
-            args.backend,
+            kind,
             args.input_size,
             args.model_profile,
             labels,
@@ -535,10 +521,11 @@ fn run_single(args: &Args, providers: &[Provider]) -> Result<()> {
 /// boxes.
 ///
 /// The backend and its capabilities come from the opened [`Detector`], not from
-/// `args`: what ran is what this line should report. The capability half reads
-/// from the static table in `infer::backend`. The Elixir boards' `backends/0`
-/// tables mirror its fused-NMS and dynamic-shapes columns (their `artifact`
-/// is the `model:` key, not this table's format), and
+/// `args`: what ran is what this line should report. The capability half is
+/// the opened backend's static descriptor — this crate's in `infer::backend`,
+/// a board library's in its own crate. The Elixir boards' `backends/0`
+/// tables mirror their fused-NMS and dynamic-shapes columns (their `artifact`
+/// is the `model:` key, not the descriptor's extension), and
 /// `Cairn.Config.Profile.check_capabilities/5` enforces the fused-NMS one.
 fn model_summary(args: &Args, detector: &Detector) -> String {
     let spec = detector.input_spec();
@@ -650,7 +637,7 @@ fn open_embedder(args: &Args, labels: &Labels, spec: InputSpec) -> Result<Option
              — drop the embedder"
         );
     }
-    let embedder = Embedder::open(model, args.backend)?;
+    let embedder = Embedder::open(model, embedder_backend(&args.backend)?)?;
     if !labels.contains("person") {
         note!(
             "cairn-detect: --embedder-model is set but the label set has no \
@@ -658,6 +645,19 @@ fn open_embedder(args: &Args, labels: &Labels, spec: InputSpec) -> Result<Option
         );
     }
     Ok(Some(embedder))
+}
+
+/// The core backend the embedder opens on, by `--backend`'s name: its open
+/// reaches only this crate's backends, so a provider registered as `ort`
+/// leaves it on this crate's `ort`, and any other provider's name has none.
+fn embedder_backend(name: &str) -> Result<BackendKind> {
+    match infer::select(name, &[]) {
+        Ok(Selected::Core(kind)) => Ok(kind),
+        _ => bail!(
+            "the embedder runs on ort only, not {name} — \
+             drop --embedder-model or use --backend ort"
+        ),
+    }
 }
 
 /// The embedder's half of the `up:` line — `embedder=off` when none is
@@ -877,19 +877,28 @@ mod tests {
         assert_eq!(with("30").unwrap().sample_fps, 30);
     }
 
-    /// A provider replaces the core's backend of the same kind, and is
-    /// trusted for nothing but an open: one that hands back another kind's
+    /// A provider replaces the core's backend of the same name, and is
+    /// trusted for nothing but an open: one that hands back another
     /// backend is refused before the model is resolved.
     #[test]
-    fn a_provider_is_consulted_first_and_must_open_its_own_kind() {
-        use infer::{InputTensor, ModelIo, Tensors};
+    fn a_provider_is_consulted_first_and_must_open_its_own_backend() {
+        use infer::{Backend, Capabilities, Descriptor, InputTensor, ModelIo, Tensors};
+        use std::path::Path;
 
-        struct Fake(BackendKind, ModelIo);
+        static BOARD: Descriptor = Descriptor {
+            name: "board",
+            capabilities: Capabilities {
+                supports_fused_nms: false,
+                supports_dynamic_shapes: false,
+                artifact: ".board",
+            },
+        };
+        struct Fake(&'static Descriptor, ModelIo);
         impl Backend for Fake {
             fn open(_: &Path, _: &SessionOptions) -> Result<Self> {
                 unreachable!("built by the provider")
             }
-            fn kind(&self) -> BackendKind {
+            fn descriptor(&self) -> &'static Descriptor {
                 self.0
             }
             fn io(&self) -> &ModelIo {
@@ -899,9 +908,9 @@ mod tests {
                 unreachable!("refused before any run")
             }
         }
-        fn fake(kind: BackendKind, declared_input_size: Option<InputSize>) -> Box<dyn Backend> {
+        fn fake(declared_input_size: Option<InputSize>) -> Box<dyn Backend> {
             Box::new(Fake(
-                kind,
+                BackendKind::Ort.descriptor(),
                 ModelIo {
                     input_name: "images".to_string(),
                     declared_input_size,
@@ -914,10 +923,10 @@ mod tests {
             ))
         }
         fn mislabelled(_: &Path, _: &SessionOptions) -> Result<Box<dyn Backend>> {
-            Ok(fake(BackendKind::Ort, None))
+            Ok(fake(None))
         }
         fn ort_provider(_: &Path, _: &SessionOptions) -> Result<Box<dyn Backend>> {
-            Ok(fake(BackendKind::Ort, Some(InputSize::square(64))))
+            Ok(fake(Some(InputSize::square(64))))
         }
         let labels = Labels::load(None).unwrap();
         // Not `unwrap_err`: `Detector` has no `Debug`, deliberately.
@@ -933,28 +942,56 @@ mod tests {
             "--udp-port",
             "17000",
             "--backend",
-            "rknn",
+            "board",
         ])
         .unwrap();
         let msg = fail(
             &args,
             &[Provider {
-                kind: BackendKind::Rknn,
+                descriptor: &BOARD,
                 open: mislabelled,
             }],
         );
-        assert!(msg.contains("--backend rknn opened backend ort"), "{msg}");
+        assert!(msg.contains("--backend board opened backend ort"), "{msg}");
 
         // The core's ort backend would have failed on the missing file.
         let args = parse(&["--camera-id", "front", "--udp-port", "17000"]).unwrap();
         let msg = fail(
             &args,
             &[Provider {
-                kind: BackendKind::Ort,
+                descriptor: BackendKind::Ort.descriptor(),
                 open: ort_provider,
             }],
         );
         assert!(msg.contains("has no outputs"), "{msg}");
+
+        // Without its provider the name is no backend at all, refused before
+        // any model access.
+        let args = parse(&[
+            "--camera-id",
+            "front",
+            "--udp-port",
+            "17000",
+            "--backend",
+            "board",
+        ])
+        .unwrap();
+        let msg = fail(&args, &[]);
+        assert!(
+            msg.contains("--backend: backend \"board\" is not one this build carries (ort, qnn)"),
+            "{msg}"
+        );
+    }
+
+    /// The embedder opens on this crate's backends only, and follows
+    /// `--backend` by name.
+    #[test]
+    fn the_embedder_backend_is_a_core_one_or_refused() {
+        assert_eq!(embedder_backend("ort").unwrap(), BackendKind::Ort);
+        assert_eq!(embedder_backend("qnn").unwrap(), BackendKind::Qnn);
+        let msg = embedder_backend("board").unwrap_err().to_string();
+        assert!(msg.contains("ort only, not board"), "{msg}");
+        assert!(msg.contains("--embedder-model"), "{msg}");
     }
 
     /// Refused on the spec alone, before the embedder's model is touched —

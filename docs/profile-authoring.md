@@ -259,7 +259,7 @@ Two consequences worth an operator's attention:
 
 | field | menu | where the menu lives |
 |---|---|---|
-| `backend` | `ort`, `qnn` | the release's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors `BackendKind`'s ort and qnn rows, `plugins/cairn-detect/src/infer/backend.rs`, and the Rockchip board's carries rknn's |
+| `backend` | `ort`, `qnn` | the release's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors the `ORT` and `QNN` descriptors in `plugins/cairn-detect/src/infer/backend.rs`, and the Rockchip board's the `RKNN` descriptor in its own crate |
 | `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr`, `yolov8split`, `yolo26split` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the release's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
@@ -408,7 +408,7 @@ against.
 
 The release's board carries a static table of what each backend accepts
 (`Cairn.Stage.Board.backends/0`), each row a mirror of its
-`BackendKind::capabilities` row on the Rust side. It is static because
+backend's `Descriptor` on the Rust side. It is static because
 config load has to answer these questions before the engine has loaded a
 model and, for a board profile written ahead of its hardware, with no such
 device attached.

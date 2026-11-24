@@ -184,10 +184,10 @@ impl QuantParams {
 /// interleaves each pixel's three channels.
 ///
 /// A property of the runtime that opened the model, not of the family — one
-/// set of weights compiled for onnxruntime and for RKNN takes NCHW float on
-/// the first and NHWC uint8 on the second. No `Default`, so every site that
-/// builds an [`InputSpec`](super::InputSpec) names one; the one a packer reads
-/// is always a backend's report.
+/// set of weights compiled for onnxruntime and for a board's NPU runtime can
+/// take NCHW float on the first and NHWC uint8 on the second. No `Default`,
+/// so every site that builds an [`InputSpec`](super::InputSpec) names one;
+/// the one a packer reads is always a backend's report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorLayout {
     Nchw,

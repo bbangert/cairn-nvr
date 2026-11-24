@@ -135,7 +135,7 @@ A second board, `boards/cairn_foo`, needs:
 5. In `.github/workflows/container.yml`: the `board` option and its add-on mapping, with a `deploy/vagus-addon/<addon>/config.yaml`.
 6. In CI: an entry in the sobelow and dialyzer matrices, a test job compiled with `CAIRN_BOARD=foo`, a job for the library standing alone, and the five Rust gates for its crate.
 
-A board that brings a new backend name also touches shared code, and this is where the separation is incomplete. `BackendKind` in `plugins/cairn-detect` enumerates backends, `Rknn` among them. The base treats every backend but `ort` as experimental. And a backend's model verdicts live in the base's profile catalog, keyed on the backend's name, as `rknn_conversion` does.
+A board that brings a new backend registers it from its own crate: a `Descriptor` (name and capabilities) and a `Provider` that opens it, handed to `cairn_detect::cli::run` by its probe binary and to `Engine::with_provider` by its NIF. `plugins/cairn-detect` names only the backends it opens itself, `ort` and `qnn`. The separation is still incomplete in the Elixir base: it treats every backend but `ort` as experimental. And a backend's model verdicts live in the base's profile catalog, keyed on the backend's name, as `rknn_conversion` does.
 
 ## The ring buffer
 

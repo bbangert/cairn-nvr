@@ -3,11 +3,9 @@
 //! This crate carries two backends, and both are onnxruntime sessions:
 //! [`onnxruntime::OrtBackend`] on the CPU execution provider and
 //! [`onnxruntime::QnnBackend`] on Qualcomm's HTP via the QNN plugin execution
-//! provider. The third name in [`BackendKind`], `rknn`, is a runtime a board
-//! library provides: it implements [`Backend`] in its own crate and hands the
-//! open backend to [`Detector::with_backend`](super::Detector::with_backend).
-//! A build without that library refuses the name at
-//! [`Detector::open`](super::Detector::open).
+//! provider. Any other runtime is a board library's: it implements [`Backend`]
+//! in its own crate and registers a [`Provider`] under its own name, which
+//! [`select`] resolves before this crate's names.
 //!
 //! No SDK type appears in a signature here. A backend reports its model as
 //! [`ModelIo`] — a name, a size, a batch, the input's element kind, the uint8
@@ -32,8 +30,7 @@ pub(super) mod onnxruntime;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use clap::ValueEnum;
+use anyhow::{bail, Result};
 
 use super::encoding::{TensorLayout, TensorValues};
 use super::geometry::InputSize;
@@ -41,106 +38,92 @@ use super::heads::Raw;
 use super::qparams::IoQuant;
 use super::resolve::Declared;
 
-/// Which runtime executes the model.
+/// The backends this crate opens itself.
 ///
-/// `rknn` is accepted by `--backend` everywhere and executes only where a
-/// board library hands its backend to
-/// [`Detector::with_backend`](super::Detector::with_backend); this crate's own
-/// [`Detector::open`](super::Detector::open) rejects it. Parsing it is the
-/// point: the host already refuses to run a group on a non-`ort` profile unless the
-/// profile declares `experimental: true` *and* the group sets
-/// `allow_experimental: true` (`Cairn.Config.check_backend_implemented/3`), and
-/// this is the belt to that suspender — a name that reached the plugin anyway
-/// stops here with a message about the backend, instead of being a clap usage
-/// error the operator reads as a typo in the flag. `qnn` executes, but stays
-/// behind the same host-side experimental gate until it has soaked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// A board's backend is never a value of this type, only a [`Provider`], so
+/// [`Detector::open`](super::Detector::open) cannot be handed a runtime this
+/// crate does not carry. `qnn` executes, but stays behind the host's
+/// experimental gate (`Cairn.Config.check_backend_implemented/3`) until it
+/// has soaked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     /// onnxruntime, CPU execution provider.
     Ort,
-    /// Rockchip NPU (rk3566/rk3576) via librknnrt, from a board library.
-    Rknn,
     /// Qualcomm HTP via onnxruntime's QNN plugin execution provider. Needs
     /// `--qnn-library` and a full-op-coverage QDQ model.
     Qnn,
 }
 
-impl fmt::Display for BackendKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Ort => "ort",
-            Self::Rknn => "rknn",
-            Self::Qnn => "qnn",
-        })
-    }
-}
-
 impl BackendKind {
-    /// What this backend accepts, as static data.
-    ///
-    /// Static because profile validation on the Elixir side has to answer the
-    /// same questions at config load, with no plugin running and possibly no
-    /// such hardware attached. Each board's `backends/0` mirrors the rows of
-    /// this table for the backends it runs (`Cairn.Board.Generic`: `ort` and
-    /// `qnn`; `Cairn.Rockchip.Board`: `ort` and `rknn`): `fused_nms` feeds
-    /// `Cairn.Config.Profile`'s `check_capabilities` rule, `artifact` picks
-    /// the `model:` key a profile is read by, and `dynamic_shapes` is mirrored
-    /// but read by no rule on either side (an `input_size:` disagreeing with a
-    /// compiled artifact is a fact about a file the host cannot open — the
-    /// authoring guide carries it instead). Every copy is a claim about the
-    /// runtime, not an observation of it — see the per-row notes for which are
-    /// established and which are conservative readings.
-    pub(super) fn capabilities(self) -> Capabilities {
+    const ALL: [Self; 2] = [Self::Ort, Self::Qnn];
+
+    pub fn descriptor(self) -> &'static Descriptor {
         match self {
-            // Both yes, and both load-bearing in this crate rather than
-            // inferred: every RF-DETR export leaves its spatial dims dynamic
-            // and ort runs them (that is why `--input-size` exists), and
-            // onnxruntime implements the ONNX `NonMaxSuppression` op on CPU, so
-            // an export with the head fused in loads. No shipped profile feeds
-            // it one — `catalog` pairs every grid family with `DEFAULT_NMS`,
-            // i.e. host-side suppression in `heads` — so this flag says what
-            // the backend would accept, not what cairn sends it.
-            Self::Ort => Capabilities {
-                supports_fused_nms: true,
-                supports_dynamic_shapes: true,
-                artifact: ArtifactFormat::Onnx,
-            },
-            // Dynamic shapes: rknn-toolkit2 compiles to a fixed input geometry,
-            // so there is nothing to leave dynamic. Fused NMS is the
-            // conservative reading: `docs/npu-backends.md` establishes the
-            // ban for QNN only, and no source it cites puts an NMS op on the
-            // RKNN NPU either. Refusing an export we may not be able to run
-            // costs an operator a profile edit; accepting one that silently
-            // does not run costs a deployment.
-            Self::Rknn => Capabilities {
-                supports_fused_nms: false,
-                supports_dynamic_shapes: false,
-                artifact: ArtifactFormat::Rknn,
-            },
-            // Both established in `docs/npu-backends.md`: the NMS operator
-            // is not in QNN's supported op list, and HTP takes no dynamic
-            // shapes. The artifact is still `.onnx` — QNN is an onnxruntime
-            // execution provider, and what changes is that the graph must be
-            // quantized to QDQ, which is a property of the export rather than
-            // of the file format. The host's profile schema nonetheless keys
-            // QNN's artifact separately from ort's (`model.qnn:` against
-            // `model.onnx:`, `Cairn.Config.Profile`): a QDQ graph is a
-            // different *file* from the fp32 export, and which file to load is
-            // a different question from what format it is in. Neither is a
-            // stale copy of the other.
-            Self::Qnn => Capabilities {
-                supports_fused_nms: false,
-                supports_dynamic_shapes: false,
-                artifact: ArtifactFormat::Onnx,
-            },
+            Self::Ort => &ORT,
+            Self::Qnn => &QNN,
         }
     }
 }
 
-/// What a backend accepts. See [`BackendKind::capabilities`] for where the
-/// values come from and why they are a table rather than a probe.
+/// A backend's name and what it accepts, as static data.
+///
+/// Static because profile validation on the Elixir side has to answer the
+/// same questions at config load, with no plugin running and possibly no
+/// such hardware attached. Each board's `backends/0` mirrors the descriptors
+/// of the backends it runs — [`ORT`] and [`QNN`] here, a board library's in
+/// its own crate (`Cairn.Board.Generic` runs `ort` and `qnn`): `fused_nms` feeds
+/// `Cairn.Config.Profile`'s `check_capabilities` rule, `artifact` picks
+/// the `model:` key a profile is read by, and `dynamic_shapes` is mirrored
+/// but read by no rule on either side (an `input_size:` disagreeing with a
+/// compiled artifact is a fact about a file the host cannot open — the
+/// authoring guide carries it instead). Every copy is a claim about the
+/// runtime, not an observation of it — see the per-backend notes for which
+/// are established and which are conservative readings.
+#[derive(Debug)]
+pub struct Descriptor {
+    /// What `--backend` and the NIF config's `backend` call it.
+    pub name: &'static str,
+    pub capabilities: Capabilities,
+}
+
+// Both yes, and both load-bearing in this crate rather than inferred: every
+// RF-DETR export leaves its spatial dims dynamic and ort runs them (that is
+// why `--input-size` exists), and onnxruntime implements the ONNX
+// `NonMaxSuppression` op on CPU, so an export with the head fused in loads.
+// No shipped profile feeds it one — `catalog` pairs every grid family with
+// `DEFAULT_NMS`, i.e. host-side suppression in `heads` — so this flag says
+// what the backend would accept, not what cairn sends it.
+static ORT: Descriptor = Descriptor {
+    name: "ort",
+    capabilities: Capabilities {
+        supports_fused_nms: true,
+        supports_dynamic_shapes: true,
+        artifact: ".onnx",
+    },
+};
+
+// Both established in `docs/npu-backends.md`: the NMS operator is not in
+// QNN's supported op list, and HTP takes no dynamic shapes. The artifact is
+// still `.onnx` — QNN is an onnxruntime execution provider, and what changes
+// is that the graph must be quantized to QDQ, which is a property of the
+// export rather than of the file format. The host's profile schema
+// nonetheless keys QNN's artifact separately from ort's (`model.qnn:` against
+// `model.onnx:`, `Cairn.Config.Profile`): a QDQ graph is a different *file*
+// from the fp32 export, and which file to load is a different question from
+// what format it is in. Neither is a stale copy of the other.
+static QNN: Descriptor = Descriptor {
+    name: "qnn",
+    capabilities: Capabilities {
+        supports_fused_nms: false,
+        supports_dynamic_shapes: false,
+        artifact: ".onnx",
+    },
+};
+
+/// What a backend accepts. See [`Descriptor`] for where the values come from
+/// and why they are a table rather than a probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Capabilities {
+pub struct Capabilities {
     /// Whether a model whose export fuses the NMS op into the graph will run.
     /// `false` means that family must be paired with a head that needs no NMS,
     /// or with a decode that does it host-side.
@@ -149,8 +132,12 @@ pub(super) struct Capabilities {
     /// symbolic. `false` means the artifact's geometry is fixed at compile
     /// time and `--input-size` can only agree with it.
     pub supports_dynamic_shapes: bool,
-    /// The compiled artifact a profile must point this backend at.
-    pub artifact: ArtifactFormat,
+    /// The extension of the compiled artifact a profile must point this
+    /// backend at, dot included. A profile names one artifact per backend
+    /// rather than one model: a runtime's own format is compiled from an
+    /// `.onnx` by a host-side toolchain, so the two are different files
+    /// describing the same trained weights.
+    pub artifact: &'static str,
 }
 
 impl fmt::Display for Capabilities {
@@ -169,24 +156,47 @@ impl fmt::Display for Capabilities {
     }
 }
 
-/// The compiled model file a backend loads.
+/// A backend this crate does not carry, under the name its descriptor gives.
 ///
-/// A profile names one artifact per backend rather than one model: an `.rknn`
-/// is produced from an `.onnx` by a host-side toolchain, so the two are
-/// different files describing the same trained weights.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ArtifactFormat {
-    Onnx,
-    Rknn,
+/// [`select`] consults providers before this crate's own names, so a provider
+/// named `ort` or `qnn` replaces that backend.
+pub struct Provider {
+    pub descriptor: &'static Descriptor,
+    pub open: fn(&Path, &SessionOptions) -> Result<Box<dyn Backend>>,
 }
 
-impl fmt::Display for ArtifactFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Onnx => ".onnx",
-            Self::Rknn => ".rknn",
-        })
+/// What a backend name resolved to.
+pub enum Selected<'a> {
+    Provided(&'a Provider),
+    Core(BackendKind),
+}
+
+/// `name` is `--backend` or the NIF config's `backend`, as sent.
+///
+/// The host refuses a non-`ort` profile at config load unless the profile and
+/// its group both acknowledge it as experimental, so a miss here is a name
+/// that got this far anyway: the error lists what this build runs, so it reads
+/// as a backend the build lacks rather than as a mistyped flag.
+pub fn select<'a>(name: &str, providers: &'a [Provider]) -> Result<Selected<'a>> {
+    if let Some(provider) = providers.iter().find(|p| p.descriptor.name == name) {
+        return Ok(Selected::Provided(provider));
     }
+    if let Some(kind) = BackendKind::ALL
+        .into_iter()
+        .find(|kind| kind.descriptor().name == name)
+    {
+        return Ok(Selected::Core(kind));
+    }
+    let mut known: Vec<&str> = providers.iter().map(|p| p.descriptor.name).collect();
+    for kind in BackendKind::ALL {
+        if !known.contains(&kind.descriptor().name) {
+            known.push(kind.descriptor().name);
+        }
+    }
+    bail!(
+        "backend {name:?} is not one this build carries ({})",
+        known.join(", ")
+    )
 }
 
 /// Per-backend session settings, handed whole to [`Backend::open`] so a backend
@@ -195,13 +205,12 @@ impl fmt::Display for ArtifactFormat {
 /// There is no `ort` group: the only session setting the ort backend makes
 /// is the CPU execution provider, which is not a profile knob and has
 /// nothing to configure. The `qnn` group is read by
-/// [`onnxruntime::QnnBackend`]; `rknn` is read by a board library's backend,
-/// and nothing in this crate fills it — the CLI has no flag for it, so it
-/// arrives at its default.
+/// [`onnxruntime::QnnBackend`]. A board library's backend takes its own
+/// settings outside this struct (its NIF's arguments, its environment), so
+/// of this it reads `io_quant` at most.
 #[derive(Debug, Default, Clone)]
 pub struct SessionOptions {
     pub qnn: QnnOptions,
-    pub rknn: RknnOptions,
     /// The uint8-IO artifact's edge qparams (`<model>.qparams.json`), `None`
     /// for the ordinary float-IO contract. At the session level this carries
     /// two obligations: the backend dequantizes the outputs it names, and a
@@ -239,15 +248,6 @@ pub struct QnnOptions {
     pub vtcm_mb: Option<u32>,
 }
 
-/// Rockchip NPU knobs, per librknnrt.
-#[derive(Debug, Default, Clone)]
-pub struct RknnOptions {
-    /// Which NPU core(s) the model is bound to, as librknnrt's core mask. The
-    /// runtime is sequential per model (`docs/npu-backends.md`), so this
-    /// spreads *models* across cores and never one model's frames.
-    pub core_mask: Option<u32>,
-}
-
 /// What the bytes of a model's input are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputElement {
@@ -258,7 +258,8 @@ pub enum InputElement {
     /// are what make the packer emit the codes.
     U8Codes,
     /// The frame's own bytes, in the profile encoding's channel order: the
-    /// artifact folds its normalisation and quantisation in (an `.rknn`).
+    /// artifact folds its normalisation and quantisation in, as a board
+    /// runtime's compiled format can.
     /// A sidecar input entry is refused as belonging to some other artifact.
     ///
     /// The bytes go through the quantized packer under
@@ -381,12 +382,12 @@ pub trait Backend: Send {
     where
         Self: Sized;
 
-    /// Which backend this is — the value `--backend` named.
+    /// Which backend this is, and what it accepts.
     ///
-    /// Capabilities are deliberately NOT a trait method: they live on
-    /// [`BackendKind::capabilities`] alone, so an implementation has no way
-    /// to report something its kind's row denies.
-    fn kind(&self) -> BackendKind;
+    /// Nothing checks that the capabilities a backend reports are true of its
+    /// runtime; a provided backend's name is checked against the one its
+    /// [`Provider`] registered.
+    fn descriptor(&self) -> &'static Descriptor;
 
     /// The model's inputs and outputs as settled at [`Backend::open`].
     fn io(&self) -> &ModelIo;
@@ -408,14 +409,61 @@ pub trait Tensors {
 mod tests {
     use super::*;
 
-    #[test]
-    fn backend_names_round_trip_through_clap() {
-        for kind in [BackendKind::Ort, BackendKind::Rknn, BackendKind::Qnn] {
-            let rendered = kind.to_string();
-            let parsed = BackendKind::from_str(&rendered, true)
-                .unwrap_or_else(|e| panic!("clap does not accept {rendered:?}: {e}"));
-            assert_eq!(parsed, kind, "--backend {rendered} parsed as {parsed}");
+    fn provider(descriptor: &'static Descriptor) -> Provider {
+        Provider {
+            descriptor,
+            open: |_, _| unreachable!("select never opens"),
         }
+    }
+
+    static BOARD: Descriptor = Descriptor {
+        name: "board",
+        capabilities: Capabilities {
+            supports_fused_nms: false,
+            supports_dynamic_shapes: false,
+            artifact: ".board",
+        },
+    };
+
+    static BOARD_ORT: Descriptor = Descriptor {
+        name: "ort",
+        capabilities: ORT.capabilities,
+    };
+
+    #[test]
+    fn select_answers_a_provider_first_then_the_core_names() {
+        let providers = [provider(&BOARD), provider(&BOARD_ORT)];
+        let provided = |name| match select(name, &providers) {
+            Ok(Selected::Provided(p)) => p.descriptor as *const Descriptor,
+            _ => panic!("{name} was not answered by its provider"),
+        };
+        assert_eq!(provided("board"), &BOARD as *const _);
+        assert_eq!(provided("ort"), &BOARD_ORT as *const _);
+
+        for kind in BackendKind::ALL {
+            match select(kind.descriptor().name, &[]) {
+                Ok(Selected::Core(selected)) => assert_eq!(selected, kind),
+                _ => panic!("{} did not select the core backend", kind.descriptor().name),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_name_is_refused_naming_every_backend_the_build_carries() {
+        let err = match select("tensorrt", &[provider(&BOARD), provider(&BOARD_ORT)]) {
+            Ok(_) => panic!("an unknown name selected a backend"),
+            Err(err) => err.to_string(),
+        };
+        assert_eq!(
+            err,
+            r#"backend "tensorrt" is not one this build carries (board, ort, qnn)"#
+        );
+        // A provider's name means nothing to a build without it.
+        let err = match select("board", &[]) {
+            Ok(_) => panic!("a provider's name selected without the provider"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.ends_with("(ort, qnn)"), "{err}");
     }
 
     /// The rules `docs/npu-backends.md` turns into profile validation, in
@@ -423,41 +471,37 @@ mod tests {
     /// what a profile may declare, not a refactor.
     #[test]
     fn capability_table_matches_the_researched_rules() {
-        let ort = BackendKind::Ort.capabilities();
+        assert_eq!(BackendKind::Ort.descriptor().name, "ort");
+        let ort = BackendKind::Ort.descriptor().capabilities;
         assert!(ort.supports_fused_nms);
         assert!(ort.supports_dynamic_shapes);
-        assert_eq!(ort.artifact, ArtifactFormat::Onnx);
+        assert_eq!(ort.artifact, ".onnx");
 
         // QNN: no NMS op on HTP, no dynamic shapes, still an ONNX artifact
         // because QNN is an onnxruntime execution provider.
-        let qnn = BackendKind::Qnn.capabilities();
+        assert_eq!(BackendKind::Qnn.descriptor().name, "qnn");
+        let qnn = BackendKind::Qnn.descriptor().capabilities;
         assert!(!qnn.supports_fused_nms);
         assert!(!qnn.supports_dynamic_shapes);
-        assert_eq!(qnn.artifact, ArtifactFormat::Onnx);
-
-        // RKNN: its own compiled artifact, fixed geometry.
-        let rknn = BackendKind::Rknn.capabilities();
-        assert!(!rknn.supports_fused_nms);
-        assert!(!rknn.supports_dynamic_shapes);
-        assert_eq!(rknn.artifact, ArtifactFormat::Rknn);
+        assert_eq!(qnn.artifact, ".onnx");
     }
 
     #[test]
     fn capabilities_render_every_field() {
         assert_eq!(
-            BackendKind::Ort.capabilities().to_string(),
+            ORT.capabilities.to_string(),
             "artifact=.onnx fused-nms=yes dynamic-shapes=yes"
         );
         assert_eq!(
-            BackendKind::Rknn.capabilities().to_string(),
-            "artifact=.rknn fused-nms=no dynamic-shapes=no"
+            QNN.capabilities.to_string(),
+            "artifact=.onnx fused-nms=no dynamic-shapes=no"
         );
-        // No real row mixes its booleans, so the two table rows above would
-        // also pass a Display that swapped the fields; this one would not.
+        // No real row mixes its booleans, so the two rows above would also
+        // pass a Display that swapped the fields; this one would not.
         let mixed = Capabilities {
             supports_fused_nms: false,
             supports_dynamic_shapes: true,
-            artifact: ArtifactFormat::Onnx,
+            artifact: ".onnx",
         };
         assert_eq!(
             mixed.to_string(),

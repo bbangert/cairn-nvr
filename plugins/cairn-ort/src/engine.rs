@@ -17,11 +17,11 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard};
 
-use cairn_detect::cli::Provider;
 use cairn_detect::decode::ModelInput;
 use cairn_detect::emit::Det;
 use cairn_detect::infer::{
-    self, Detector, Embedder, InputSpec, IoQuant, Labels, ScoreFloors, SessionOptions, TensorLayout,
+    self, BackendKind, Detector, Embedder, InputSpec, IoQuant, Labels, Provider, ScoreFloors,
+    Selected, SessionOptions, TensorLayout,
 };
 use cairn_detect::note;
 
@@ -50,6 +50,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn open(config: InitConfig) -> Result<Self> {
+        let backend = core_backend(&config.backend)?;
         let labels = Labels::load(config.labels.as_deref())
             .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
         // Deliberately no sidecar load on the core backends: their uint8-IO
@@ -80,7 +81,7 @@ impl Engine {
         }
         let detector = Detector::open(
             &config.model,
-            config.backend,
+            backend,
             config.input_size,
             config.model_profile,
             &labels,
@@ -93,34 +94,36 @@ impl Engine {
     }
 
     /// An engine on a board library's backend: what the binary's
-    /// `cli::run(&[provider])` opens for `--backend <provider.kind>`.
+    /// `cli::run(&[provider])` opens for `--backend <provider.descriptor.name>`.
     ///
-    /// The library serves that one kind, so any other `backend` is refused
+    /// The library serves that one backend, so any other `backend` is refused
     /// rather than opened on the core's backends — a host sending one here has
     /// routed it to the wrong library. The sidecar is loaded and checked as
     /// the binary loads it: whether one may sit next to the artifact is the
     /// backend's input contract to decide ([`Detector::with_backend`]).
     pub fn with_provider(config: InitConfig, provider: &Provider) -> Result<Self> {
-        if config.backend != provider.kind {
-            return Err(NativeError::Config(format!(
-                "this library's engine runs {}; backend {} is served by CairnOrt",
-                provider.kind, config.backend
-            )));
+        let runs = provider.descriptor.name;
+        if config.backend != runs {
+            let wanted = &config.backend;
+            return Err(NativeError::Config(match infer::select(wanted, &[]) {
+                Ok(_) => format!(
+                    "this library's engine runs {runs}; backend {wanted} is served by CairnOrt"
+                ),
+                Err(_) => format!("backend: this library's engine runs {runs}, not {wanted:?}"),
+            }));
         }
         let model_load = |e: anyhow::Error| NativeError::ModelLoad(chain(&e));
         let labels = Labels::load(config.labels.as_deref()).map_err(model_load)?;
         let options = SessionOptions {
             qnn: config.qnn.clone(),
             io_quant: IoQuant::load_for(&config.model).map_err(model_load)?,
-            ..SessionOptions::default()
         };
         let backend = (provider.open)(&config.model, &options).map_err(model_load)?;
-        // The `up:` line names the backend's own kind.
-        if backend.kind() != provider.kind {
+        // The `up:` line names the backend's own descriptor.
+        let opened = backend.descriptor().name;
+        if opened != runs {
             return Err(NativeError::ModelLoad(format!(
-                "the provider for backend {} opened backend {}",
-                provider.kind,
-                backend.kind()
+                "the provider for backend {runs} opened backend {opened}"
             )));
         }
         let detector = Detector::with_backend(
@@ -158,7 +161,7 @@ impl Engine {
                         input_spec.layout
                     )));
                 }
-                let embedder = Embedder::open(path, config.backend)
+                let embedder = Embedder::open(path, core_backend(&config.backend)?)
                     .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
                 if !labels.contains("person") {
                     note!(
@@ -263,6 +266,16 @@ impl Engine {
     }
 }
 
+/// `name` as one of the backends `cairn-detect` opens itself, refused as
+/// config before any model access.
+fn core_backend(name: &str) -> Result<BackendKind> {
+    match infer::select(name, &[]) {
+        Ok(Selected::Core(kind)) => Ok(kind),
+        Ok(Selected::Provided(_)) => unreachable!("`select` was handed no providers"),
+        Err(error) => Err(NativeError::Config(format!("backend: {}", chain(&error)))),
+    }
+}
+
 /// Median CPU-side model-pass latency, milliseconds: the number
 /// `Cairn.Native.Health`'s D-P5 ratio compares an accelerator's own pass
 /// latency against. Opens a second [`Detector`] on `BackendKind::Ort` — never
@@ -354,19 +367,19 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_detect::infer::{BackendKind, QnnOptions};
+    use cairn_detect::infer::QnnOptions;
     use std::path::PathBuf;
 
     /// The pass-count bound must fire before any model access — proven here by
     /// a model path that does not exist, the same technique
-    /// `a_board_backend_this_build_lacks_is_refused_before_any_model_access` in
+    /// `qnn_without_library_is_refused_before_any_model_access` in
     /// `cairn-detect` uses.
     #[cfg(feature = "nif")]
     #[test]
     fn cpu_baseline_ms_refuses_a_bad_pass_count_before_any_model_access() {
         let config = InitConfig {
             model: PathBuf::from("does/not/exist"),
-            backend: BackendKind::Ort,
+            backend: "ort".into(),
             model_profile: None,
             input_size: None,
             labels: None,
@@ -385,7 +398,8 @@ mod tests {
         use crate::config::RawStreamParams;
         use crate::stream::{Frame, Stream};
         use cairn_detect::infer::{
-            Backend, Declared, InputElement, InputSize, InputTensor, ModelIo, Raw, Tensors,
+            Backend, Capabilities, Declared, Descriptor, InputElement, InputSize, InputTensor,
+            ModelIo, Raw, Tensors,
         };
         use std::collections::HashMap;
         use std::path::Path;
@@ -394,8 +408,17 @@ mod tests {
 
         const SIZE: InputSize = InputSize { w: 96, h: 64 };
 
-        /// A yolox-shaped 96x64 model that takes pixel bytes NHWC, as an
-        /// `.rknn` does, and outputs zeros. `run` refuses any tensor but
+        static BOARD: Descriptor = Descriptor {
+            name: "board",
+            capabilities: Capabilities {
+                supports_fused_nms: false,
+                supports_dynamic_shapes: false,
+                artifact: ".board",
+            },
+        };
+
+        /// A yolox-shaped 96x64 model that takes pixel bytes NHWC, as a
+        /// board runtime's compiled artifact can, and outputs zeros. `run` refuses any tensor but
         /// [`rgb`]'s pixels with each one's channels reversed — the sniffed
         /// yolox profile is raw BGR — so a pass that returns proves what
         /// reached the backend, byte for byte.
@@ -433,8 +456,8 @@ mod tests {
                     output: vec![0.0; 126 * 85],
                 })
             }
-            fn kind(&self) -> BackendKind {
-                BackendKind::Rknn
+            fn descriptor(&self) -> &'static Descriptor {
+                &BOARD
             }
             fn io(&self) -> &ModelIo {
                 &self.io
@@ -457,15 +480,15 @@ mod tests {
 
         fn provider() -> Provider {
             Provider {
-                kind: BackendKind::Rknn,
+                descriptor: &BOARD,
                 open: |model, options| Ok(Box::new(PixelBytes::open(model, options)?)),
             }
         }
 
         fn config(embedder_model: Option<&str>) -> InitConfig {
             InitConfig {
-                model: PathBuf::from("does/not/exist.rknn"),
-                backend: BackendKind::Rknn,
+                model: PathBuf::from("does/not/exist.board"),
+                backend: "board".into(),
                 model_profile: None,
                 input_size: None,
                 labels: None,
@@ -545,7 +568,7 @@ mod tests {
             std::fs::write(IoQuant::sidecar_path(&model), "{}").unwrap();
             let opened = Engine::open(InitConfig {
                 model,
-                backend: BackendKind::Ort,
+                backend: "ort".into(),
                 ..config(None)
             });
             std::fs::remove_dir_all(&dir).unwrap();
@@ -555,6 +578,50 @@ mod tests {
             };
             assert_eq!(error.reason(), "model_load");
             assert!(error.message().contains("qparams sidecar"), "{error:?}");
+        }
+
+        /// Each constructor refuses a backend it does not run as config, before
+        /// any model access: [`Engine::open`] a board's name or an unknown one,
+        /// [`Engine::with_provider`] a core name or an unknown one.
+        #[test]
+        fn a_backend_the_constructor_does_not_run_is_config_before_any_load() {
+            for backend in ["board", "tensorrt"] {
+                let error = match Engine::open(InitConfig {
+                    backend: backend.into(),
+                    ..config(None)
+                }) {
+                    Ok(_) => panic!("{backend} opened on the core backends"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.reason(), "config", "{backend}");
+                assert!(
+                    error.message().starts_with(&format!(
+                        r#"backend: backend "{backend}" is not one this build carries (ort, qnn)"#
+                    )),
+                    "{error:?}"
+                );
+            }
+
+            for (backend, refusal) in [
+                ("ort", "runs board; backend ort is served by CairnOrt"),
+                (
+                    "tensorrt",
+                    r#"backend: this library's engine runs board, not "tensorrt""#,
+                ),
+            ] {
+                let error = match Engine::with_provider(
+                    InitConfig {
+                        backend: backend.into(),
+                        ..config(None)
+                    },
+                    &provider(),
+                ) {
+                    Ok(_) => panic!("{backend} opened on the board provider"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.reason(), "config", "{backend}");
+                assert!(error.message().contains(refusal), "{error:?}");
+            }
         }
     }
 
