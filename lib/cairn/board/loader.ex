@@ -42,8 +42,8 @@ defmodule Cairn.Board.Loader do
   The board for `Cairn.Board.module/0`: attached, `:none` when
   `CAIRN_BOARD_DIR` is unset or empty, else attached now. This answer is
   remembered: `board/0` reads the variable once, and returns a failed attach
-  on every later call rather than retrying it. `attach/0` and `attach/1`
-  remember only a success.
+  on every later call rather than retrying it. `attach/1` remembers only a
+  success.
   """
   @spec board() :: {:ok, module()} | :none | {:error, String.t()}
   def board do
@@ -79,13 +79,22 @@ defmodule Cairn.Board.Loader do
     reply(state)
   end
 
-  @doc "`attach/1` on `CAIRN_BOARD_DIR`; `:ok` when it is unset or empty."
+  @doc """
+  `attach/1` on `CAIRN_BOARD_DIR`; `:ok` when it is unset or empty, which it
+  records, so that after a boot `board/0` never resolves, or locks, inside a
+  child's `init/1`.
+  """
   @spec attach() :: :ok | {:error, String.t()}
   def attach do
     case env_dir() do
-      nil -> :ok
+      nil -> serialised(&no_board/0)
       dir -> attach(dir)
     end
+  end
+
+  defp no_board do
+    if :persistent_term.get(@key, nil) == nil, do: :persistent_term.put(@key, :none)
+    :ok
   end
 
   @spec attach(Path.t()) :: :ok | {:error, String.t()}

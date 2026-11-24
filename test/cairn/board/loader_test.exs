@@ -98,12 +98,19 @@ defmodule Cairn.Board.LoaderTest do
   end
 
   describe "attach/0" do
-    test "does nothing with CAIRN_BOARD_DIR unset or empty" do
-      System.delete_env("CAIRN_BOARD_DIR")
+    test "records no board with CAIRN_BOARD_DIR unset or empty", %{tmp_dir: tmp} do
+      for set <- [&System.delete_env/1, &System.put_env(&1, "")] do
+        :persistent_term.erase(@key)
+        set.("CAIRN_BOARD_DIR")
+        assert :ok = Loader.attach()
+        assert :persistent_term.get(@key, nil) == :none
+      end
+
+      # A recorded "none" is not a refusal: a later attach/1 still attaches.
+      %{dir: dir, board: board} = board_dir(tmp)
+      assert :ok = Loader.attach(dir)
       assert :ok = Loader.attach()
-      System.put_env("CAIRN_BOARD_DIR", "")
-      assert :ok = Loader.attach()
-      assert :persistent_term.get(@key, nil) == nil
+      assert Cairn.Board.module() == board
     end
 
     test "attaches CAIRN_BOARD_DIR", %{tmp_dir: tmp} do
