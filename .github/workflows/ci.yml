@@ -18,6 +18,9 @@ jobs:
     # Elixir gates run as parallel jobs below, each with its own cache key.
     # The Rust crates have their own toolchain and their own gates — see the
     # `cairn-detect` job below.
+    #
+    # Every setup-beam step installs the exact versions in mise.toml, so a
+    # toolchain move is one edit there plus the Dockerfile's ARGs.
 
     steps:
       - uses: actions/checkout@v7
@@ -25,8 +28,11 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
+
+      - name: Toolchain matches the image
+        run: tools/ci/check-toolchain.sh
 
       - name: Cache deps and build
         uses: actions/cache@v6
@@ -54,8 +60,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - name: Cache deps and build
         uses: actions/cache@v6
@@ -87,8 +93,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - name: Cache deps and build
         uses: actions/cache@v6
@@ -124,8 +130,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - name: Cache deps and build
         uses: actions/cache@v6
@@ -159,8 +165,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       # the test suite drives real ffmpeg/ffprobe (fixtures, probe, e2e)
       - name: Install ffmpeg
@@ -198,8 +204,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - name: Install ffmpeg
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
@@ -243,8 +249,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - name: Cache deps and build
         uses: actions/cache@v6
@@ -271,8 +277,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - name: Cache deps and build
         uses: actions/cache@v6
@@ -308,8 +314,8 @@ jobs:
 
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - run: mix compile --warnings-as-errors
         working-directory: tools/qdq-export/driver
@@ -331,8 +337,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - name: Cache deps and build
         uses: actions/cache@v6
@@ -366,8 +372,8 @@ jobs:
       - uses: erlef/setup-beam@v1
         id: beam
         with:
-          elixir-version: "1.20"
-          otp-version: "28"
+          version-file: mise.toml
+          version-type: strict
 
       - name: Cache deps and build
         uses: actions/cache@v6
