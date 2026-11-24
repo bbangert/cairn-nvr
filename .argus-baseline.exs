@@ -141,5 +141,35 @@
       "Cairn.PresenceFixtures.relay/1 spawns a process with bare spawn — no link, no monitor. If the process crashes, nothing observes it: no restart, no log, no cleanup.",
     reason:
       "Test-only, deliberate (documented on relay/1): the relay is unlinked so a test that kills it survives, and it monitors the test process so it is reaped when the test ends."
+  },
+  %{
+    analysis: "startup",
+    file: "lib/cairn/board/loader.ex",
+    title: "Lock during init",
+    at_label: "lock reached from init/1; it waits on this node's holders",
+    detail:
+      "Cairn.Artifacts.init/1 reaches :global.trans from init/1, over only the local node. No other node takes part, so the cluster cannot stall it, but the lock retries until it is free: init, and the supervisor's start sequence with it, waits for as long as another process on this node holds the lock.",
+    reason:
+      "Deliberate design, not reached on a started node: Cairn.Application.start/2 calls Cairn.Board.Loader.attach/0 before the supervisor, which records the board or `:none` in :persistent_term (or fails the start), so Cairn.Board.module/0 inside any init/1 answers from the term and never takes the lock. The lazy, locked path in Loader.board/0 exists for `bin/cairn eval`, which starts no supervisor; the lock keeps two first callers there from running a failed NIF on_load twice. It is local-node only, never nested, and held only for one attach."
+  },
+  %{
+    analysis: "startup",
+    file: "lib/cairn/board/loader.ex",
+    title: "Lock during init",
+    at_label: "lock reached from init/1; it waits on this node's holders",
+    detail:
+      "Cairn.Native.Drain.init/1 reaches :global.trans from init/1, over only the local node. No other node takes part, so the cluster cannot stall it, but the lock retries until it is free: init, and the supervisor's start sequence with it, waits for as long as another process on this node holds the lock.",
+    reason:
+      "Deliberate design, not reached on a started node: Cairn.Application.start/2 calls Cairn.Board.Loader.attach/0 before the supervisor, which records the board or `:none` in :persistent_term (or fails the start), so Cairn.Board.module/0 inside any init/1 answers from the term and never takes the lock. The lazy, locked path in Loader.board/0 exists for `bin/cairn eval`, which starts no supervisor; the lock keeps two first callers there from running a failed NIF on_load twice. It is local-node only, never nested, and held only for one attach."
+  },
+  %{
+    analysis: "startup",
+    file: "lib/cairn/board/loader.ex",
+    title: "Lock during init",
+    at_label: "lock reached from init/1; it waits on this node's holders",
+    detail:
+      "Cairn.Native.Host.init/1 reaches :global.trans from init/1, over only the local node. No other node takes part, so the cluster cannot stall it, but the lock retries until it is free: init, and the supervisor's start sequence with it, waits for as long as another process on this node holds the lock.",
+    reason:
+      "Deliberate design, not reached on a started node: Cairn.Application.start/2 calls Cairn.Board.Loader.attach/0 before the supervisor, which records the board or `:none` in :persistent_term (or fails the start), so Cairn.Board.module/0 inside any init/1 answers from the term and never takes the lock. The lazy, locked path in Loader.board/0 exists for `bin/cairn eval`, which starts no supervisor; the lock keeps two first callers there from running a failed NIF on_load twice. It is local-node only, never nested, and held only for one attach."
   }
 ]

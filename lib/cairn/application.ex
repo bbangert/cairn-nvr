@@ -5,10 +5,11 @@ defmodule Cairn.Application do
 
   use Application
 
+  alias Cairn.Board.Loader
+
   @impl true
   def start(_type, _args) do
-    Cairn.ExtractorTelemetry.attach()
-
+    # The list stays in this function, where argus reads the tree from.
     children = [
       # First on purpose: children stop in reverse start order, so this one's
       # terminate/2 — the bounded native-teardown drain — runs after every
@@ -105,7 +106,24 @@ defmodule Cairn.Application do
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Cairn.Supervisor]
-    Supervisor.start_link(children, opts)
+
+    # Before the tree: every reader of the board is in it, the first being
+    # `Drain`'s child spec.
+    with :ok <- start_board() do
+      Cairn.ExtractorTelemetry.attach()
+      Supervisor.start_link(children, opts)
+    end
+  end
+
+  @doc false
+  @spec start_board() :: :ok | {:error, {:board, String.t()}}
+  def start_board do
+    with :ok <- Loader.attach(),
+         :ok <- Loader.start() do
+      :ok
+    else
+      {:error, message} -> {:error, {:board, message}}
+    end
   end
 
   # Tell Phoenix to update the endpoint configuration
