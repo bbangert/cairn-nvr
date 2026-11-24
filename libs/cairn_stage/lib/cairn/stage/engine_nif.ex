@@ -30,6 +30,8 @@ defmodule Cairn.Stage.EngineNif do
           motion: FrameMeta.motion_verdict() | nil
         }
 
+  # Authoritative for `t:frame_meta/0`'s keys; `cairn-ort`'s Rust suite reads
+  # both lists from this source.
   @frame_meta_keys Enum.sort(~w(width height orig_width orig_height pts observed_at_ms motion)a)
   @motion_keys Enum.sort(~w(changed_fraction motion calibrating scene_cut)a)
 
@@ -46,7 +48,7 @@ defmodule Cairn.Stage.EngineNif do
   @callback drain_teardown(timeout_ms :: non_neg_integer()) :: boolean()
   # `Cairn.Stage.contract/0` as the library was built.
   @callback contract() :: pos_integer()
-  # The keys the library's `push_frame` decodes, as `frame_meta_keys/0` spells them.
+  # The keys the library's `push_frame` decodes, as this module's `frame_meta_keys/0` spells them.
   @callback frame_meta_keys() :: {[atom()], [atom()]}
 
   @doc """

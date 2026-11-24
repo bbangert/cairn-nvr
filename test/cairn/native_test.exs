@@ -36,7 +36,7 @@ defmodule Cairn.NativeTest do
     end
 
     # CI's Elixir jobs build no library; `cairn-ort`'s Rust suite ties the
-    # number to the source there instead.
+    # number and the keys to the source there instead.
     unless CairnOrt.available?(), do: @tag(skip: "libcairn_ort is not built")
 
     test "CairnOrt was built against this stage contract and frame metadata" do

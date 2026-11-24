@@ -4,6 +4,7 @@ defmodule Cairn.Stage do
 
   A board composes its chain from elements that each cover some of these
   (`Cairn.Stage.Step`); `Cairn.Stage.Chain` checks the composition.
+  `contract/0` is the version a board built apart from this base agrees with.
   """
 
   @stages [:decode, :scale, :motion, :infer]

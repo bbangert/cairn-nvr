@@ -104,8 +104,9 @@ fn drain_teardown(timeout_ms: u64) -> bool {
     cairn_ort::teardown::drain(Duration::from_millis(timeout_ms))
 }
 
-/// `cairn_ort::CONTRACT`, not a number of this crate's: the term shapes and
-/// the engine hosting it reports on are that crate's.
+/// `cairn_ort::CONTRACT` of the `cairn-ort` this was built on. The number
+/// also covers the decoder surface and `DmaFrame`, which this crate's own
+/// decoder produces, and reporting it checks neither.
 #[rustler::nif]
 fn contract() -> u32 {
     cairn_ort::CONTRACT

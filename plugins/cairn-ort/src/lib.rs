@@ -497,4 +497,34 @@ mod tests {
             "Cairn.Stage.contract/0 is not {CONTRACT}"
         );
     }
+
+    /// Read from the host's source for the same reason as above: the Elixir
+    /// CI jobs build no library, so only this suite sees `KEYS` drift from
+    /// the lists `Cairn.Stage.EngineNif.frame_meta_keys/0` returns.
+    #[test]
+    fn the_keys_are_the_stage_librarys() {
+        let source = include_str!("../../../libs/cairn_stage/lib/cairn/stage/engine_nif.ex");
+        let listed = |attribute: &str| -> Vec<String> {
+            let line = source
+                .lines()
+                .find(|line| line.trim_start().starts_with(attribute))
+                .unwrap_or_else(|| panic!("engine_nif.ex has no {attribute} line"));
+            let words = line
+                .split_once("~w(")
+                .and_then(|(_, rest)| rest.split_once(")a"))
+                .unwrap_or_else(|| panic!("{attribute} is not a ~w(...)a list: {line}"))
+                .0;
+            let mut keys: Vec<String> = words.split_whitespace().map(String::from).collect();
+            assert!(!keys.is_empty(), "{attribute} lists no keys");
+            keys.sort_unstable();
+            keys
+        };
+        let sorted = |keys: &[&str]| -> Vec<String> {
+            let mut keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(listed("@frame_meta_keys "), sorted(RawFrameMeta::KEYS));
+        assert_eq!(listed("@motion_keys "), sorted(RawMotionVerdict::KEYS));
+    }
 }

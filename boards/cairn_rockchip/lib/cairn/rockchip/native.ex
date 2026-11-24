@@ -106,8 +106,8 @@ defmodule Cairn.Rockchip.Native do
   @impl true
   def drain_teardown(_timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
 
-  # `cairn_ort::CONTRACT` as this library was built: the engine half is that
-  # crate's, so the number is too.
+  # The number is the built-on `cairn-ort`'s, not a check of this library's
+  # decoder (see `contract` in the crate).
   @impl true
   def contract, do: :erlang.nif_error(:nif_not_loaded)
 
