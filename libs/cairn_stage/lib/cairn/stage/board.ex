@@ -39,8 +39,9 @@ defmodule Cairn.Stage.Board do
   contract's export by a tool that can break it: per decode contract (the
   canonical `model_profile:` family), whether the converted model was
   measured to detect, and `evidence`, where the measurements are. A backend
-  without the key has no conversion step. Read both keys through
-  `Cairn.Stage.Capabilities`, which applies the defaults.
+  without the key declares no verdicts, so config load checks none of its
+  contracts. Read both keys through `Cairn.Stage.Capabilities`, which
+  applies the defaults.
   """
   @type capabilities :: %{
           required(:artifact) => String.t(),

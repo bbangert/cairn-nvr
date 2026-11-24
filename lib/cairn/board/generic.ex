@@ -35,7 +35,9 @@ defmodule Cairn.Board.Generic do
   # `cpu_twin` has no Rust mirror — the baseline is the host's concern — and
   # is false on both rows: the CPU baseline runs qnn's QDQ `.onnx` itself.
   #
-  # Only ort has soaked.
+  # `experimental` has no Rust mirror either: it is the host's D-P10 policy,
+  # under which ort is the only backend cleared of the acknowledgement and
+  # qnn stays behind it.
   #
   # Only these two: a profile naming another backend is refused with this
   # board's name, because no engine in this release runs it.

@@ -15,15 +15,40 @@ defmodule Cairn.Stage.CapabilitiesTest do
     refute Capabilities.experimental?(Map.put(@base, :experimental, false))
   end
 
-  test "without a conversion step every contract is proven, with no evidence" do
+  test "only an explicit false is not experimental" do
+    for value <- [nil, "false", 0] do
+      assert Capabilities.experimental?(Map.put(@base, :experimental, value))
+    end
+  end
+
+  test "without conversions every contract is proven, with no evidence" do
     assert Capabilities.conversion(@base, "rfdetr") == :proven
     assert Capabilities.evidence(@base) == nil
   end
 
-  test "with one, a contract is what the board lists, and unproven when unlisted" do
+  test "with conversions, a contract is what the board lists, and unproven when unlisted" do
     assert Capabilities.conversion(@converted, "yolox") == :proven
     assert Capabilities.conversion(@converted, "rfdetr") == {:unproven, "no op"}
     assert Capabilities.conversion(@converted, "yolov8") == {:unproven, "not listed by the board"}
     assert Capabilities.evidence(@converted) == "docs/x.md"
+  end
+
+  test "conversions without a contracts map make every contract unproven" do
+    for conversions <- [%{evidence: "docs/x.md"}, %{evidence: "docs/x.md", contracts: nil}, nil] do
+      caps = Map.put(@base, :conversions, conversions)
+      assert Capabilities.conversion(caps, "yolox") == {:unproven, "not listed by the board"}
+    end
+  end
+
+  test "a verdict outside the type is unproven" do
+    caps =
+      Map.put(@base, :conversions, %{evidence: "docs/x.md", contracts: %{"yolox" => :unproven}})
+
+    assert Capabilities.conversion(caps, "yolox") == {:unproven, "not listed by the board"}
+  end
+
+  test "conversions naming no evidence have none" do
+    assert Capabilities.evidence(Map.put(@base, :conversions, %{contracts: %{}})) == nil
+    assert Capabilities.evidence(Map.put(@base, :conversions, nil)) == nil
   end
 end

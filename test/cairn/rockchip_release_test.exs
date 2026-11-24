@@ -95,6 +95,13 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       assert caps.dynamic_shapes == (dynamic == "true")
     end
 
+    # A key the base never asks about (an alias, a misspelling) is a dead
+    # verdict, and a contract the board omits reads as unlisted, not measured.
+    test "rknn's verdicts are keyed by exactly the base's decode contracts" do
+      %{conversions: %{contracts: contracts}} = Profile.capabilities("rknn")
+      assert Enum.sort(Map.keys(contracts)) == Enum.sort(Profile.contracts())
+    end
+
     test "the release's profiles are the base's and the board's; qcs6490-tier1 is not one" do
       assert {:ok, config, []} = Config.from_map(%{"data_dir" => "tmp/cfg_test"})
       assert Enum.sort(Map.keys(config.profiles)) == ["generic-ort", "rk3566-tier1"]
@@ -293,7 +300,7 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       assert Enum.any?(warnings, &(&1 =~ "CPU twin gone.onnx does not exist"))
     end
 
-    test "D-P10 is unchanged: rknn still needs experimental twice" do
+    test "rknn needs experimental twice (D-P10)" do
       dir = profile_dir("rk", rknn([rknn: @stub_rknn, onnx: @stub_onnx], false))
       assert {:error, errors} = Config.from_map(map("rk", [dir]))
       assert Enum.any?(errors, &(&1 =~ "must declare experimental: true"))

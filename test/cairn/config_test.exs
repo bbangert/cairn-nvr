@@ -2068,7 +2068,7 @@ defmodule Cairn.ConfigTest do
       assert Map.has_key?(config.profiles, "gone")
     end
 
-    test "a non-experimental profile on a non-ort backend is refused for the group that runs it" do
+    test "a non-experimental profile on an experimental backend is refused for the group that runs it" do
       dir = "test/support/fixtures/profiles/stable"
       map = argv_map("stable-qnn", %{"allow_experimental" => true}, dir)
 
@@ -2102,6 +2102,41 @@ defmodule Cairn.ConfigTest do
 
       assert {:ok, %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"}} =
                Config.native_model_config(config)
+    end
+
+    # The gate reads the board's `experimental`, not the backend's name: "npu"
+    # is cleared and "ort" gated below, the opposite of what a name check
+    # would answer.
+    defp gate(backend, caps, experimental \\ false, allow \\ false) do
+      group = %Cairn.Config.PluginGroup{name: "det", allow_experimental: allow}
+      profile = %Cairn.Config.Profile{name: "p", backend: backend, experimental: experimental}
+      acc = %{errors: [], warnings: []}
+      Config.check_experimental_backend(acc, group, profile, "testboard", caps)
+    end
+
+    test "a backend its board clears loads with no acknowledgement" do
+      assert gate("npu", %{experimental: false}) == %{errors: [], warnings: []}
+    end
+
+    test "a backend its board marks experimental is refused, naming the board" do
+      assert %{errors: [error]} = gate("ort", %{experimental: true})
+
+      assert error ==
+               "plugin det: profile p uses backend ort, which is experimental on the " <>
+                 "testboard board — a profile naming it must declare experimental: true"
+
+      assert %{errors: [error]} = gate("ort", %{experimental: true}, true)
+
+      assert error ==
+               "plugin det: profile p uses backend ort, which is experimental — set " <>
+                 "allow_experimental: true on this plugin group to run it anyway"
+
+      assert gate("ort", %{experimental: true}, true, true) == %{errors: [], warnings: []}
+    end
+
+    test "a capability without the key is experimental" do
+      assert %{errors: [error]} = gate("ort", %{})
+      assert error =~ "which is experimental on the testboard board"
     end
 
     test "allow_experimental must be a boolean" do
@@ -3024,7 +3059,8 @@ defmodule Cairn.ConfigTest do
     # `BackendKind::capabilities` in plugins/cairn-detect/src/infer/backend.rs
     # is a change to what a profile may declare, not a refactor — the Rust side
     # has the same test over the same values. `experimental` has no Rust
-    # mirror: only ort has soaked.
+    # mirror: it is the host's D-P10 policy, which keeps qnn behind the
+    # acknowledgement.
     test "the table carries a row per backend, matching the plugin's own" do
       assert Profile.capabilities("ort") == %{
                artifact: "onnx",
@@ -3076,10 +3112,14 @@ defmodule Cairn.ConfigTest do
     end
 
     test "the family table resolves each family to its decode contract" do
-      assert {"yolov8", _row} = Profile.family("yolo11")
-      # Under yolov8, not yolov10: the runnable yolo26 exports are raw-head
-      # (device-proven 2026-08-19; the catalog moved with the evidence).
-      assert {"yolov8", _row} = Profile.family("yolo26")
+      # The conversion verdict is looked up by this contract, so every alias
+      # shares yolov8's. yolo26 is under yolov8, not yolov10: the runnable
+      # yolo26 exports are raw-head (device-proven 2026-08-19; the catalog
+      # moved with the evidence).
+      for name <- ~w(yolov8 yolov9 yolo11 yolov11 yolo26) do
+        assert {"yolov8", _row} = Profile.family(name)
+      end
+
       assert {"rfdetr", _row} = Profile.family("RF-DETR ")
       # hyphens are spelling, so the split contracts resolve either way
       assert {"yolov8split", %{nms: :host_side}} = Profile.family("yolov8-split")
@@ -3126,8 +3166,8 @@ defmodule Cairn.ConfigTest do
       assert config.profiles["qnn-host-side-nms"].model_profile == "yolox"
     end
 
-    # Rule 2's branches, on a backend no generic board offers: one whose
-    # board lists conversions. The verdicts and their wording are the board's.
+    # Rule 2's branches, on a backend the generic board does not offer: one
+    # with `conversions`, whose verdicts and wording are this fixture's.
     @converted {"npu",
                 %{
                   artifact: "npu",
@@ -3171,7 +3211,8 @@ defmodule Cairn.ConfigTest do
                  "proven npu conversion: no op"
     end
 
-    # By the contract, under its canonical name, not the spelling written.
+    # The lookup by canonical name is pinned above: written "rf-detr" finds
+    # rfdetr's "no op", where the written name would be unlisted.
     test "a contract the board does not list is unproven" do
       assert %{errors: [error]} = converted(false, {"yolo11", "yolov8"})
 
@@ -3179,7 +3220,26 @@ defmodule Cairn.ConfigTest do
                "model_profile yolo11 is not a proven npu conversion: not listed by the board"
     end
 
-    test "a backend with no conversion step has no conversion rule" do
+    test "a board naming no evidence gets no measurements parenthetical" do
+      {backend, caps} = @converted
+      caps = update_in(caps.conversions, &Map.delete(&1, :evidence))
+      {_canonical, row} = Profile.family("rfdetr")
+
+      assert %{errors: [error]} =
+               Profile.check_capabilities(
+                 %{errors: [], warnings: []},
+                 "profile p",
+                 {backend, caps},
+                 false,
+                 {"rfdetr", "rfdetr", row}
+               )
+
+      assert error ==
+               "profile p: model_profile rfdetr is not a proven npu conversion: no op — " <>
+                 "experimental: true loads it regardless"
+    end
+
+    test "a backend without conversions has no conversion rule" do
       for backend <- ~w(ort qnn) do
         assert Profile.check_capabilities(
                  %{errors: [], warnings: []},

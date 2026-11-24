@@ -14,14 +14,14 @@ defmodule Cairn.Config.Profile do
   `decoder:` against the release's board (`Cairn.Stage.Board`),
   `model_profile:` against the Rust catalog's decode contracts and their
   families — and two backend/family combinations: a fused-NMS export on a
-  backend that cannot run the op, and a family whose conversion to the
-  backend's artifact the board does not list as proven, which
+  backend that cannot run the op, and a family that the backend's
+  `conversions`, where it has them, does not list as proven, which
   `experimental: true` turns from an error into a warning (see
   `check_capabilities/5`).
   `Cairn.Config` rejects a group's profile whose model artifact or labels file
   is missing, that names no CPU twin its backend needs (a named twin missing
-  on disk only warns), or whose backend is unproven (see "The model half"
-  below).
+  on disk only warns), or whose backend its board marks experimental without
+  both acknowledgements (see "The model half" below).
 
   Profiles are files, never inline config: shipped ones live in
   `priv/profiles/*.yml`, then the board's `profiles_dir/0`, then operator
@@ -301,6 +301,10 @@ defmodule Cairn.Config.Profile do
   end
 
   def family(_other), do: nil
+
+  @doc "The catalog's decode contracts: every canonical name `family/1` resolves to."
+  @spec contracts() :: [String.t()]
+  def contracts, do: Map.keys(@model_families)
 
   @doc """
   The `model:` key naming `backend`'s compiled artifact — the one
@@ -748,15 +752,14 @@ defmodule Cairn.Config.Profile do
 
   @doc false
   # Public so both rules can be exercised against rows no shipped menu holds:
-  # a fused family (see `@model_families`) and, on a board without one, a
-  # backend with `conversions`. `where` opens each diagnostic (the profile,
-  # or one of its rungs); the third argument is a backend paired with its
-  # capabilities, the last a `family/1` result led by the name the operator
-  # wrote. Test coverage leans on both rules being reached through this one
-  # function: the conversion rule's fixtures (run where a board backend has
-  # `conversions`) prove the parse→here wiring on the public path, direct
-  # calls prove each branch — give the rules separate entry points and each
-  # needs its own public-path test.
+  # a fused family (see `@model_families`), and a backend with `conversions`,
+  # of which the generic board has none. `where` opens each diagnostic (the
+  # profile, or one of its rungs); `requested` is led by the name the
+  # operator wrote. Test coverage leans on both rules being reached through
+  # this one function: the conversion rule's fixtures (run where a board
+  # backend has `conversions`) prove the parse→here wiring on the public
+  # path, direct calls prove each branch — give the rules separate entry
+  # points and each needs its own public-path test.
   @spec check_capabilities(
           map(),
           String.t(),
@@ -764,8 +767,8 @@ defmodule Cairn.Config.Profile do
           boolean(),
           {String.t(), String.t(), family()}
         ) :: map()
-  def check_capabilities(acc, where, {backend, caps}, experimental, family) do
-    {model_profile, _canonical, row} = family
+  def check_capabilities(acc, where, {backend, caps}, experimental, requested) do
+    {model_profile, _canonical, row} = requested
 
     acc
     |> Config.check(
@@ -775,12 +778,11 @@ defmodule Cairn.Config.Profile do
         "export — its op is not one this runtime implements, so the graph would be " <>
         "declined at load"
     )
-    |> check_conversion(where, {backend, caps}, experimental, family)
+    |> check_conversion(where, {backend, caps}, experimental, requested)
   end
 
-  # Acknowledged, it warns with the same reason: a group runs a profile on an
-  # experimental backend only if the profile declares `experimental: true`,
-  # so on such a backend the refusal alone would reach no running profile.
+  # An acknowledged unproven conversion still loads and runs, so its reason
+  # is logged as a warning rather than lost with the error it replaces.
   defp check_conversion(acc, where, {backend, caps}, experimental, {model_profile, canonical, _}) do
     case {Capabilities.conversion(caps, canonical), experimental} do
       {:proven, _experimental} ->
@@ -797,9 +799,15 @@ defmodule Cairn.Config.Profile do
         Config.add_error(
           acc,
           "#{where}: model_profile #{model_profile} is not a proven #{backend} conversion: " <>
-            "#{why} — experimental: true loads it regardless " <>
-            "(measurements: #{Capabilities.evidence(caps)})"
+            "#{why} — experimental: true loads it regardless" <> measurements(caps)
         )
+    end
+  end
+
+  defp measurements(caps) do
+    case Capabilities.evidence(caps) do
+      nil -> ""
+      evidence -> " (measurements: #{evidence})"
     end
   end
 

@@ -1338,26 +1338,41 @@ defmodule Cairn.Config do
   # halves of the acknowledgement, the profile's own `experimental:` and the
   # operator's `allow_experimental:`. Read from the release's board, like
   # every menu `Cairn.Config.Profile` checks; a backend outside it is already
-  # refused there, and reads here as experimental. Refused at load rather than
-  # when the engine opens, because load is where an operator reads
+  # refused there, and would read here as experimental. Refused at load rather
+  # than when the engine opens, because load is where an operator reads
   # diagnostics.
   defp check_backend_implemented(acc, group, profile) do
     board = Cairn.Board.module()
     caps = Map.get(board.backends(), profile.backend, %{})
+    check_experimental_backend(acc, group, profile, board.name(), caps)
+  end
 
+  @doc false
+  # Public, taking the board's name and the backend's capabilities, so the
+  # gate can be driven by rows no shipped board holds; the release's board is
+  # compiled in and cannot be swapped per test.
+  @spec check_experimental_backend(
+          map(),
+          PluginGroup.t(),
+          Profile.t(),
+          String.t(),
+          map()
+        ) :: map()
+  def check_experimental_backend(acc, group, profile, board_name, caps) do
+    # `!= true`: anything short of an explicit acknowledgement is refused.
     cond do
       not Capabilities.experimental?(caps) ->
         acc
 
-      profile.experimental == false ->
+      profile.experimental != true ->
         add_error(
           acc,
           "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, " <>
-            "which is experimental on the #{board.name()} board — a profile naming it " <>
+            "which is experimental on the #{board_name} board — a profile naming it " <>
             "must declare experimental: true"
         )
 
-      group.allow_experimental == false ->
+      group.allow_experimental != true ->
         add_error(
           acc,
           "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, " <>

@@ -135,7 +135,7 @@ A second board, `boards/cairn_foo`, needs:
 5. In `.github/workflows/container.yml`: the `board` option and its add-on mapping, with a `deploy/vagus-addon/<addon>/config.yaml`.
 6. In CI: an entry in the sobelow and dialyzer matrices, a test job compiled with `CAIRN_BOARD=foo`, a job for the library standing alone, and the five Rust gates for its crate.
 
-A board that brings a new backend name also touches shared code, and this is where the separation is incomplete: `BackendKind` in `plugins/cairn-detect` enumerates backends, `Rknn` among them. Whether a backend is experimental, and which model families its conversion is proven for, the board declares in `backends/0`; the base reads both through `Cairn.Stage.Capabilities`.
+A board that brings a new backend name also touches shared code, and this is where the separation is incomplete: `BackendKind` in `plugins/cairn-detect` enumerates backends, `Rknn` among them. Whether a backend is experimental, and which decode contracts its conversion is proven for, the board declares in `backends/0`; the base reads both through `Cairn.Stage.Capabilities`.
 
 ## The ring buffer
 
