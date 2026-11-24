@@ -5,8 +5,20 @@ defmodule Cairn.Application do
 
   use Application
 
+  alias Cairn.Board.Loader
+
   @impl true
   def start(_type, _args) do
+    # Before the child list: `Drain` and `Artifacts` read the board.
+    with :ok <- Loader.attach(),
+         :ok <- Loader.start() do
+      start_tree()
+    else
+      {:error, message} -> {:error, {:board, message}}
+    end
+  end
+
+  defp start_tree do
     Cairn.ExtractorTelemetry.attach()
 
     children = [
