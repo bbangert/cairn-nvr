@@ -20,6 +20,8 @@
 # stay beside the libs, and the Qualcomm .so files must not be stripped.
 # Verdict + obligations: .claude/plans/tier1-container/research/qairt-licensing.md.
 
+# mise.toml pins the same pair for CI and local work; a move changes both,
+# and tools/ci/check-toolchain.sh fails CI when they differ.
 ARG ELIXIR_VERSION=1.20.2
 ARG OTP_VERSION=29.0.3
 ARG DEBIAN_TAG=trixie-20260713
