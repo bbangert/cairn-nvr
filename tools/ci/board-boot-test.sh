@@ -6,10 +6,11 @@
 # refused boot prints.
 #
 # Builds the release (MIX_ENV=prod mix release) unless REL names a built
-# one, and the fixture board through build-fixture-board.sh (CARGO is passed
-# on). CI's board-loader job, and runnable locally; writes only under WORK
-# (default: a fresh temporary directory), _build and cargo's cache. The
-# release needs no assets: no request is made.
+# one, and the fixture board through build-fixture-board.sh against that
+# release's cairn.rel (CARGO is passed on). CI's board-loader job, and
+# runnable locally; writes only under WORK (default: a fresh temporary
+# directory), _build, cargo's cache and the fixture's git-ignored
+# priv/native. The release needs no assets: no request is made.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -38,7 +39,10 @@ if [ -z "$rel" ]; then
 fi
 
 say "building the fixture board"
-"$root/tools/ci/build-fixture-board.sh" "$work/board" >>"$log" 2>&1 || fail "fixture build (see $log)"
+# "<erts> <release vsn>", with no newline for `read` to stop at.
+rel_vsn=$(cut -d' ' -f2 "$rel/releases/start_erl.data")
+"$root/tools/ci/build-fixture-board.sh" "$work/board" "$rel/releases/$rel_vsn/cairn.rel" \
+  >>"$log" 2>&1 || fail "fixture build (see $log)"
 contract=$(sed -n 's/^{contract, \([0-9]*\)}\.$/\1/p' "$work/board/board.manifest")
 
 # A reused WORK holds the last run's copies, and `cp -R` would nest into them.
