@@ -4,6 +4,7 @@ defmodule Cairn.NativeTest do
   alias Cairn.Native
   alias Cairn.Native.Canary
   alias Cairn.Native.Config
+  alias Cairn.Stage.EngineNif
 
   @fake_detect Path.absname("test/support/fake_detect.sh")
 
@@ -32,6 +33,15 @@ defmodule Cairn.NativeTest do
       unless CairnOrt.available?() do
         assert_raise ErlangError, fn -> CairnOrt.close_stream(make_ref()) end
       end
+    end
+
+    # CI's Elixir jobs build no library; `cairn-ort`'s Rust suite ties the
+    # number to the source there instead.
+    unless CairnOrt.available?(), do: @tag(skip: "libcairn_ort is not built")
+
+    test "CairnOrt was built against this stage contract and frame metadata" do
+      assert CairnOrt.contract() == Cairn.Stage.contract()
+      assert CairnOrt.frame_meta_keys() == EngineNif.frame_meta_keys()
     end
   end
 

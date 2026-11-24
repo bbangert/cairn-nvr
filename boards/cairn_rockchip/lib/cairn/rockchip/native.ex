@@ -56,7 +56,9 @@ defmodule Cairn.Rockchip.Native do
              close_decoder: 1,
              download: 1,
              release: 1,
-             drain_teardown: 1}
+             drain_teardown: 1,
+             contract: 0,
+             frame_meta_keys: 0}
 
   # The library path rides the call because the NIF cannot read the VM's
   # environment: `System.put_env/2` writes the BEAM's own copy, which libc's
@@ -103,6 +105,14 @@ defmodule Cairn.Rockchip.Native do
   # This library's own teardown queue: `CairnOrt`'s drain does not reach it.
   @impl true
   def drain_teardown(_timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  # `cairn_ort::CONTRACT` as this library was built: the engine half is that
+  # crate's, so the number is too.
+  @impl true
+  def contract, do: :erlang.nif_error(:nif_not_loaded)
+
+  @impl true
+  def frame_meta_keys, do: :erlang.nif_error(:nif_not_loaded)
 
   defp load_result, do: :persistent_term.get(@load_result, {:error, :not_loaded})
 

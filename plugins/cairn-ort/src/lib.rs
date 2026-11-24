@@ -39,9 +39,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use rustler::{Atom, Env, NifMap, Resource};
 #[cfg(feature = "nif")]
 use rustler::{Binary, ResourceArc};
-use rustler::{Env, NifMap, Resource};
 
 use cairn_detect::infer::{InputSize, InputSpec};
 use cairn_detect::motion::MotionVerdict;
@@ -51,6 +51,10 @@ pub use engine::Engine;
 pub use error::{NativeError, Result};
 pub use observation::FrameObservations;
 pub use stream::{Frame, Stream};
+
+/// `Cairn.Stage.contract/0`, whose doc says what bumps it; every engine NIF
+/// built on this crate reports it from `contract/0`.
+pub const CONTRACT: u32 = 1;
 
 pub struct EngineRef(pub Arc<Engine>);
 
@@ -144,15 +148,35 @@ impl StreamRef {
     }
 }
 
-/// `cairn_detect::motion::MotionVerdict`, term-shaped. The fraction survives
-/// the f32 -> f64 -> f32 round trip exactly, so carrying it through terms
-/// loses nothing.
-#[derive(NifMap)]
-pub struct RawMotionVerdict {
-    changed_fraction: f64,
-    motion: bool,
-    calibrating: bool,
-    scene_cut: bool,
+/// A struct and `KEYS`, its field names, from one field list: a `NifMap`
+/// decoder requires an atom per field name, so a list kept beside the struct
+/// would be one more place for the two to drift. The derive is the caller's
+/// to write: expanded from inside this macro, its generated code and the
+/// field names it uses land in different hygiene contexts and do not compile.
+macro_rules! term_map {
+    ($(#[$attr:meta])* $vis:vis struct $name:ident { $($field:ident: $ty:ty),* $(,)? }) => {
+        $(#[$attr])*
+        $vis struct $name {
+            $($field: $ty),*
+        }
+
+        impl $name {
+            pub const KEYS: &'static [&'static str] = &[$(stringify!($field)),*];
+        }
+    };
+}
+
+term_map! {
+    /// `cairn_detect::motion::MotionVerdict`, term-shaped. The fraction survives
+    /// the f32 -> f64 -> f32 round trip exactly, so carrying it through terms
+    /// loses nothing.
+    #[derive(NifMap)]
+    pub struct RawMotionVerdict {
+        changed_fraction: f64,
+        motion: bool,
+        calibrating: bool,
+        scene_cut: bool,
+    }
 }
 
 impl From<RawMotionVerdict> for MotionVerdict {
@@ -166,17 +190,33 @@ impl From<RawMotionVerdict> for MotionVerdict {
     }
 }
 
-/// What `push_frame` takes alongside the payload binary: the metadata the
-/// decode half minted, handed back through `Cairn.Pipeline.Decoder`'s buffer.
-#[derive(NifMap)]
-pub struct RawFrameMeta {
-    width: usize,
-    height: usize,
-    orig_width: usize,
-    orig_height: usize,
-    pts: Option<i64>,
-    observed_at_ms: i64,
-    motion: Option<RawMotionVerdict>,
+term_map! {
+    /// What `push_frame` takes alongside the payload binary: the metadata the
+    /// decode half minted, handed back through `Cairn.Pipeline.Decoder`'s buffer.
+    #[derive(NifMap)]
+    pub struct RawFrameMeta {
+        width: usize,
+        height: usize,
+        orig_width: usize,
+        orig_height: usize,
+        pts: Option<i64>,
+        observed_at_ms: i64,
+        motion: Option<RawMotionVerdict>,
+    }
+}
+
+/// `frame_meta_keys/0`'s body: [`RawFrameMeta::KEYS`] and
+/// [`RawMotionVerdict::KEYS`] as atoms, each sorted, which is how
+/// `Cairn.Stage.EngineNif.frame_meta_keys/0` spells the keys the host sends.
+pub fn frame_meta_atoms(env: Env<'_>) -> (Vec<Atom>, Vec<Atom>) {
+    let atoms = |keys: &[&str]| {
+        let mut keys = keys.to_vec();
+        keys.sort_unstable();
+        keys.into_iter()
+            .map(|key| Atom::from_str(env, key).expect("a field name is a valid atom"))
+            .collect()
+    };
+    (atoms(RawFrameMeta::KEYS), atoms(RawMotionVerdict::KEYS))
 }
 
 impl RawFrameMeta {
@@ -352,6 +392,18 @@ fn drain_teardown(timeout_ms: u64) -> bool {
 }
 
 #[cfg(feature = "nif")]
+#[rustler::nif]
+fn contract() -> u32 {
+    CONTRACT
+}
+
+#[cfg(feature = "nif")]
+#[rustler::nif]
+fn frame_meta_keys(env: Env<'_>) -> (Vec<Atom>, Vec<Atom>) {
+    frame_meta_atoms(env)
+}
+
+#[cfg(feature = "nif")]
 rustler::init!("Elixir.CairnOrt");
 
 #[cfg(test)]
@@ -391,7 +443,7 @@ mod tests {
     /// with the feature off sees none of these in its own list.
     #[cfg(feature = "nif")]
     #[test]
-    fn the_nif_surface_is_cairn_orts_seven_functions() {
+    fn the_nif_surface_is_cairn_orts_nine_functions() {
         let mut nifs: Vec<(String, u32, u32)> =
             rustler::codegen_runtime::inventory::iter::<rustler::Nif>()
                 .map(|nif| {
@@ -408,9 +460,11 @@ mod tests {
         );
         let expected = [
             ("close_stream", 1, io),
+            ("contract", 0, normal),
             ("cpu_baseline_ms", 2, cpu),
             ("drain_teardown", 1, io),
             ("engine_spec", 1, normal),
+            ("frame_meta_keys", 0, normal),
             ("init", 1, cpu),
             ("open_stream", 3, cpu),
             ("push_frame", 4, cpu),
@@ -430,5 +484,17 @@ mod tests {
         let verdict = MotionVerdict::from(raw);
         assert_eq!(verdict.changed_fraction, (1.0f64 / 3.0) as f32);
         assert!(verdict.motion);
+    }
+
+    /// Read from the host's source, because the Elixir CI jobs build no
+    /// library to ask and skip their tie; this one runs wherever the crate's
+    /// tests do.
+    #[test]
+    fn the_contract_is_the_stage_librarys() {
+        let stage = include_str!("../../../libs/cairn_stage/lib/cairn/stage.ex");
+        assert!(
+            stage.contains(&format!("def contract, do: {CONTRACT}\n")),
+            "Cairn.Stage.contract/0 is not {CONTRACT}"
+        );
     }
 }
