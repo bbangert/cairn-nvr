@@ -33,7 +33,7 @@ use cairn_ort::{
     guarded, Engine, EngineRef, FrameObservations, RawFrameMeta, RawInitConfig, RawInputSpec,
     RawStreamParams, Result, StreamRef,
 };
-use rustler::{Binary, ResourceArc};
+use rustler::{Atom, Binary, Env, ResourceArc};
 
 /// Load librknnrt and the artifact, once per VM. DirtyCpu, as `CairnOrt`'s:
 /// `rknn_init` builds the NPU context.
@@ -104,6 +104,19 @@ fn drain_teardown(timeout_ms: u64) -> bool {
     cairn_ort::teardown::drain(Duration::from_millis(timeout_ms))
 }
 
+/// `cairn_ort::CONTRACT` of the `cairn-ort` this was built on. The number
+/// also covers the decoder surface and `DmaFrame`, which this crate's own
+/// decoder produces, and reporting it checks neither.
+#[rustler::nif]
+fn contract() -> u32 {
+    cairn_ort::CONTRACT
+}
+
+#[rustler::nif]
+fn frame_meta_keys(env: Env<'_>) -> (Vec<Atom>, Vec<Atom>) {
+    cairn_ort::frame_meta_atoms(env)
+}
+
 rustler::init!("Elixir.Cairn.Rockchip.Native", load = decoder::load);
 
 #[cfg(test)]
@@ -160,10 +173,12 @@ mod tests {
         let expected = [
             ("close_decoder", 1, io),
             ("close_stream", 1, io),
+            ("contract", 0, normal),
             ("decode_au", 4, io),
             ("download", 1, cpu),
             ("drain_teardown", 1, io),
             ("engine_spec", 1, normal),
+            ("frame_meta_keys", 0, normal),
             ("init", 2, cpu),
             ("open_decoder", 2, io),
             ("open_stream", 3, cpu),

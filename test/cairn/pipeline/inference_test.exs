@@ -11,7 +11,7 @@ defmodule Cairn.Pipeline.InferenceTest do
   alias Cairn.NativeStub
   alias Cairn.Pipeline.{Decoder, Inference, ObservationStamper, Picker, TrackSink}
   alias Cairn.Pipeline.Inference.Detections
-  alias Cairn.Stage.FrameMeta
+  alias Cairn.Stage.{EngineNif, FrameMeta}
   alias Membrane.Buffer
   alias Membrane.Testing
 
@@ -214,6 +214,11 @@ defmodule Cairn.Pipeline.InferenceTest do
                observed_at_ms: 0,
                motion: nil
              }
+
+      # …under exactly the keys the engine NIFs decode (theirs are tied to
+      # the same list in their own suites)
+      {keys, _motion_keys} = EngineNif.frame_meta_keys()
+      assert Enum.sort(Map.keys(meta)) == keys
     end
   end
 

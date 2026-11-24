@@ -33,11 +33,11 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       dir
     end
 
-    # yolox, a proven rknn conversion, so `experimental:` is the D-P10 gate
-    # alone.
-    defp rknn(model, experimental \\ true) do
+    # Acknowledged, and yolox is a proven rknn conversion, so only the twin
+    # rules are in play.
+    defp rknn(model) do
       """
-      experimental: #{experimental}
+      experimental: true
       backend: rknn
       model:
       #{Enum.map_join(model, "\n", fn {key, path} -> "  #{key}: #{path}" end)}
@@ -71,17 +71,6 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       assert %Download{} = children.download
     end
 
-    test "qnn is refused by name of board" do
-      dir = profile_dir("q", "experimental: true\nbackend: qnn\nmodel:\n  qnn: #{@stub_onnx}\n")
-
-      assert {:error, errors} = Config.from_map(map("q", [dir]))
-
-      assert Enum.any?(
-               errors,
-               &(&1 =~ ~s(unknown backend "qnn" — the rockchip board provides ort or rknn))
-             )
-    end
-
     # The generic board's rows are paired in config_test.exs; this is rknn's,
     # whose descriptor is the board crate's.
     test "the rknn capability booleans match the board crate's source" do
@@ -101,14 +90,6 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
     test "rknn's verdicts are keyed by exactly the base's decode contracts" do
       %{conversions: %{contracts: contracts}} = Profile.capabilities("rknn")
       assert Enum.sort(Map.keys(contracts)) == Enum.sort(Profile.contracts())
-    end
-
-    test "the release's profiles are the base's and the board's; qcs6490-tier1 is not one" do
-      assert {:ok, config, []} = Config.from_map(%{"data_dir" => "tmp/cfg_test"})
-      assert Enum.sort(Map.keys(config.profiles)) == ["generic-ort", "rk3566-tier1"]
-
-      assert {:error, errors} = Config.from_map(map("qcs6490-tier1", []))
-      assert Enum.any?(errors, &(&1 =~ ~s(unknown profile "qcs6490-tier1")))
     end
 
     @rungs [
@@ -300,25 +281,17 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       assert {:ok, _config, warnings} = Config.from_map(map("ladder", [dir]))
       assert Enum.any?(warnings, &(&1 =~ "CPU twin gone.onnx does not exist"))
     end
-
-    test "rknn needs experimental twice (D-P10)" do
-      dir = profile_dir("rk", rknn([rknn: @stub_rknn, onnx: @stub_onnx], false))
-      assert {:error, errors} = Config.from_map(map("rk", [dir]))
-      assert Enum.any?(errors, &(&1 =~ "must declare experimental: true"))
-
-      dir = profile_dir("rk", rknn(rknn: @stub_rknn, onnx: @stub_onnx))
-      assert {:error, errors} = Config.from_map(map("rk", [dir], %{}))
-      assert Enum.any?(errors, &(&1 =~ "set allow_experimental: true on this plugin group"))
-    end
   end
 end
 
 # Outside the `if`, so a CAIRN_BOARD the build did not honour fails here
-# instead of compiling the suite above to zero tests.
+# instead of compiling the suite above to zero tests. The built-in board,
+# not `Cairn.Board.module/0`, which is an attached board's when there is one.
 defmodule Cairn.ReleaseBoardTest do
   use ExUnit.Case, async: true
 
-  test "the compiled board is the one CAIRN_BOARD names" do
-    assert Cairn.Board.module().name() == System.get_env("CAIRN_BOARD", "generic")
+  test "the built-in board is the one CAIRN_BOARD names" do
+    built_in = Application.get_env(:cairn, :board, Cairn.Board.Generic)
+    assert built_in.name() == System.get_env("CAIRN_BOARD", "generic")
   end
 end

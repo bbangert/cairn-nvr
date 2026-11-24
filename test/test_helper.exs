@@ -21,5 +21,10 @@ Cairn.Repo.delete_all(Cairn.Tracks.Track)
 # :e2e_membrane needs everything :native_parity does *and* everything
 # :integration does — it runs the whole membrane stack on a recorded clip.
 # Run it with: mix test --only e2e_membrane
-ExUnit.start(exclude: [:integration, :native_parity, :e2e_membrane])
+#
+# :fixture_board needs a fixture board directory, which
+# tools/ci/build-fixture-board.sh <dir> <release's cairn.rel> builds (the
+# boot test builds one in $WORK/board). Run it with:
+# CAIRN_FIXTURE_BOARD_DIR=<dir> mix test --only fixture_board
+ExUnit.start(exclude: [:integration, :native_parity, :e2e_membrane, :fixture_board])
 Ecto.Adapters.SQL.Sandbox.mode(Cairn.Repo, :manual)

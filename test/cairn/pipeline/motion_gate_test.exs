@@ -3,6 +3,7 @@ defmodule Cairn.Pipeline.MotionGateTest do
 
   alias Cairn.Motion.Config
   alias Cairn.Pipeline.MotionGate
+  alias Cairn.Stage.EngineNif
   alias Membrane.Buffer
 
   # 96x54 is at the thumbnail cap, so the downsample is a pixel-for-pixel
@@ -99,6 +100,22 @@ defmodule Cairn.Pipeline.MotionGateTest do
     assert out.metadata.motion.motion
     refute out.metadata.motion.calibrating
     assert out.metadata.motion.changed_fraction == 0.5
+  end
+
+  test "every verdict path carries exactly the canonical motion keys" do
+    {_keys, motion_keys} = EngineNif.frame_meta_keys()
+
+    # still (first frame), settled (after the window), scene cut
+    {[buffer: {:output, still}], state} = feed(formatted(element()), grey(100), at(0))
+    state = observe(state, grey(100), 1, @window - 1)
+    {[buffer: {:output, settled}], state} = feed(state, half(100, 200), at(@window))
+    {[buffer: {:output, cut}], _state} = feed(state, grey(230), at(@window + 1))
+
+    assert cut.metadata.motion.scene_cut
+
+    for out <- [still, settled, cut] do
+      assert Enum.sort(Map.keys(out.metadata.motion)) == motion_keys
+    end
   end
 
   test "a new stream format restarts the measurement at the new geometry" do

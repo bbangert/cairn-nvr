@@ -61,6 +61,9 @@ config.yml
 # so `Cairn.Native`'s @on_load finds it. A build artifact, not a source file.
 /priv/native/
 
+# The fixture board's stub NIF, copied here by tools/ci/build-fixture-board.sh.
+/test/fixture_board/priv/native/
+
 # Claude Code working files (plans, reviews, solutions) — local only.
 .claude/
 /profiles/
