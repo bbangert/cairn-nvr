@@ -229,6 +229,33 @@ rustler::init!("Elixir.Cairn.Native");
 mod tests {
     use super::*;
 
+    /// This crate's `RawMotionVerdict` is a second copy of cairn-ort's, and
+    /// it is the one that mints the verdict the host sends back. The pattern
+    /// in `field_names!` fails to compile if a field is added or removed here;
+    /// the names it yields must then equal cairn-ort's `KEYS`, so a rename on
+    /// either side, or a field only one has, fails this test.
+    #[test]
+    fn the_motion_verdict_has_cairn_orts_keys() {
+        macro_rules! field_names {
+            ($ty:ident { $($field:ident),* }) => {{
+                let _ = |value: &$ty| {
+                    let $ty { $($field: _),* } = value;
+                };
+                [$(stringify!($field)),*]
+            }};
+        }
+        let mut ours = field_names!(RawMotionVerdict {
+            changed_fraction,
+            motion,
+            calibrating,
+            scene_cut
+        });
+        let mut theirs = cairn_ort::RawMotionVerdict::KEYS.to_vec();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(ours.as_slice(), theirs.as_slice());
+    }
+
     #[test]
     fn a_panicking_body_becomes_an_error_and_not_an_unwind() {
         let caught = guarded("test", || -> Result<()> { panic!("the decoder exploded") });

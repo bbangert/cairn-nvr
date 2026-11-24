@@ -61,7 +61,9 @@ defmodule CairnOrt do
              push_frame: 4,
              close_stream: 1,
              drain_teardown: 1,
-             cpu_baseline_ms: 2}
+             cpu_baseline_ms: 2,
+             contract: 0,
+             frame_meta_keys: 0}
 
   @type input_spec :: Cairn.Stage.EngineNif.input_spec()
   @type frame_meta :: Cairn.Stage.EngineNif.frame_meta()
@@ -114,6 +116,14 @@ defmodule CairnOrt do
   """
   @spec drain_teardown(non_neg_integer()) :: boolean()
   def drain_teardown(_timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "`cairn_ort::CONTRACT`: the `Cairn.Stage.contract/0` this library was built against."
+  @spec contract() :: pos_integer()
+  def contract, do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "The keys `push_frame/4` decodes, as `Cairn.Stage.EngineNif.frame_meta_keys/0` spells them."
+  @spec frame_meta_keys() :: {[atom()], [atom()]}
+  def frame_meta_keys, do: :erlang.nif_error(:nif_not_loaded)
 
   defp load_result, do: :persistent_term.get(@load_result, {:error, :not_loaded})
 

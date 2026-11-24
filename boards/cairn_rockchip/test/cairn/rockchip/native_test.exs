@@ -15,6 +15,13 @@ defmodule Cairn.Rockchip.NativeTest do
     end
   end
 
+  unless Native.available?(), do: @tag(skip: "libcairn_rockchip is not built")
+
+  test "the library was built against this stage contract and frame metadata" do
+    assert Native.contract() == Cairn.Stage.contract()
+    assert Native.frame_meta_keys() == Cairn.Stage.EngineNif.frame_meta_keys()
+  end
+
   # Undeclared (the behaviours conflict), so the compiler checks none of it.
   test "the module exports every decoder callback" do
     Code.ensure_loaded!(Native)

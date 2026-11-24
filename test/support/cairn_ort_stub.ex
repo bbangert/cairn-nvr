@@ -11,6 +11,7 @@ defmodule Cairn.CairnOrtStub do
   @behaviour Cairn.Stage.EngineNif
 
   alias Cairn.NativeStub
+  alias Cairn.Stage.EngineNif
 
   @impl true
   def available?, do: control(:ort_available?, true)
@@ -73,6 +74,12 @@ defmodule Cairn.CairnOrtStub do
   end
 
   defp timed(other, _micros), do: other
+
+  @impl true
+  def contract, do: Cairn.Stage.contract()
+
+  @impl true
+  def frame_meta_keys, do: EngineNif.frame_meta_keys()
 
   def cpu_baseline_ms(config, passes) do
     notify({:cpu_baseline_ms, config, passes})
