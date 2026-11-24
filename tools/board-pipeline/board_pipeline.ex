@@ -607,7 +607,12 @@ defmodule Cairn.BoardPipeline do
   # `rkmpp` and `rknn` name the same Rockchip module.
   defp nif_modules(opts) do
     board = Cairn.Board.module()
-    Enum.uniq([board.decoder_backend(opts.decoder), board.engine(opts.backend).module])
+    base = Cairn.Board.base()
+
+    Enum.uniq([
+      board.decoder_backend(opts.decoder, base),
+      board.engine(opts.backend, base).module
+    ])
   end
 
   defp drain(module) do

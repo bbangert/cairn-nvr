@@ -56,7 +56,8 @@ defmodule Cairn.Pipeline.DetectChain do
       # engine's config was pinned apart; a caller that passes none gets `nil`.
       decoder: Keyword.get(detect, :decoder),
       motion: gate && gate.config,
-      generic: generic(camera, stream_params, gate)
+      generic: generic(camera, stream_params, gate),
+      base: Cairn.Board.base()
     }
 
     steps = board.detect_chain(context)

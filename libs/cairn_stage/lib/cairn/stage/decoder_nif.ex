@@ -1,7 +1,7 @@
 defmodule Cairn.Stage.DecoderNif do
   @moduledoc """
   The decode NIF surface the host opens and drives decoders through. A board
-  names its module per `decoder:` (`c:Cairn.Stage.Board.decoder_backend/1`);
+  names its module per `decoder:` (`c:Cairn.Stage.Board.decoder_backend/2`);
   errors are `{reason, message}` in the crate's vocabulary.
   """
 

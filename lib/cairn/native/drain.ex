@@ -45,8 +45,9 @@ defmodule Cairn.Native.Drain do
   """
   @spec libraries(module()) :: [module()]
   def libraries(board \\ Cairn.Board.module()) do
-    engines = for backend <- Map.keys(board.backends()), do: board.engine(backend).module
-    decoders = Enum.map(board.decoders(), &board.decoder_backend/1)
+    base = Cairn.Board.base()
+    engines = for backend <- Map.keys(board.backends()), do: board.engine(backend, base).module
+    decoders = for decoder <- board.decoders(), do: board.decoder_backend(decoder, base)
     Enum.uniq(engines ++ decoders)
   end
 

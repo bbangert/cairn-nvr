@@ -36,10 +36,10 @@ defmodule Cairn.Native.DrainTest do
 
   defmodule ThreeLibraryBoard do
     def backends, do: %{"a" => %{}, "b" => %{}, "c" => %{}}
-    def engine("c"), do: %{module: :board_engine, canary: "probe"}
-    def engine(_backend), do: %{module: :base_engine, canary: "base"}
+    def engine("c", _base), do: %{module: :board_engine, canary: "probe"}
+    def engine(_backend, _base), do: %{module: :base_engine, canary: "base"}
     def decoders, do: ~w(auto sw)
-    def decoder_backend(_decoder), do: :base_decoder
+    def decoder_backend(_decoder, _base), do: :base_decoder
   end
 
   test "every library the board names is drained once, engines first" do

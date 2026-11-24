@@ -6,11 +6,11 @@ defmodule Cairn.Rockchip.Board do
   decode and RGA scale (`Cairn.Rockchip.DecodeScale`) plus the
   `Cairn.Rockchip.Download` that turns their dma-buf frames back into RGB.
 
-  The base's own libraries — the ffmpeg-backed decoder, the decoder host, the
-  onnxruntime engine and its canary — are lent through
-  `config :cairn_rockchip, :generic`, which the base's
-  `config/boards/rockchip.exs` sets: this library depends only on
-  `cairn_stage`, so it cannot name a base module itself.
+  Every other name gets the base's own libraries — the ffmpeg-backed decoder,
+  the onnxruntime engine and its canary — and `DecodeScale` opens through the
+  base's decoder host. All three arrive in the `base` map
+  (`t:Cairn.Stage.Board.base/0`): this library depends only on `cairn_stage`,
+  so it cannot name a base module itself.
   """
 
   @behaviour Cairn.Stage.Board
@@ -61,7 +61,7 @@ defmodule Cairn.Rockchip.Board do
       name: :decoder,
       element: %DecodeScale{
         camera_id: context.camera_id,
-        host: generic(:host),
+        host: context.base.host,
         stream_params: Map.put(context.stream_params, :motion_json, nil)
       },
       covers: [:decode, :scale],
@@ -111,12 +111,12 @@ defmodule Cairn.Rockchip.Board do
   end
 
   @impl true
-  def decoder_backend("rkmpp"), do: Native
-  def decoder_backend(_decoder), do: generic(:decoder)
+  def decoder_backend("rkmpp", _base), do: Native
+  def decoder_backend(_decoder, base), do: base.decoder
 
   @impl true
-  def engine("rknn"), do: %{module: Native, canary: "cairn-rockchip-probe"}
-  def engine(_backend), do: generic(:engine)
+  def engine("rknn", _base), do: %{module: Native, canary: "cairn-rockchip-probe"}
+  def engine(_backend, base), do: base.engine
 
   # Every reason that applies, so fixing one does not uncover the next on the
   # following boot. The base sets `CAIRN_RKNN_LIBRARY` to where it downloads
@@ -192,7 +192,4 @@ defmodule Cairn.Rockchip.Board do
 
   @impl true
   def profiles_dir, do: Application.app_dir(:cairn_rockchip, "priv/profiles")
-
-  defp generic(key),
-    do: :cairn_rockchip |> Application.fetch_env!(:generic) |> Keyword.fetch!(key)
 end

@@ -20,8 +20,8 @@ defmodule Cairn.Pipeline.DetectChainTest do
     @moduledoc false
     def name, do: "decoder"
 
-    def detect_chain(%{decoder: decoder, generic: generic}) do
-      send(self(), {:decoder, decoder})
+    def detect_chain(%{decoder: decoder, generic: generic, base: base}) do
+      send(self(), {:decoder, decoder, base})
       generic
     end
   end
@@ -68,13 +68,14 @@ defmodule Cairn.Pipeline.DetectChainTest do
     end
   end
 
-  test "the detect opts' decoder reaches the board, nil when absent" do
+  test "the detect opts' decoder reaches the board, nil when absent, with the base's libraries" do
     params = %{min_score: %{}, motion_json: nil}
     DetectChain.build(head(), @camera, [stream_params: params, decoder: "sw"], DecoderBoard)
-    assert_received {:decoder, "sw"}
+    assert_received {:decoder, "sw", base}
+    assert base == Cairn.Board.base()
 
     DetectChain.build(head(), @camera, [stream_params: params], DecoderBoard)
-    assert_received {:decoder, nil}
+    assert_received {:decoder, nil, _base}
   end
 
   describe "a board's chain is checked before anything is built" do

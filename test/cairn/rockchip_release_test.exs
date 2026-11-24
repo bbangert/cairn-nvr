@@ -50,15 +50,16 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
 
     test "the base reaches the board's libraries, and drains all three" do
       board = Cairn.Board.module()
+      base = Cairn.Board.base()
 
-      assert board.engine("rknn") == %{
+      assert board.engine("rknn", base) == %{
                module: Cairn.Rockchip.Native,
                canary: "cairn-rockchip-probe"
              }
 
-      assert board.engine("ort") == %{module: CairnOrt, canary: "cairn-detect"}
-      assert board.decoder_backend("sw") == Cairn.Native
-      assert board.decoder_backend("rkmpp") == Cairn.Rockchip.Native
+      assert board.engine("ort", base) == %{module: CairnOrt, canary: "cairn-detect"}
+      assert board.decoder_backend("sw", base) == Cairn.Native
+      assert board.decoder_backend("rkmpp", base) == Cairn.Rockchip.Native
       assert Drain.libraries() == [CairnOrt, Cairn.Rockchip.Native, Cairn.Native]
     end
 
