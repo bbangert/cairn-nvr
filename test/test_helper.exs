@@ -23,7 +23,8 @@ Cairn.Repo.delete_all(Cairn.Tracks.Track)
 # Run it with: mix test --only e2e_membrane
 #
 # :fixture_board needs a fixture board directory, which
-# tools/ci/build-fixture-board.sh builds. Run it with:
+# tools/ci/build-fixture-board.sh <dir> <release's cairn.rel> builds (the
+# boot test builds one in $WORK/board). Run it with:
 # CAIRN_FIXTURE_BOARD_DIR=<dir> mix test --only fixture_board
 ExUnit.start(exclude: [:integration, :native_parity, :e2e_membrane, :fixture_board])
 Ecto.Adapters.SQL.Sandbox.mode(Cairn.Repo, :manual)

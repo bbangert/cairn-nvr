@@ -149,6 +149,12 @@ A board that brings a new backend name also touches shared code, and this is whe
 
 The manifest is three Erlang terms, each once: `{app, cairn_rockchip}.`, `{board, 'Elixir.Cairn.Rockchip.Board'}.` and `{contract, 1}.` The board application's version is its `.app` `vsn`; the directory may hold other applications beside it.
 
+A board's Mix project writes its directory with `mix cairn_stage.board --core-rel <release>/releases/<vsn>/cairn.rel --out <dir>`, after it compiled, in the environment it ships from. The board module is the project's `cairn_board:` key in `project/0`; the contract is `Cairn.Stage.contract/0`. The task walks the board application's `applications` and `included_applications` through the build's `.app` files, judges each against the core release's `.rel`, and writes nothing if anything fails:
+
+- An application the `.rel` lists is not written, and its version in the board's build must equal the `.rel`'s. Versions are compared, never bytes: the same version builds differently in another checkout.
+- An application the `.rel` does not list is written, with its dependencies.
+- An application in neither the `.rel` nor the build is refused, unless it is optional. So is the board application itself in the `.rel`, a dependency on `:cairn`, an ERTS other than the `.rel`'s, and a `defimpl` of a protocol the directory does not ship.
+
 Attaching checks the contract number against `Cairn.Stage.contract/0`, then appends every `lib/*/ebin` to the code path and loads every application with all its modules, which runs each `on_load`. It requires the board application to be the directory's copy, runs `Cairn.Stage.Conformance.check/2` on the board module, handing `detect_chain/1` the base's own steps as `generic`, and only then records the board. `:cairn`'s start then starts the board application. Any failure stops the boot: `start/2` returns `{:error, {:board, message}}`, the log reads `Application cairn exited: … returned an error: {:board, "…"}`, and the VM halts with OTP's `application_start_failure` slogan carrying the same message.
 
 A board obeys these rules:
@@ -159,10 +165,10 @@ A board obeys these rules:
 - An application the release already ships is not taken from the directory: the release's copy is loaded first and is the one that runs. A board application the release ships is refused.
 - `backends/0` offers `ort` and `decoders/0` offers `auto`: the base's shipped profile and its defaults name them, so the loader refuses a board without either.
 - A NIF module that fails its `on_load` refuses the boot. One whose absence should not stop the node loads without its library and reports through `load_error/0`.
-- It implements no protocol: the release's protocols are consolidated, so a board's `defimpl` never dispatches.
+- It implements no protocol the release ships: the release's protocols are consolidated, so a board's `defimpl` of one never dispatches. The task refuses it.
 - The directory is trusted code. Every application under `lib/` is loaded and every `on_load` runs with the node's privileges, in an eval VM too, so the directory must not be writable by the service's user. The contract number is a compatibility check, not a signature.
 
-`test/fixture_board` is a board built this way, with a stub NIF and no hardware. `tools/ci/board-boot-test.sh`, CI's `board-loader` job, boots the prod release with it attached, and with broken copies of it that must be refused.
+`test/fixture_board` is a board built this way, with a stub NIF and no hardware; `tools/ci/build-fixture-board.sh` writes its directory. `tools/ci/board-boot-test.sh`, CI's `board-loader` job, boots the prod release with it attached, and with broken copies of it that must be refused.
 
 ## The ring buffer
 

@@ -2,8 +2,9 @@ defmodule CairnFixtureBoard.MixProject do
   use Mix.Project
 
   # Core's deps and lock, so the fixture builds against the versions the
-  # release ships, and nothing it fetches or builds lands under `test/`,
-  # where core's `mix test`, format and credo would read it.
+  # release ships, and its deps and build land outside `test/`, where core's
+  # `mix test`, format and credo would read them. Only the stub NIF is
+  # copied in, to `priv/native`, the `priv` `mix cairn_stage.board` ships.
   def project do
     [
       app: :cairn_fixture_board,
@@ -12,6 +13,7 @@ defmodule CairnFixtureBoard.MixProject do
       deps_path: "../../deps",
       lockfile: "../../mix.lock",
       build_path: "../../_build/fixture_board",
+      cairn_board: Cairn.FixtureBoard.Board,
       deps: [{:cairn_stage, path: "../../libs/cairn_stage"}]
     ]
   end
