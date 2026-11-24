@@ -60,6 +60,8 @@ defmodule Cairn.Board.LoaderTest do
 
       assert :ok = Loader.start()
       assert started?(app)
+      # `:application.info/0` is the one place the restart type shows.
+      assert {app, :permanent} in :application.info()[:started]
     end
 
     test "both halves are idempotent; a second directory is refused", %{tmp_dir: tmp} do
@@ -85,6 +87,31 @@ defmodule Cairn.Board.LoaderTest do
 
     test "start/0 with no board attached does nothing" do
       assert :ok = Loader.start()
+    end
+
+    test "a directory whose name holds glob characters", %{tmp_dir: tmp} do
+      %{dir: dir, board: board} = board_dir(Path.join(tmp, "b[1]{x}"))
+
+      assert :ok = Loader.attach(dir)
+      assert Cairn.Board.module() == board
+    end
+  end
+
+  describe "attach/0" do
+    test "does nothing with CAIRN_BOARD_DIR unset or empty" do
+      System.delete_env("CAIRN_BOARD_DIR")
+      assert :ok = Loader.attach()
+      System.put_env("CAIRN_BOARD_DIR", "")
+      assert :ok = Loader.attach()
+      assert :persistent_term.get(@key, nil) == nil
+    end
+
+    test "attaches CAIRN_BOARD_DIR", %{tmp_dir: tmp} do
+      %{dir: dir, board: board} = board_dir(tmp)
+      System.put_env("CAIRN_BOARD_DIR", dir)
+
+      assert :ok = Loader.attach()
+      assert Cairn.Board.module() == board
     end
   end
 
@@ -131,6 +158,45 @@ defmodule Cairn.Board.LoaderTest do
       assert message == "application #{app}: module :bad_nif failed its on_load"
     end
 
+    test "an application that depends on cairn, before loading any code", %{tmp_dir: tmp} do
+      %{dir: dir, app: app, board: board} = board_dir(tmp, applications: [:cairn])
+
+      assert {:error, message} = Loader.attach(dir)
+      ebin = Path.join([dir, "lib", "#{app}-0.1.0", "ebin"])
+
+      assert message ==
+               "application #{app} in #{ebin} depends on cairn; a board starts inside cairn's " <>
+                 "start and depends on cairn_stage, not on the base"
+
+      refute :code.is_loaded(board)
+    end
+
+    test "another application in the directory that includes cairn", %{tmp_dir: tmp} do
+      %{dir: dir} = board_dir(tmp)
+      extra = unique(:extra)
+      write_app(dir, extra, [], included_applications: [:cairn])
+
+      assert {:error, message} = Loader.attach(dir)
+      assert message =~ "application #{extra} in "
+      assert message =~ " depends on cairn; "
+    end
+
+    test "a board application the release already ships", %{tmp_dir: tmp} do
+      app = unique(:board)
+      shipped = Path.join(tmp, "release")
+      write_app(shipped, app, [erl(:"#{app}_board", "")])
+      :code.add_pathz(String.to_charlist(Path.join([shipped, "lib", "#{app}-0.1.0", "ebin"])))
+      :ok = Application.load(app)
+
+      %{dir: dir} = board_dir(Path.join(tmp, "board"), app: app)
+
+      assert {:error, message} = Loader.attach(dir)
+
+      assert message ==
+               "application #{app} in #{dir} is already shipped by this release, " <>
+                 "from #{shipped}/lib/#{app}-0.1.0"
+    end
+
     test "a manifest naming an application the directory does not hold", %{tmp_dir: tmp} do
       %{dir: dir} = board_dir(tmp, manifest_app: :not_here)
       assert {:error, message} = Loader.attach(dir)
@@ -144,15 +210,30 @@ defmodule Cairn.Board.LoaderTest do
     %{dir: dir, app: app} = board_dir(tmp, refuse_start: true)
 
     assert :ok = Loader.attach(dir)
-    assert {:error, message} = Loader.start()
+    # Permanent, a failed start would stop the test VM.
+    assert {:error, message} = Loader.start(:temporary)
     assert message =~ "board application #{app} did not start: "
     assert message =~ ":refused"
   end
 
+  test "Cairn.Application.start_board/0 tags a failed attach as the board's", %{tmp_dir: tmp} do
+    dir = Path.join(tmp, "nope")
+    System.put_env("CAIRN_BOARD_DIR", dir)
+
+    assert Cairn.Application.start_board() ==
+             {:error, {:board, "board directory #{dir} does not exist"}}
+  end
+
   describe "Cairn.Board.module/0" do
     test "is the built-in board with CAIRN_BOARD_DIR unset or empty" do
+      built_in = Application.get_env(:cairn, :board, Generic)
+
+      System.delete_env("CAIRN_BOARD_DIR")
+      assert Cairn.Board.module() == built_in
+
+      :persistent_term.erase(@key)
       System.put_env("CAIRN_BOARD_DIR", "")
-      assert Cairn.Board.module() == Application.get_env(:cairn, :board, Generic)
+      assert Cairn.Board.module() == built_in
     end
 
     test "attaches from CAIRN_BOARD_DIR, as under bin/cairn eval", %{tmp_dir: tmp} do
@@ -179,7 +260,7 @@ defmodule Cairn.Board.LoaderTest do
   # A board whose module delegates every callback to the generic board, so a
   # process elsewhere in the VM that reads it mid-test gets generic answers.
   defp board_dir(dir, opts \\ []) do
-    app = unique(:board)
+    app = Keyword.get_lazy(opts, :app, fn -> unique(:board) end)
     board = :"#{app}_board"
 
     callbacks =
@@ -199,6 +280,8 @@ defmodule Cairn.Board.LoaderTest do
       else
         {[], []}
       end
+
+    start = start ++ Keyword.take(opts, [:applications])
 
     board_src = "-export([#{exports}]).\n" <> Enum.join(callbacks, "\n")
     modules = [erl(board, board_src)] ++ start_mod ++ Keyword.get(opts, :extra_modules, [])
@@ -230,13 +313,15 @@ defmodule Cairn.Board.LoaderTest do
       File.write!(Path.join(ebin, "#{mod}.beam"), bin)
     end
 
+    {deps, extra} = Keyword.pop(extra, :applications, [])
+
     spec =
       [
         description: ~c"loader test",
         vsn: ~c"0.1.0",
         modules: Enum.map(modules, &elem(&1, 0)),
         registered: [],
-        applications: [:kernel, :stdlib]
+        applications: [:kernel, :stdlib | deps]
       ] ++ extra
 
     File.write!(

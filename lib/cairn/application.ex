@@ -9,10 +9,17 @@ defmodule Cairn.Application do
 
   @impl true
   def start(_type, _args) do
-    # Before the child list: `Drain` and `Artifacts` read the board.
+    # Before the tree: every reader of the board is in it, the first being
+    # `Drain`'s child spec.
+    with :ok <- start_board(), do: start_tree()
+  end
+
+  @doc false
+  @spec start_board() :: :ok | {:error, {:board, String.t()}}
+  def start_board do
     with :ok <- Loader.attach(),
          :ok <- Loader.start() do
-      start_tree()
+      :ok
     else
       {:error, message} -> {:error, {:board, message}}
     end
