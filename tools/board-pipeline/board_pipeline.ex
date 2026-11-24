@@ -384,7 +384,7 @@ end
 
 defmodule Cairn.BoardPipeline.Board do
   @moduledoc """
-  The release's board with one change, for `BOARD_PIPELINE_ENGINES` > 1: a
+  The node's board with one change, for `BOARD_PIPELINE_ENGINES` > 1: a
   camera's `:infer` step calls the `Cairn.Native.Host` this harness assigned
   it. `Cairn.Pipeline.DetectChain.build/4` hands a board only the chain
   context, so the assignment is a `:persistent_term` the harness writes
@@ -418,7 +418,7 @@ end
 defmodule Cairn.BoardPipeline.Pipe do
   @moduledoc """
   One camera's detect branch as production builds it
-  (`Cairn.Pipeline.DetectChain.build/4`, so the release's board picks the
+  (`Cairn.Pipeline.DetectChain.build/4`, so the node's board picks the
   elements), with a paced clip and parser standing in for the ingest session
   and `DetectionSink` for the host-side tracker. `stream_params: %{}` builds
   no motion gate: every sampled frame is inferred.
@@ -477,7 +477,7 @@ end
 
 defmodule Cairn.BoardPipeline do
   @moduledoc """
-  Runs cairn's detect branch, as the release's board builds it, for N paced
+  Runs cairn's detect branch, as the node's board builds it, for N paced
   clip streams against real `Cairn.Native.Host`s (each with its
   `Cairn.Native.Health`). `Cairn.BoardSoak` asks whether the NIFs survive;
   this asks whether the *pipeline around them* behaves — the format-driven

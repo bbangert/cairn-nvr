@@ -272,10 +272,10 @@ defmodule Cairn.Config do
   source re-rendering a reduced fleet passes it, to hold the rung and derived
   rate the full fleet resolved to (D-P1).
 
-  `board:` replaces the release's board (`Cairn.Board.module/0`) for its
+  `board:` replaces the node's board (`Cairn.Board.module/0`) for its
   profile directory and its preflight, so the suite can reach states the
   generic board never produces; the menus `Cairn.Config.Profile` checks still
-  come from the release's board. `artifacts:` replaces
+  come from the node's board. `artifacts:` replaces
   `Cairn.Artifacts.unusable/0`'s answer the same way, and `artifact:`
   `Cairn.Artifacts.state/1`, which a fetched ladder rung is looked up with.
   """
@@ -1336,7 +1336,7 @@ defmodule Cairn.Config do
 
   # D-P10: a group running a backend its board marks experimental needs both
   # halves of the acknowledgement, the profile's own `experimental:` and the
-  # operator's `allow_experimental:`. Read from the release's board, like
+  # operator's `allow_experimental:`. Read from the node's board, like
   # every menu `Cairn.Config.Profile` checks; a backend outside it is already
   # refused there, and would read here as experimental. Refused at load rather
   # than when the engine opens, because load is where an operator reads
@@ -1349,8 +1349,8 @@ defmodule Cairn.Config do
 
   @doc false
   # Public, taking the board's name and the backend's capabilities, so the
-  # gate can be driven by rows no shipped board holds; the release's board is
-  # compiled in and cannot be swapped per test.
+  # gate can be driven by rows no shipped board holds; the node's board is
+  # VM-global, so an async test cannot swap in its own.
   @spec check_experimental_backend(
           map(),
           PluginGroup.t(),

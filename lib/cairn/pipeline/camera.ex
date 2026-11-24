@@ -50,7 +50,7 @@ defmodule Cairn.Pipeline.Camera do
   detect branch depends on: a manual input behind our push source arms
   membrane_core's toilet and is killed under exactly the overload it exists to
   survive, so the manual pads are internal to the branch, behind
-  `Cairn.Pipeline.Picker`. What follows the picker is the release's board's
+  `Cairn.Pipeline.Picker`. What follows the picker is the node's board's
   (`Cairn.Pipeline.DetectChain`); on the generic board it is access units into
   `Cairn.Pipeline.Decoder` and sampled RGB frames between the decoder and
   `Cairn.Pipeline.Inference` (D-C2's seam: frames as plain buffers, letterbox

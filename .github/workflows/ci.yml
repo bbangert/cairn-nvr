@@ -238,6 +238,46 @@ jobs:
           test/cairn/config_server_update_test.exs
           test/cairn/config_source_test.exs
           test/cairn/artifacts_test.exs
+          test/cairn/board/
+
+  board-loader:
+    name: Board loader (prod release + fixture board)
+    runs-on: ubuntu-latest
+    # The prod release booted with test/fixture_board attached from a board
+    # directory, for what only a release shows: embedded loading, the
+    # release's copy of an application winning over the directory's, the
+    # board application starting inside :cairn's start, and what a refused
+    # boot prints. Then the suite that needs a board attached.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          version-file: mise.toml
+          version-type: strict
+
+      - name: Cache deps, build and the fixture NIF's crates
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+            ~/.cargo/registry
+          key: mix-board-loader-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock', 'test/fixture_board/native/cairn_fixture_board/Cargo.lock') }}
+          restore-keys: |
+            mix-board-loader-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      - run: tools/ci/board-boot-test.sh
+        env:
+          WORK: ${{ runner.temp }}/board-boot
+
+      - run: mix test --only fixture_board test/cairn/fixture_board_test.exs
+        env:
+          CAIRN_FIXTURE_BOARD_DIR: ${{ runner.temp }}/board-boot/board
 
   audit:
     name: Hex audit · Unused deps
@@ -460,7 +500,8 @@ jobs:
             plugins/cairn-native/target
             plugins/cairn-ort/target
             boards/cairn_rockchip/native/cairn_rockchip/target
-          key: cargo-debian13-${{ hashFiles('plugins/*/Cargo.lock', 'boards/cairn_rockchip/native/cairn_rockchip/Cargo.lock') }}
+            test/fixture_board/native/cairn_fixture_board/target
+          key: cargo-debian13-${{ hashFiles('plugins/*/Cargo.lock', 'boards/cairn_rockchip/native/cairn_rockchip/Cargo.lock', 'test/fixture_board/native/cairn_fixture_board/Cargo.lock') }}
           restore-keys: |
             cargo-debian13-
 
@@ -564,6 +605,24 @@ jobs:
 
       - run: cargo doc --no-deps --document-private-items
         working-directory: boards/cairn_rockchip/native/cairn_rockchip
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # The fixture board's stub NIF, same gates.
+      - run: cargo fmt --check
+        working-directory: test/fixture_board/native/cairn_fixture_board
+
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: test/fixture_board/native/cairn_fixture_board
+
+      - run: cargo test
+        working-directory: test/fixture_board/native/cairn_fixture_board
+
+      - run: cargo build --release
+        working-directory: test/fixture_board/native/cairn_fixture_board
+
+      - run: cargo doc --no-deps --document-private-items
+        working-directory: test/fixture_board/native/cairn_fixture_board
         env:
           RUSTDOCFLAGS: -D warnings
 

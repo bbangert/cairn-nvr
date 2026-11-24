@@ -1,0 +1,9 @@
+# The fixture board's one profile. The model path resolves against the
+# node's working directory, which the boot test arranges.
+experimental: true
+backend: fake
+decoder: fake
+model:
+  fake: models/fixture.fake
+model_profile: yolox
+input_size: 416

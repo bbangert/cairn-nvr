@@ -207,6 +207,20 @@ defmodule Cairn.Board.LoaderTest do
                  "from #{shipped}/lib/#{app}-0.1.0"
     end
 
+    test "a board that does not conform, naming each violation", %{tmp_dir: tmp} do
+      overrides = %{name: "'name'() -> 42.", profiles_dir: "'profiles_dir'() -> <<\"/nope\">>."}
+      %{dir: dir, board: board} = board_dir(tmp, overrides: overrides)
+
+      assert {:error, message} = Loader.attach(dir)
+
+      assert message ==
+               "board #{inspect(board)} in #{dir} does not conform: " <>
+                 "#{inspect(board)}.name/0 is 42, not a non-empty string; " <>
+                 "#{inspect(board)}.profiles_dir/0 /nope is no directory"
+
+      assert :persistent_term.get(@key, nil) == nil
+    end
+
     test "a manifest naming an application the directory does not hold", %{tmp_dir: tmp} do
       %{dir: dir} = board_dir(tmp, manifest_app: :not_here)
       assert {:error, message} = Loader.attach(dir)
@@ -267,16 +281,22 @@ defmodule Cairn.Board.LoaderTest do
 
   defp started?(app), do: List.keymember?(Application.started_applications(), app, 0)
 
-  # A board whose module delegates every callback to the generic board, so a
-  # process elsewhere in the VM that reads it mid-test gets generic answers.
+  # A board whose module delegates every callback not in `:overrides` to the
+  # generic board, so a process elsewhere in the VM that reads it mid-test
+  # gets generic answers.
   defp board_dir(dir, opts \\ []) do
     app = Keyword.get_lazy(opts, :app, fn -> unique(:board) end)
     board = :"#{app}_board"
 
+    overrides = Keyword.get(opts, :overrides, %{})
+
     callbacks =
       for {fun, arity} <- Generic.__info__(:functions) do
         args = Enum.map_join(1..arity//1, ",", &"A#{&1}")
-        "'#{fun}'(#{args}) -> 'Elixir.Cairn.Board.Generic':'#{fun}'(#{args})."
+
+        Map.get_lazy(overrides, fun, fn ->
+          "'#{fun}'(#{args}) -> 'Elixir.Cairn.Board.Generic':'#{fun}'(#{args})."
+        end)
       end
 
     exports =

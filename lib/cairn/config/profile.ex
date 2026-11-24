@@ -11,7 +11,7 @@ defmodule Cairn.Config.Profile do
   every field the model half reads (`model:` a mapping of path strings,
   `model_profile:`/`decoder:`/`labels:` strings, `experimental:` a boolean)
   are rejected here. So are names outside the menus — `backend:` and
-  `decoder:` against the release's board (`Cairn.Stage.Board`),
+  `decoder:` against the node's board (`Cairn.Stage.Board`),
   `model_profile:` against the Rust catalog's decode contracts and their
   families — and two backend/family combinations: a fused-NMS export on a
   backend that cannot run the op, and a family that the backend's
@@ -46,7 +46,7 @@ defmodule Cairn.Config.Profile do
                              # Absent = no tier semantics (today's behavior).
   experimental: false        # true before any group may run a backend the
                              # board marks experimental
-  backend: ort               # one of the backends the release's board offers
+  backend: ort               # one of the backends the node's board offers
   model:                     # per-backend artifact paths; onnx: is also the
                              # FP32 CPU twin a backend the CPU cannot run
                              # needs (its capability's cpu_twin)
@@ -273,7 +273,7 @@ defmodule Cairn.Config.Profile do
   @type family :: %{families: [String.t()], nms: :fused | :host_side | :none}
 
   @doc """
-  What `backend` accepts, from the release's board (`Cairn.Stage.Board.backends/0`).
+  What `backend` accepts, from the node's board (`Cairn.Stage.Board.backends/0`).
 
   Raises on a backend outside the board's menu — every caller has already had
   `check_backend/3` reject one.
