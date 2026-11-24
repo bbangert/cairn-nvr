@@ -8,7 +8,7 @@ into *both* halves of the boundary — the in-VM engine's model config and the
 host's tracker stage list — so the two cannot disagree with each other.
 
 A profile is **data composing curated code**. Every field names something that
-already exists: a family the Rust catalog ships, a backend the release's board
+already exists: a family the Rust catalog ships, a backend the node's board
 offers, a stage the tracker implements. There are no free knobs here — a value
 this file does not accept is one nothing in cairn implements.
 
@@ -18,11 +18,11 @@ other route — a camera's `plugin:` names a `plugins:` group, every group must
 name a `profile:` (one without is a config error), and the group's cameras run
 what that profile names.
 
-Shipped profiles live in `priv/profiles/`; a board's own live in the directory
-its release names (`Cairn.Stage.Board.profiles_dir/0`); yours live wherever
+Shipped profiles live in `priv/profiles/`; a board's own live in its
+`Cairn.Stage.Board.profiles_dir/0`; yours live wherever
 you point `profile_dirs:`. The schema and the `profile …:` messages quoted
 below come from `Cairn.Config.Profile`; the `backend:` and `decoder:` menus
-come from the release's board.
+come from the node's board.
 
 ## Attaching one
 
@@ -41,7 +41,7 @@ plugins:
     # reference and your consent flags — the external-plugin `command:` form
     # died with membrane port phase 6.
     profile: rk3566-tier1
-    # Required to run a profile whose backend the release's board marks
+    # Required to run a profile whose backend the node's board marks
     # experimental: each release offers `ort` plus its own (`qnn` on the
     # generic board, `rknn` on the Rockchip one), and both of those are
     # marked so. Both halves are needed — the profile says
@@ -259,9 +259,9 @@ Two consequences worth an operator's attention:
 
 | field | menu | where the menu lives |
 |---|---|---|
-| `backend` | `ort`, `qnn` | the release's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors `BackendKind`'s ort and qnn rows, `plugins/cairn-detect/src/infer/backend.rs`, and the Rockchip board's carries rknn's |
+| `backend` | `ort`, `qnn` | the node's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors `BackendKind`'s ort and qnn rows, `plugins/cairn-detect/src/infer/backend.rs`, and the Rockchip board's carries rknn's |
 | `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr`, `yolov8split`, `yolo26split` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
-| `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the release's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
+| `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the node's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
 The `backend` and `decoder` menus shown are the generic board's. The
@@ -406,7 +406,7 @@ against.
 
 ## The capability table, and what it refuses
 
-The release's board carries a static table of what each backend accepts
+The node's board carries a static table of what each backend accepts
 (`Cairn.Stage.Board.backends/0`). The fused-NMS and dynamic-shape columns
 mirror its `BackendKind::capabilities` row on the Rust side; the CPU twin,
 whether the backend is experimental and its conversion verdicts are the
@@ -594,7 +594,7 @@ channel to refuse one at runtime.
 
 ## Contributing a board profile
 
-**A profile needs no code change** when the release's board already offers
+**A profile needs no code change** when the node's board already offers
 the decoder and backend it names. Write the file, drop it in a
 `profile_dirs:` directory, restart or hit Reload. Everything the file names is
 already in the code: if it loads, every value in it is one cairn implements. If

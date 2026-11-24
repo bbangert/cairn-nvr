@@ -87,13 +87,13 @@ Topology: source (`BridgeSource` or `RTSPDualStream.Source`) → TS demux (bridg
 
 ## Boards
 
-Everything that differs between SoC families — the decoders and NPU runtimes on offer, the elements in a camera's detect branch, the profiles that ship — belongs to a **board**, and a release is built for exactly one. Three layers:
+Everything that differs between SoC families — the decoders and NPU runtimes on offer, the elements in a camera's detect branch, the profiles that ship — belongs to a **board**, and a node runs exactly one. Three layers:
 
 - **`libs/cairn_stage`, the contract.** `Cairn.Stage.Board` is the behaviour a board implements. `Cairn.Stage.Step` and `Cairn.Stage.Chain` say what a detect chain is and check one. `DecoderNif` and `EngineNif` are the behaviours a board's NIF modules meet, `FrameMeta` and `DmaFrame` the frame formats that pass between elements. `SampleGate` and `DecoderCore` are the sampling rule and the decode element's lifecycle, held here so every board's decoder behaves alike. The library depends on Membrane and on nothing of Cairn's.
 - **The base, `:cairn`.** Everything else in this document, and the generic board (`Cairn.Board.Generic`): decode through `cairn-native`, ONNX Runtime and QNN through `cairn-ort`.
 - **A board library under `boards/`.** Today `boards/cairn_rockchip`: its elements (`DecodeScale`, `Download`), its NIF crate over MPP, librga and RKNN, its probe binary and its profiles. Its Elixir depends on `cairn_stage` and never on the base. The base libraries it reuses are lent to it by name in `config/boards/rockchip.exs`: the generic decoder and engine, for a camera that does not ask for `rkmpp` and a backend that is not `rknn`, and the decoder host, which its own decode element opens through as well. Its Rust crate is the exception to that separation: it has path dependencies on `plugins/cairn-detect` and `plugins/cairn-ort`.
 
-`CAIRN_BOARD` (default `generic`) picks the board when the release is compiled, and nothing switches it afterwards. `mix.exs` adds the board library as a dependency; `config/config.exs` imports `config/boards/<board>.exs`, which names the board module; `Cairn.Board` reads that name once, at compile time; and the Dockerfile's runtime stage is `vendor-<board>`.
+`CAIRN_BOARD` (default `generic`) picks the board a release is built with. `mix.exs` adds the board library as a dependency; `config/config.exs` imports `config/boards/<board>.exs`, which names the board module; `Cairn.Board` reads that name at compile time, as its default; and the Dockerfile's runtime stage is `vendor-<board>`. A board attached at boot from a board directory replaces the default (see [Board directories](#board-directories)).
 
 ### What a board answers
 
@@ -136,6 +136,33 @@ A second board, `boards/cairn_foo`, needs:
 6. In CI: an entry in the sobelow and dialyzer matrices, a test job compiled with `CAIRN_BOARD=foo`, a job for the library standing alone, and the five Rust gates for its crate.
 
 A board that brings a new backend name also touches shared code, and this is where the separation is incomplete: `BackendKind` in `plugins/cairn-detect` enumerates backends, `Rknn` among them. Whether a backend is experimental, and which decode contracts its conversion is proven for, the board declares in `backends/0`; the base reads both through `Cairn.Stage.Capabilities`.
+
+### Board directories
+
+`CAIRN_BOARD_DIR` names a directory holding a board built apart from the release. `Cairn.Board.Loader` attaches it in `Cairn.Application.start/2`, before the supervision tree starts, and `bin/cairn eval` attaches it on the first `Cairn.Board.module/0`. Empty or unset means the built-in board.
+
+```
+<dir>/board.manifest
+<dir>/lib/<app>-<vsn>/ebin    the .app file and the beams
+<dir>/lib/<app>-<vsn>/priv    NIF libraries, profiles
+```
+
+The manifest is three Erlang terms, each once: `{app, cairn_rockchip}.`, `{board, 'Elixir.Cairn.Rockchip.Board'}.` and `{contract, 1}.` The board application's version is its `.app` `vsn`; the directory may hold other applications beside it.
+
+Attaching checks the contract number against `Cairn.Stage.contract/0`, then appends every `lib/*/ebin` to the code path and loads every application with all its modules, which runs each `on_load`. It requires the board application to be the directory's copy, runs `Cairn.Stage.Conformance.check/2` on the board module, handing `detect_chain/1` the base's own steps as `generic`, and only then records the board. `:cairn`'s start then starts the board application. Any failure stops the boot: `start/2` returns `{:error, {:board, message}}`, the log reads `Application cairn exited: … returned an error: {:board, "…"}`, and the VM halts with OTP's `application_start_failure` slogan carrying the same message.
+
+A board obeys these rules:
+
+- It depends on `cairn_stage`, on applications the release ships, and on applications its directory carries, never on `:cairn`. Its application starts inside `:cairn`'s start, before `:cairn`'s tree, so it cannot use `:cairn`'s processes; a dependency on `:cairn` would hang the boot, and the loader refuses it.
+- It is started `:permanent`: a board application that fails to start, or exits later, halts the node.
+- It is built for this release's contract number. A different number is refused, naming both, before any board code is on the path; an engine library that loaded must report the same number from `contract/0`. One that did not load is never opened: the host refuses it by name.
+- An application the release already ships is not taken from the directory: the release's copy is loaded first and is the one that runs. A board application the release ships is refused.
+- `backends/0` offers `ort` and `decoders/0` offers `auto`: the base's shipped profile and its defaults name them, so the loader refuses a board without either.
+- A NIF module that fails its `on_load` refuses the boot. One whose absence should not stop the node loads without its library and reports through `load_error/0`.
+- It implements no protocol: the release's protocols are consolidated, so a board's `defimpl` never dispatches.
+- The directory is trusted code. Every application under `lib/` is loaded and every `on_load` runs with the node's privileges, in an eval VM too, so the directory must not be writable by the service's user. The contract number is a compatibility check, not a signature.
+
+`test/fixture_board` is a board built this way, with a stub NIF and no hardware. `tools/ci/board-boot-test.sh`, CI's `board-loader` job, boots the prod release with it attached, and with broken copies of it that must be refused.
 
 ## The ring buffer
 

@@ -1,0 +1,13 @@
+[package]
+name = "cairn-fixture-board"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[lib]
+name = "cairn_fixture_board"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.38"

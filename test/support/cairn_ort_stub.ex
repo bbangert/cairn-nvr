@@ -105,7 +105,7 @@ defmodule Cairn.CairnOrtStub do
     end
   end
 
-  # Drain calls the release board's real modules, never a stub.
+  # Drain calls the node's board's real modules, never a stub.
   @impl true
   def drain_teardown(_timeout_ms), do: true
 

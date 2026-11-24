@@ -16,9 +16,10 @@ defmodule Cairn.Board.Loader do
   builds on `cairn_stage` alone and cannot use `:cairn`'s processes.
 
   Two halves, because `bin/cairn eval` loads `:cairn` without starting it but
-  must still see the board: `attach/1` puts the code on the path, loads it
-  and records the board for `Cairn.Board.module/0`; `start/0` starts the
-  board application. Both are idempotent.
+  must still see the board: `attach/1` puts the code on the path, loads it,
+  checks the board module (`Cairn.Stage.Conformance`) and records it for
+  `Cairn.Board.module/0`; `start/0` starts the board application. Both are
+  idempotent.
 
   Each load step is explicit because `bin/cairn start` runs embedded: nothing
   autoloads, and a module on the path but not loaded fails
@@ -35,6 +36,9 @@ defmodule Cairn.Board.Loader do
   writable by the service's user. Nothing verifies a signature; the contract
   number is a compatibility check, not a security check.
   """
+
+  alias Cairn.Pipeline.DetectChain
+  alias Cairn.Stage.Conformance
 
   @key {__MODULE__, :board}
 
@@ -129,7 +133,8 @@ defmodule Cairn.Board.Loader do
          :ok <- has_app(dir, apps, manifest.app),
          :ok <- load_apps(apps),
          :ok <- from_dir(dir, manifest.app),
-         :ok <- board_module(manifest) do
+         :ok <- board_module(manifest),
+         :ok <- conforms(dir, manifest) do
       :persistent_term.put(@key, {:attached, Map.put(manifest, :dir, dir)})
     end
   end
@@ -338,5 +343,30 @@ defmodule Cairn.Board.Loader do
     if board in Application.spec(app, :modules),
       do: :ok,
       else: {:error, "board module #{inspect(board)} is not in application #{app}"}
+  end
+
+  # Every config load checks each profile's backend against the board, and
+  # the base's own `generic-ort.yml` and the `backend:` default are `ort`; a
+  # profile with no `decoder:` opens `auto`.
+  @doc false
+  def requires, do: %{backends: ["ort"], decoders: ["auto"]}
+
+  # After the load, so it judges the code the node would run; before the
+  # board is recorded, so no reader ever sees one that fails it.
+  defp conforms(dir, %{board: board, contract: contract}) do
+    opts = [
+      contract: contract,
+      generic: DetectChain.base_steps("conformance"),
+      requires: requires()
+    ]
+
+    case Conformance.check(board, opts) do
+      :ok ->
+        :ok
+
+      {:error, violations} ->
+        {:error,
+         "board #{inspect(board)} in #{dir} does not conform: " <> Enum.join(violations, "; ")}
+    end
   end
 end

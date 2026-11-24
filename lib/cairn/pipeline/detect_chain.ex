@@ -1,6 +1,6 @@
 defmodule Cairn.Pipeline.DetectChain do
   @moduledoc """
-  A camera's detect branch from the picker to inference, as the release's
+  A camera's detect branch from the picker to inference, as the node's
   board composes it (`c:Cairn.Stage.Board.detect_chain/1`). The base's own
   steps — decoder, the gate when one is configured, inference — reach the
   board in the context as `generic`; `Cairn.Board.Generic` returns them as
@@ -20,7 +20,7 @@ defmodule Cairn.Pipeline.DetectChain do
 
   @doc """
   `head` linked through the picker and every step, ending at the last one's
-  output. `board` is the release's unless a test names another.
+  output. `board` is the node's unless a test names another.
   """
   @spec build(Membrane.ChildrenSpec.builder(), map(), keyword(), module()) ::
           Membrane.ChildrenSpec.builder()
@@ -70,6 +70,13 @@ defmodule Cairn.Pipeline.DetectChain do
               "camera #{camera.id}: board #{board.name()}'s detect chain: #{message}"
     end
   end
+
+  @doc """
+  The base's own steps for a camera with no motion gate, as `detect_chain/1`
+  receives them in `generic`: what conformance checks a board's chain on.
+  """
+  @spec base_steps(String.t()) :: [Step.t()]
+  def base_steps(camera_id), do: generic(%{id: camera_id}, %{}, nil)
 
   defp generic(camera, stream_params, gate) do
     decoder = %Step{
