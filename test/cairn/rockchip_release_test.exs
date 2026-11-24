@@ -11,6 +11,7 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
     alias Cairn.Native.Drain
     alias Cairn.Pipeline.DetectChain
     alias Cairn.Rockchip.{DecodeScale, Download}
+    alias Cairn.Stage.Capabilities
 
     @stub_rknn "test/support/fixtures/models/stub.rknn"
     @stub_onnx "test/support/fixtures/models/stub.onnx"
@@ -94,6 +95,13 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       assert caps.dynamic_shapes == (dynamic == "true")
     end
 
+    # A key the base never asks about (an alias, a misspelling) is a dead
+    # verdict, and a contract the board omits reads as unlisted, not measured.
+    test "rknn's verdicts are keyed by exactly the base's decode contracts" do
+      %{conversions: %{contracts: contracts}} = Profile.capabilities("rknn")
+      assert Enum.sort(Map.keys(contracts)) == Enum.sort(Profile.contracts())
+    end
+
     test "the release's profiles are the base's and the board's; qcs6490-tier1 is not one" do
       assert {:ok, config, []} = Config.from_map(%{"data_dir" => "tmp/cfg_test"})
       assert Enum.sort(Map.keys(config.profiles)) == ["generic-ort", "rk3566-tier1"]
@@ -162,7 +170,7 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
 
       # The family the operator wrote, not its canonical: yolo11 and yolo26
       # are refused by name, not as "yolov8". The reasons' own wording is
-      # pinned in config_test.exs.
+      # pinned in the board library's suite.
       expected =
         for {where, family} <- [
               {"rknn-rfdetr", "rfdetr"},
@@ -173,7 +181,8 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
               # a rung's own family, over a profile whose family is proven
               {"rknn-rung: model_ladder rung 1", "yolo11"}
             ] do
-          {_canonical, %{rknn_conversion: {:unproven, why}}} = Profile.family(family)
+          {canonical, _row} = Profile.family(family)
+          {:unproven, why} = Capabilities.conversion(Profile.capabilities("rknn"), canonical)
 
           "profile #{where}: model_profile #{family} is not a proven rknn conversion: " <>
             "#{why} — experimental: true loads it regardless " <>
@@ -187,11 +196,11 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
                &(&1 =~ "profile rknn-truthy-experimental: experimental must be true or false")
              )
 
-      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :proven}}
+      fused = {"fusednet", "fusednet", %{families: [], nms: :fused}}
       acc = %{errors: [], warnings: []}
+      rknn = {"rknn", Profile.capabilities("rknn")}
 
-      assert %{errors: [error]} =
-               Profile.check_capabilities(acc, "profile s", "rknn", true, fused)
+      assert %{errors: [error]} = Profile.check_capabilities(acc, "profile s", rknn, true, fused)
 
       assert error =~ "profile s: rknn backend requires an NMS-free family or host-side-NMS"
     end
@@ -291,7 +300,7 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       assert Enum.any?(warnings, &(&1 =~ "CPU twin gone.onnx does not exist"))
     end
 
-    test "D-P10 is unchanged: rknn still needs experimental twice" do
+    test "rknn needs experimental twice (D-P10)" do
       dir = profile_dir("rk", rknn([rknn: @stub_rknn, onnx: @stub_onnx], false))
       assert {:error, errors} = Config.from_map(map("rk", [dir]))
       assert Enum.any?(errors, &(&1 =~ "must declare experimental: true"))

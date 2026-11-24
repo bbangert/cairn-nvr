@@ -3,7 +3,7 @@ defmodule Cairn.Rockchip.BoardTest do
   use ExUnit.Case, async: false
 
   alias Cairn.Rockchip.{Board, DecodeScale, Download, Native}
-  alias Cairn.Stage.{Chain, Step}
+  alias Cairn.Stage.{Capabilities, Chain, Step}
 
   # This suite has no base app, so stand-in atoms play the base's libraries.
   @generic [
@@ -37,6 +37,34 @@ defmodule Cairn.Rockchip.BoardTest do
     assert Map.keys(Board.backends()) == ~w(ort rknn)
     assert Board.backends()["rknn"].cpu_twin
     refute Board.backends()["ort"].cpu_twin
+  end
+
+  test "rknn has not soaked; ort has, and converts nothing" do
+    assert Capabilities.experimental?(Board.backends()["rknn"])
+    refute Capabilities.experimental?(Board.backends()["ort"])
+    assert Capabilities.conversion(Board.backends()["ort"], "rfdetr") == :proven
+  end
+
+  # Contracts by the base's canonical names; the base resolves yolo11 and
+  # yolo26 to yolov8 before asking.
+  test "rknn's conversions: three proven, and each unproven one says what was measured" do
+    rknn = Board.backends()["rknn"]
+    assert Capabilities.evidence(rknn) == "tools/rknn-export/README.md"
+
+    for contract <- ~w(yolox yolov8split yolo26split),
+        do: assert(Capabilities.conversion(rknn, contract) == :proven)
+
+    assert {:unproven, why} = Capabilities.conversion(rknn, "yolov8")
+    assert why =~ "one INT8 scale zeroes the scores"
+    assert why =~ "detected nothing in the toolkit's simulator"
+    assert why =~ "model_profile yolov8split for v8 and v11, yolo26split for yolo26"
+
+    assert {:unproven, why} = Capabilities.conversion(rknn, "yolov10")
+    assert why =~ "wrong boxes in FP16 on the board"
+    assert why =~ "measured on yolo26's export of that head"
+
+    assert {:unproven, why} = Capabilities.conversion(rknn, "rfdetr")
+    assert why =~ "no INT8 build ran on the board, where its FP16 build crashed librknnrt 2.3.2"
   end
 
   defp generic(gate?) do

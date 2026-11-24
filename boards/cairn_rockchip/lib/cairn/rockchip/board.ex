@@ -18,6 +18,37 @@ defmodule Cairn.Rockchip.Board do
   alias Cairn.Rockchip.{DecodeScale, Download, Native}
   alias Cairn.Stage.Step
 
+  # What rknn-toolkit2 and librknnrt 2.3.2 were measured to do with each
+  # decode contract's export. `:proven` converted to INT8, ran on the RK3566
+  # NPU and detected there. An unproven reason is the toolkit simulator's
+  # except where it names the board. Per contract, not per model size (a
+  # yolox_nano build passes as yolox and detected nothing in INT8 in the
+  # simulator) nor per family (yolov9 was never converted and shares yolov8's;
+  # yolov10's is yolo26's export of that head). Rockchip's model zoo covers v8
+  # and v11 through the head cut before its box decode: `yolov8split`'s
+  # layout, not `yolov8`'s. The backend opens INT8 artifacts only, so an FP16
+  # result in a reason is the runtime's, measured by the bench harness.
+  @conversions %{
+    "yolox" => :proven,
+    "yolov8split" => :proven,
+    "yolo26split" => :proven,
+    "yolov10" =>
+      {:unproven,
+       "its end-to-end output detects nothing in INT8 in the toolkit's simulator and " <>
+         "has wrong boxes in FP16 on the board, both measured on yolo26's export of " <>
+         "that head"},
+    "yolov8" =>
+      {:unproven,
+       "a whole-head export carries pixel-range boxes and 0..1 scores in one output, " <>
+         "whose one INT8 scale zeroes the scores (yolov8, yolo11 and yolo26 detected " <>
+         "nothing in the toolkit's simulator); their split exports detect on the board " <>
+         "(model_profile yolov8split for v8 and v11, yolo26split for yolo26)"},
+    "rfdetr" =>
+      {:unproven,
+       "its INT8 scores are unusable in the toolkit's simulator and no INT8 build ran " <>
+         "on the board, where its FP16 build crashed librknnrt 2.3.2 (no GridSample op)"}
+  }
+
   @impl true
   def name, do: "rockchip"
 
@@ -57,12 +88,25 @@ defmodule Cairn.Rockchip.Board do
 
   # No `qnn`: this board has no HTP, so a profile naming it is refused with
   # this board's name. Only librknnrt runs an `.rknn`, so the CPU baseline
-  # needs `rknn`'s twin.
+  # needs `rknn`'s twin. `rknn` stays experimental until it has soaked.
   @impl true
   def backends do
     %{
-      "ort" => %{artifact: "onnx", fused_nms: true, dynamic_shapes: true, cpu_twin: false},
-      "rknn" => %{artifact: "rknn", fused_nms: false, dynamic_shapes: false, cpu_twin: true}
+      "ort" => %{
+        artifact: "onnx",
+        fused_nms: true,
+        dynamic_shapes: true,
+        cpu_twin: false,
+        experimental: false
+      },
+      "rknn" => %{
+        artifact: "rknn",
+        fused_nms: false,
+        dynamic_shapes: false,
+        cpu_twin: true,
+        experimental: true,
+        conversions: %{evidence: "tools/rknn-export/README.md", contracts: @conversions}
+      }
     }
   end
 

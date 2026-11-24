@@ -22,15 +22,41 @@ defmodule Cairn.Stage.Board do
         }
 
   @typedoc """
-  `cpu_twin` is true when the CPU baseline cannot run the backend's artifact,
-  so a profile on it must name an FP32 ONNX twin under `model.onnx`.
+  One backend's claims, answered at config load with no engine running.
+
+  `artifact` is the `model:` key its compiled file is named under.
+  `fused_nms` is whether it runs an export with the NMS op inside the graph,
+  `dynamic_shapes` whether it accepts a graph that leaves a spatial dim
+  symbolic. `cpu_twin` is true when the CPU baseline cannot run the
+  artifact, so a profile on it must name an FP32 ONNX twin under
+  `model.onnx`.
+
+  `experimental` is true for a backend not yet proven in soak: a group runs
+  it only when its profile and the operator both acknowledge that. Absent
+  means true, so a board must say a backend is proven.
+
+  `conversions` is for a backend whose artifact is converted from the
+  contract's export by a tool that can break it: per decode contract (the
+  canonical `model_profile:` family), whether the converted model was
+  measured to detect, and `evidence`, where the measurements are. A backend
+  without the key declares no verdicts, so config load checks none of its
+  contracts. Read both keys through `Cairn.Stage.Capabilities`, which
+  applies the defaults.
   """
   @type capabilities :: %{
-          artifact: String.t(),
-          fused_nms: boolean(),
-          dynamic_shapes: boolean(),
-          cpu_twin: boolean()
+          required(:artifact) => String.t(),
+          required(:fused_nms) => boolean(),
+          required(:dynamic_shapes) => boolean(),
+          required(:cpu_twin) => boolean(),
+          optional(:experimental) => boolean(),
+          optional(:conversions) => %{
+            evidence: String.t(),
+            contracts: %{optional(String.t()) => conversion()}
+          }
         }
+
+  @typedoc "`{:unproven, why}` carries the measured failure a config diagnostic states."
+  @type conversion :: :proven | {:unproven, String.t()}
 
   # Config errors name the release's board with it.
   @callback name() :: String.t()
