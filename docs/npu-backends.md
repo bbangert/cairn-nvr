@@ -149,7 +149,8 @@ research asked of the seam, as built:
   Each backend's `Descriptor`, mirrored by each board's `backends/0`: the
   artifact (its extension in Rust, the `model:` key in Elixir), fused NMS,
   dynamic shapes, and on the Elixir side whether the CPU baseline needs an
-  FP32 twin.
+  FP32 twin, whether the backend is experimental, and its conversion
+  verdicts.
 - **The artifact format.** A profile's `model:` is keyed per backend
   (`onnx:`, `qnn:`, `rknn:`).
 

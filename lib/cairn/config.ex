@@ -19,6 +19,7 @@ defmodule Cairn.Config do
   # `as:` because this module is a `Config` of its own — the engine's
   # vocabulary and the operator's file are two different things.
   alias Cairn.Native.Config, as: NativeConfig
+  alias Cairn.Stage.Capabilities
 
   @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips events retention cameras
                  plugins integrations tracking profile_dirs)
@@ -1333,32 +1334,56 @@ defmodule Cairn.Config do
 
   defp check_group_profile(_group, acc), do: acc
 
-  # D-P10: a group running `rknn` or `qnn` needs both halves of the
-  # acknowledgement, the profile's own `experimental:` and the operator's
-  # `allow_experimental:`. Both execute (qnn on the generic board, rknn on
-  # the Rockchip one) and neither has soaked: non-ort means experimental
-  # until this comment says otherwise. Refused at load rather than when the
-  # engine opens, because load is where an operator reads diagnostics.
-  defp check_backend_implemented(acc, _group, %Profile{backend: "ort"}), do: acc
-
-  defp check_backend_implemented(acc, group, %Profile{experimental: false} = profile) do
-    add_error(
-      acc,
-      "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, which is " <>
-        "experimental — only ort is proven in soak, and a profile naming another backend " <>
-        "must declare experimental: true"
-    )
+  # D-P10: a group running a backend its board marks experimental needs both
+  # halves of the acknowledgement, the profile's own `experimental:` and the
+  # operator's `allow_experimental:`. Read from the release's board, like
+  # every menu `Cairn.Config.Profile` checks; a backend outside it is already
+  # refused there, and would read here as experimental. Refused at load rather
+  # than when the engine opens, because load is where an operator reads
+  # diagnostics.
+  defp check_backend_implemented(acc, group, profile) do
+    board = Cairn.Board.module()
+    caps = Map.get(board.backends(), profile.backend, %{})
+    check_experimental_backend(acc, group, profile, board.name(), caps)
   end
 
-  defp check_backend_implemented(acc, %PluginGroup{allow_experimental: false} = group, profile) do
-    add_error(
-      acc,
-      "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, which is " <>
-        "experimental — set allow_experimental: true on this plugin group to run it anyway"
-    )
-  end
+  @doc false
+  # Public, taking the board's name and the backend's capabilities, so the
+  # gate can be driven by rows no shipped board holds; the release's board is
+  # compiled in and cannot be swapped per test.
+  @spec check_experimental_backend(
+          map(),
+          PluginGroup.t(),
+          Profile.t(),
+          String.t(),
+          map()
+        ) :: map()
+  def check_experimental_backend(acc, group, profile, board_name, caps) do
+    # `!= true`: anything short of an explicit acknowledgement is refused.
+    cond do
+      not Capabilities.experimental?(caps) ->
+        acc
 
-  defp check_backend_implemented(acc, _group, _profile), do: acc
+      profile.experimental != true ->
+        add_error(
+          acc,
+          "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, " <>
+            "which is experimental on the #{board_name} board — a profile naming it " <>
+            "must declare experimental: true"
+        )
+
+      group.allow_experimental != true ->
+        add_error(
+          acc,
+          "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, " <>
+            "which is experimental — set allow_experimental: true on this plugin group to " <>
+            "run it anyway"
+        )
+
+      true ->
+        acc
+    end
+  end
 
   # The artifact is checked verbatim, against this node's working directory,
   # because that is the one the engine resolves it in: resolving the path

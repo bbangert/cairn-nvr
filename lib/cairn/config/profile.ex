@@ -14,13 +14,14 @@ defmodule Cairn.Config.Profile do
   `decoder:` against the release's board (`Cairn.Stage.Board`),
   `model_profile:` against the Rust catalog's decode contracts and their
   families — and two backend/family combinations: a fused-NMS export on a
-  backend that cannot run the op, and an rknn conversion not measured to
-  detect, which `experimental: true` turns from an error into a warning (see
+  backend that cannot run the op, and a family that the backend's
+  `conversions`, where it has them, does not list as proven, which
+  `experimental: true` turns from an error into a warning (see
   `check_capabilities/5`).
   `Cairn.Config` rejects a group's profile whose model artifact or labels file
   is missing, that names no CPU twin its backend needs (a named twin missing
-  on disk only warns), or whose backend is unproven (see "The model half"
-  below).
+  on disk only warns), or whose backend its board marks experimental without
+  both acknowledgements (see "The model half" below).
 
   Profiles are files, never inline config: shipped ones live in
   `priv/profiles/*.yml`, then the board's `profiles_dir/0`, then operator
@@ -43,12 +44,12 @@ defmodule Cairn.Config.Profile do
   tier: 2                    # optional; the capability this profile claims —
                              # 1 = presence detection, 2 = accurate MOT.
                              # Absent = no tier semantics (today's behavior).
-  experimental: false        # true before any group may run a non-ort backend
-  backend: ort               # ort | rknn | qnn, as the release's board offers;
-                             # rknn and qnn run behind the experimental gate
+  experimental: false        # true before any group may run a backend the
+                             # board marks experimental
+  backend: ort               # one of the backends the release's board offers
   model:                     # per-backend artifact paths; onnx: is also the
                              # FP32 CPU twin a backend the CPU cannot run
-                             # needs (rknn on a Rockchip release)
+                             # needs (its capability's cpu_twin)
     onnx: models/yolox_nano.onnx
   model_profile: yolox       # Rust catalog family name
   input_size: 416
@@ -143,18 +144,18 @@ defmodule Cairn.Config.Profile do
   rung, not yet in `Cairn.Artifacts` while a camera runs on it), a `labels:`
   file that is not on disk, a backend whose capability asks for a CPU twin
   with no `model.onnx` named (a named twin that is not on disk only warns:
-  health then has no baseline), and a group running a backend other than
-  `ort` — experimental until proven in soak (D-P10) — unless the profile
-  declares `experimental: true` *and* the group sets
-  `allow_experimental: true`. The file paths are checked only for a profile
-  some group actually runs, so a board profile for hardware this node does
-  not have costs it nothing.
+  health then has no baseline), and a group running a backend its board
+  marks experimental (D-P10) unless the profile declares
+  `experimental: true` *and* the group sets `allow_experimental: true`. The
+  file paths are checked only for a profile some group actually runs, so a
+  board profile for hardware this node does not have costs it nothing.
 
   Parsed on `Cairn.Config`'s `add_error/2`/`add_warning/2` contract like
   its `Camera`/`PluginGroup` siblings.
   """
 
   alias Cairn.Config
+  alias Cairn.Stage.Capabilities
   alias Cairn.Tracker.Stage
 
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
@@ -165,42 +166,24 @@ defmodule Cairn.Config.Profile do
   # The Rust catalog's model families, row for row with `PROFILES` in
   # `plugins/cairn-detect/src/infer/catalog.rs` — family names included, so
   # `model_profile:` is checked against the same set the stage library's
-  # `ModelProfile::parse` accepts — plus the two columns profile validation
-  # reads:
+  # `ModelProfile::parse` accepts. The canonical names are the decode
+  # contracts a backend's `conversions` lists (`Cairn.Stage.Board`).
   #
-  #   * `nms:` — where suppression happens. `:none` is an NMS-free head (Rust's
-  #     `nms: None`: yolov10's end-to-end head, rfdetr's queries); `:host_side`
-  #     is cairn's own suppression in the library's `heads` (`DEFAULT_NMS`),
-  #     which runs on the CPU whatever executed the model; `:fused` is a family
-  #     whose export carries the NMS op *inside the graph*. **No shipped family
-  #     is `:fused`** — every catalog row is one of the first two — so the
-  #     fused-NMS rule in `check_capabilities/5` cannot fire from today's menu.
-  #     It is data rather than a comment so that a family added later with a
-  #     fused export is refused on the NPU backends without anyone having to
-  #     remember the rule was here.
-  #   * `rknn_conversion:` — what rknn-toolkit2 and librknnrt 2.3.2 were
-  #     measured to do with the contract's export
-  #     (`tools/rknn-export/README.md`). `:proven` converted to INT8, ran on
-  #     the RK3566 NPU and detected there. `{:unproven, why}` carries the
-  #     reason `check_capabilities/5` states; such a verdict is the toolkit
-  #     simulator's except where its reason names the board. The verdict is
-  #     per decode contract: not per model size (a yolox_nano build passes
-  #     this rule and detected nothing in INT8 in the simulator) nor per
-  #     family (yolov9 was never converted and shares its row's; yolov10's is
-  #     yolo26's export of that head). Rockchip's model zoo covers v8 and v11
-  #     through the head cut before its box decode: `yolov8split`'s layout,
-  #     not `yolov8`'s. The backend opens INT8 artifacts only, so an FP16
-  #     result in a reason is the runtime's, measured by the bench harness.
+  # `nms:` is where suppression happens. `:none` is an NMS-free head (Rust's
+  # `nms: None`: yolov10's end-to-end head, rfdetr's queries); `:host_side` is
+  # cairn's own suppression in the library's `heads` (`DEFAULT_NMS`), which
+  # runs on the CPU whatever executed the model; `:fused` is a family whose
+  # export carries the NMS op *inside the graph*. **No shipped family is
+  # `:fused`** — every catalog row is one of the first two — so the fused-NMS
+  # rule in `check_capabilities/5` cannot fire from today's menu. It is data
+  # rather than a comment so that a family added later with a fused export is
+  # refused on the NPU backends without anyone having to remember the rule was
+  # here.
   @model_families %{
-    "yolox" => %{families: [], nms: :host_side, rknn_conversion: :proven},
+    "yolox" => %{families: [], nms: :host_side},
     "yolov10" => %{
       families: [],
-      nms: :none,
-      rknn_conversion:
-        {:unproven,
-         "its end-to-end output detects nothing in INT8 in the toolkit's simulator and " <>
-           "has wrong boxes in FP16 on the board, both measured on yolo26's export of " <>
-           "that head"}
+      nms: :none
     },
     # yolo26 belongs to this contract, not yolov10's: the only whole-head
     # exports this stack can run are end2end=False (the NMS-free tail
@@ -208,24 +191,14 @@ defmodule Cairn.Config.Profile do
     # device-proven on yolo26m 2026-08-19.
     "yolov8" => %{
       families: ["yolov9", "yolo11", "yolov11", "yolo26"],
-      nms: :host_side,
-      rknn_conversion:
-        {:unproven,
-         "a whole-head export carries pixel-range boxes and 0..1 scores in one output, " <>
-           "whose one INT8 scale zeroes the scores (yolov8, yolo11 and yolo26 detected " <>
-           "nothing in the toolkit's simulator); their split exports detect on the board " <>
-           "(model_profile yolov8split for v8 and v11, yolo26split for yolo26)"}
+      nms: :host_side
     },
     "rfdetr" => %{
       families: [],
-      nms: :none,
-      rknn_conversion:
-        {:unproven,
-         "its INT8 scores are unusable in the toolkit's simulator and no INT8 build ran " <>
-           "on the board, where its FP16 build crashed librknnrt 2.3.2 (no GridSample op)"}
+      nms: :none
     },
-    "yolov8split" => %{families: [], nms: :host_side, rknn_conversion: :proven},
-    "yolo26split" => %{families: [], nms: :host_side, rknn_conversion: :proven}
+    "yolov8split" => %{families: [], nms: :host_side},
+    "yolo26split" => %{families: [], nms: :host_side}
   }
 
   @stage_modules %{
@@ -294,29 +267,10 @@ defmodule Cairn.Config.Profile do
   @type t :: %__MODULE__{}
 
   @typedoc """
-  One backend's row of the capability table: the `model:` key its artifact is
-  named under, whether it runs an export with the NMS op fused into the graph,
-  whether it accepts a graph that leaves a spatial dim symbolic, and whether
-  the CPU baseline needs an FP32 ONNX twin under `model.onnx` because it
-  cannot run the artifact.
-  """
-  @type capabilities :: %{
-          artifact: String.t(),
-          fused_nms: boolean(),
-          dynamic_shapes: boolean(),
-          cpu_twin: boolean()
-        }
-
-  @typedoc """
   One model family's row: the `model_profile:` spellings that resolve to it,
-  where its suppression happens, and whether its rknn INT8 conversion was
-  measured to detect (with the reason, when not).
+  and where its suppression happens.
   """
-  @type family :: %{
-          families: [String.t()],
-          nms: :fused | :host_side | :none,
-          rknn_conversion: :proven | {:unproven, String.t()}
-        }
+  @type family :: %{families: [String.t()], nms: :fused | :host_side | :none}
 
   @doc """
   What `backend` accepts, from the release's board (`Cairn.Stage.Board.backends/0`).
@@ -324,7 +278,7 @@ defmodule Cairn.Config.Profile do
   Raises on a backend outside the board's menu — every caller has already had
   `check_backend/3` reject one.
   """
-  @spec capabilities(String.t()) :: capabilities()
+  @spec capabilities(String.t()) :: Cairn.Stage.Board.capabilities()
   def capabilities(backend), do: Map.fetch!(backends(), backend)
 
   @doc """
@@ -347,6 +301,10 @@ defmodule Cairn.Config.Profile do
   end
 
   def family(_other), do: nil
+
+  @doc "The catalog's decode contracts: every canonical name `family/1` resolves to."
+  @spec contracts() :: [String.t()]
+  def contracts, do: Map.keys(@model_families)
 
   @doc """
   The `model:` key naming `backend`'s compiled artifact — the one
@@ -769,16 +727,23 @@ defmodule Cairn.Config.Profile do
     requested = Map.get(raw, "model_profile")
 
     case {backend?(backend), family(requested)} do
-      {true, {_canonical, row}} ->
+      {true, {canonical, row}} ->
         # `=== true`, not `|| false`: a non-boolean `experimental:` is already
         # an error (`check_experimental/3`, same pipeline), and treating its
-        # truthiness as acknowledgement would make the rknn rule's refusal a
-        # warning alongside it.
+        # truthiness as acknowledgement would make the conversion rule's
+        # refusal a warning alongside it.
         # Diagnostics carry the name the OPERATOR wrote, the one in their
         # file: yolo11 refused as "yolov8" sends them looking for a name they
         # never wrote.
         experimental = Map.get(raw, "experimental") === true
-        check_capabilities(acc, "profile #{name}", backend, experimental, {requested, row})
+
+        check_capabilities(
+          acc,
+          "profile #{name}",
+          {backend, capabilities(backend)},
+          experimental,
+          {requested, canonical, row}
+        )
 
       _unknown_backend_or_no_family ->
         acc
@@ -786,55 +751,65 @@ defmodule Cairn.Config.Profile do
   end
 
   @doc false
-  # Public only so the fused-NMS rule can be exercised against a family row
-  # today's catalog does not contain — see `@model_families`. `where` opens
-  # each diagnostic (the profile, or one of its rungs); the last argument is
-  # a `family/1` row paired with the name the operator wrote. Test coverage
-  # leans on both rules being reached through this one function: the rknn
-  # rule's fixtures (run on the Rockchip board, whose menu has rknn) prove
-  # the parse→here wiring on the public path, the synthetic fused row proves
-  # the NMS branch directly — give the rules separate entry points and each
-  # needs its own public-path test.
-  @spec check_capabilities(map(), String.t(), String.t(), boolean(), {String.t(), family()}) ::
-          map()
-  def check_capabilities(acc, where, backend, experimental, {model_profile, family}) do
-    caps = capabilities(backend)
+  # Public so both rules can be exercised against rows no shipped menu holds:
+  # a fused family (see `@model_families`), and a backend with `conversions`,
+  # of which the generic board has none. `where` opens each diagnostic (the
+  # profile, or one of its rungs); `requested` is led by the name the
+  # operator wrote. Test coverage leans on both rules being reached through
+  # this one function: the conversion rule's fixtures (run where a board
+  # backend has `conversions`) prove the parse→here wiring on the public
+  # path, direct calls prove each branch — give the rules separate entry
+  # points and each needs its own public-path test.
+  @spec check_capabilities(
+          map(),
+          String.t(),
+          {String.t(), Cairn.Stage.Board.capabilities()},
+          boolean(),
+          {String.t(), String.t(), family()}
+        ) :: map()
+  def check_capabilities(acc, where, {backend, caps}, experimental, requested) do
+    {model_profile, _canonical, row} = requested
 
     acc
     |> Config.check(
-      family.nms != :fused or caps.fused_nms,
+      row.nms != :fused or caps.fused_nms,
       "#{where}: #{backend} backend requires an NMS-free family or host-side-NMS " <>
         "decode, and model_profile #{model_profile} fuses the suppression op into its " <>
         "export — its op is not one this runtime implements, so the graph would be " <>
         "declined at load"
     )
-    |> check_rknn_conversion(where, backend, experimental, model_profile, family)
+    |> check_conversion(where, {backend, caps}, experimental, requested)
   end
 
-  # Acknowledged, it warns with the same reason: while rknn is itself
-  # experimental (`Cairn.Config`'s backend gate) every profile a group runs
-  # declares `experimental: true`, and the refusal alone reaches none of them.
-  defp check_rknn_conversion(acc, where, "rknn", experimental, model_profile, %{
-         rknn_conversion: {:unproven, why}
-       }) do
-    if experimental do
-      Config.add_warning(
-        acc,
-        "#{where}: experimental: true loads model_profile #{model_profile}, which is not " <>
-          "a proven rknn conversion: #{why}"
-      )
-    else
-      Config.add_error(
-        acc,
-        "#{where}: model_profile #{model_profile} is not a proven rknn conversion: " <>
-          "#{why} — experimental: true loads it regardless " <>
-          "(measurements: tools/rknn-export/README.md)"
-      )
+  # An acknowledged unproven conversion still loads and runs, so its reason
+  # is logged as a warning rather than lost with the error it replaces.
+  defp check_conversion(acc, where, {backend, caps}, experimental, {model_profile, canonical, _}) do
+    case {Capabilities.conversion(caps, canonical), experimental} do
+      {:proven, _experimental} ->
+        acc
+
+      {{:unproven, why}, true} ->
+        Config.add_warning(
+          acc,
+          "#{where}: experimental: true loads model_profile #{model_profile}, which is not " <>
+            "a proven #{backend} conversion: #{why}"
+        )
+
+      {{:unproven, why}, false} ->
+        Config.add_error(
+          acc,
+          "#{where}: model_profile #{model_profile} is not a proven #{backend} conversion: " <>
+            "#{why} — experimental: true loads it regardless" <> measurements(caps)
+        )
     end
   end
 
-  defp check_rknn_conversion(acc, _where, _backend, _experimental, _model_profile, _family),
-    do: acc
+  defp measurements(caps) do
+    case Capabilities.evidence(caps) do
+      nil -> ""
+      evidence -> " (measurements: #{evidence})"
+    end
+  end
 
   # Both tier rules in one place: the menu check (the ladder's shipped rungs,
   # see `@tiers`) and the one cross-field contradiction — a tier-1 profile
@@ -1177,10 +1152,17 @@ defmodule Cairn.Config.Profile do
                 "#{inspect(value)} (#{family_menu()})"
             )
 
-          {{_canonical, row}, true} ->
+          {{canonical, row}, true} ->
             experimental = Map.get(raw, "experimental") === true
             where = "profile #{name}: model_ladder rung #{index}"
-            check_capabilities(acc, where, backend, experimental, {value, row})
+
+            check_capabilities(
+              acc,
+              where,
+              {backend, capabilities(backend)},
+              experimental,
+              {value, canonical, row}
+            )
 
           {_family, false} ->
             acc

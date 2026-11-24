@@ -102,7 +102,7 @@ Everything that differs between SoC families — the decoders and NPU runtimes o
 | `name/0` | The board's name; config errors carry it |
 | `detect_chain/1` | The steps of one camera's detect branch (below) |
 | `decoders/0` | The `decoder:` names a profile may use |
-| `backends/0` | The `backend:` names, each with its capabilities: the `model:` key naming its artifact, whether NMS may be fused into the graph, whether shapes are dynamic, whether the CPU baseline needs an FP32 twin |
+| `backends/0` | The `backend:` names, each with its capabilities: the `model:` key naming its artifact, whether NMS may be fused into the graph, whether shapes are dynamic, whether the CPU baseline needs an FP32 twin, whether it is experimental (absent means it is), and, for a backend whose artifact is converted from the export, which decode contracts the conversion was measured to detect on |
 | `decoder_backend/1` | The decode NIF module behind a decoder name |
 | `engine/1` | The engine NIF module behind a backend name, and the canary executable that probe-loads a model for it |
 | `preflight/0` | Which of those names cannot work on this host, and why (a missing device, library or NIF) — a profile naming one is valid and would do nothing |
@@ -135,7 +135,7 @@ A second board, `boards/cairn_foo`, needs:
 5. In `.github/workflows/container.yml`: the `board` option and its add-on mapping, with a `deploy/vagus-addon/<addon>/config.yaml`.
 6. In CI: an entry in the sobelow and dialyzer matrices, a test job compiled with `CAIRN_BOARD=foo`, a job for the library standing alone, and the five Rust gates for its crate.
 
-A board that brings a new backend registers it from its own crate: a `Descriptor` (name and capabilities) and a `Provider` that opens it, handed to `cairn_detect::cli::run` by its probe binary and to `Engine::with_provider` by its NIF. `plugins/cairn-detect` names only the backends it opens itself, `ort` and `qnn`. The separation is still incomplete in the Elixir base: it treats every backend but `ort` as experimental. And a backend's model verdicts live in the base's profile catalog, keyed on the backend's name, as `rknn_conversion` does.
+A board that brings a new backend registers it from its own crate: a `Descriptor` (name and capabilities) and a `Provider` that opens it, handed to `cairn_detect::cli::run` by its probe binary and to `Engine::with_provider` by its NIF. `plugins/cairn-detect` names only the backends it opens itself, `ort` and `qnn`. Whether a backend is experimental, and which decode contracts its conversion is proven for, the board declares in `backends/0`; the base reads both through `Cairn.Stage.Capabilities`.
 
 ## The ring buffer
 

@@ -41,12 +41,12 @@ plugins:
     # reference and your consent flags — the external-plugin `command:` form
     # died with membrane port phase 6.
     profile: rk3566-tier1
-    # Required to run a profile whose backend is not `ort`: each release
-    # offers `ort` plus its own (`qnn` on the generic board, `rknn` on the
-    # Rockchip one), and both of those are experimental. Both halves are
-    # needed — the profile says `experimental: true`, you say
-    # `allow_experimental: true` — because one is the author's claim and the
-    # other is your consent.
+    # Required to run a profile whose backend the release's board marks
+    # experimental: each release offers `ort` plus its own (`qnn` on the
+    # generic board, `rknn` on the Rockchip one), and both of those are
+    # marked so. Both halves are needed — the profile says
+    # `experimental: true`, you say `allow_experimental: true` — because one
+    # is the author's claim and the other is your consent.
     allow_experimental: true
 
 cameras:
@@ -407,8 +407,10 @@ against.
 ## The capability table, and what it refuses
 
 The release's board carries a static table of what each backend accepts
-(`Cairn.Stage.Board.backends/0`), each row a mirror of its
-backend's `Descriptor` on the Rust side. It is static because
+(`Cairn.Stage.Board.backends/0`). The fused-NMS and dynamic-shape columns
+mirror its backend's `Descriptor` on the Rust side; the CPU twin,
+whether the backend is experimental and its conversion verdicts are the
+host's own and have no Rust side. It is static because
 config load has to answer these questions before the engine has loaded a
 model and, for a board profile written ahead of its hardware, with no such
 device attached.
@@ -531,9 +533,8 @@ And the ones about attaching it, which name the plugin group instead:
 ```
 plugin detect: unknown profile "rk3566" — no such file in priv/profiles, the
   board's profiles or any profile_dirs entry
-plugin detect: profile my-board uses backend rknn, which is experimental
-  — only ort is proven in soak, and a profile naming another backend must
-  declare experimental: true
+plugin detect: profile my-board uses backend rknn, which is experimental on
+  the rockchip board — a profile naming it must declare experimental: true
 plugin detect: profile my-board uses backend rknn, which is experimental
   — set allow_experimental: true on this plugin group to run it anyway
 plugin detect: profile my-board names no model.rknn artifact for its rknn

@@ -42,9 +42,10 @@ use super::resolve::Declared;
 ///
 /// A board's backend is never a value of this type, only a [`Provider`], so
 /// [`Detector::open`](super::Detector::open) cannot be handed a runtime this
-/// crate does not carry. `qnn` executes, but stays behind the host's
-/// experimental gate (`Cairn.Config.check_backend_implemented/3`) until it
-/// has soaked.
+/// crate does not carry. `qnn` executes, but the generic board marks it
+/// experimental, so the host refuses a profile naming it unless the profile
+/// and its group both acknowledge that
+/// (`Cairn.Config.check_experimental_backend/5`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     /// onnxruntime, CPU execution provider.
