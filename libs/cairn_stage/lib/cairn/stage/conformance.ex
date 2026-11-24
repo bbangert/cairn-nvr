@@ -77,7 +77,7 @@ defmodule Cairn.Stage.Conformance do
 
   defp backends(board, contract) do
     judge(board, :backends, [], fn
-      backends when is_map(backends) and map_size(backends) > 0 ->
+      backends when is_map(backends) and not is_struct(backends) and map_size(backends) > 0 ->
         Enum.flat_map(Enum.sort(backends), fn {backend, caps} ->
           capabilities(board, backend, caps) ++ engine(board, backend, contract)
         end)
@@ -123,7 +123,7 @@ defmodule Cairn.Stage.Conformance do
       :error ->
         []
 
-      {:ok, %{contracts: %{} = contracts}} ->
+      {:ok, %{contracts: %{} = contracts}} when not is_struct(contracts) ->
         evidence =
           if Capabilities.evidence(caps), do: [], else: ["#{where}: conversions name no evidence"]
 
@@ -213,7 +213,7 @@ defmodule Cairn.Stage.Conformance do
   defp decoders(board, generic) do
     judge(board, :decoders, [], fn
       [_ | _] = names ->
-        if Enum.all?(names, &is_binary/1) do
+        if strings?(names) do
           Enum.flat_map(names, &decoder(board, &1)) ++
             Enum.flat_map([nil | names], &chain(board, &1, generic))
         else
@@ -224,6 +224,10 @@ defmodule Cairn.Stage.Conformance do
         ["#{inspect(board)}.decoders/0 is #{inspect(other)}, not a non-empty list"]
     end)
   end
+
+  defp strings?(list), do: proper?(list) and Enum.all?(list, &is_binary/1)
+
+  defp proper?(list), do: is_list(list) and not List.improper?(list)
 
   defp decoder(board, name) do
     judge(board, :decoder_backend, [name], fn module ->
@@ -270,8 +274,9 @@ defmodule Cairn.Stage.Conformance do
     for {fun, kind} <- [backends: "backend", decoders: "decoder"],
         needed = Map.get(requires, fun, []),
         {:ok, offered} <- [call(board, fun, [])],
-        names = if(is_map(offered), do: Map.keys(offered), else: offered),
-        is_list(names),
+        names =
+          if(is_map(offered) and not is_struct(offered), do: Map.keys(offered), else: offered),
+        proper?(names),
         name <- needed -- names do
       "#{inspect(board)}.#{fun}/0 offers no #{inspect(name)}; this base requires that " <>
         "#{kind} of every board"

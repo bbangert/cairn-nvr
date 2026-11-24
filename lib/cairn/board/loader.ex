@@ -37,6 +37,7 @@ defmodule Cairn.Board.Loader do
   number is a compatibility check, not a security check.
   """
 
+  alias Cairn.Pipeline.DetectChain
   alias Cairn.Stage.Conformance
 
   @key {__MODULE__, :board}
@@ -353,7 +354,13 @@ defmodule Cairn.Board.Loader do
   # After the load, so it judges the code the node would run; before the
   # board is recorded, so no reader ever sees one that fails it.
   defp conforms(dir, %{board: board, contract: contract}) do
-    case Conformance.check(board, contract: contract, requires: requires()) do
+    opts = [
+      contract: contract,
+      generic: DetectChain.base_steps("conformance"),
+      requires: requires()
+    ]
+
+    case Conformance.check(board, opts) do
       :ok ->
         :ok
 

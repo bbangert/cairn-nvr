@@ -149,7 +149,7 @@ A board that brings a new backend name also touches shared code, and this is whe
 
 The manifest is three Erlang terms, each once: `{app, cairn_rockchip}.`, `{board, 'Elixir.Cairn.Rockchip.Board'}.` and `{contract, 1}.` The board application's version is its `.app` `vsn`; the directory may hold other applications beside it.
 
-Attaching checks the contract number against `Cairn.Stage.contract/0`, then appends every `lib/*/ebin` to the code path and loads every application with all its modules, which runs each `on_load`. It requires the board application to be the directory's copy, runs `Cairn.Stage.Conformance.check/2` on the board module, and only then records the board. `:cairn`'s start then starts the board application. Any failure stops the boot: `start/2` returns `{:error, {:board, message}}`, the log reads `Application cairn exited: … returned an error: {:board, "…"}`, and the VM halts with OTP's `application_start_failure` slogan carrying the same message.
+Attaching checks the contract number against `Cairn.Stage.contract/0`, then appends every `lib/*/ebin` to the code path and loads every application with all its modules, which runs each `on_load`. It requires the board application to be the directory's copy, runs `Cairn.Stage.Conformance.check/2` on the board module, handing `detect_chain/1` the base's own steps as `generic`, and only then records the board. `:cairn`'s start then starts the board application. Any failure stops the boot: `start/2` returns `{:error, {:board, message}}`, the log reads `Application cairn exited: … returned an error: {:board, "…"}`, and the VM halts with OTP's `application_start_failure` slogan carrying the same message.
 
 A board obeys these rules:
 

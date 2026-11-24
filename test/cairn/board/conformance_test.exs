@@ -2,25 +2,14 @@ defmodule Cairn.Board.ConformanceTest do
   use ExUnit.Case, async: true
 
   alias Cairn.Board.Loader
-  alias Cairn.Pipeline.{Decoder, Inference}
-  alias Cairn.Stage.{Conformance, Step}
+  alias Cairn.Pipeline.DetectChain
+  alias Cairn.Stage.Conformance
 
-  # The base's own steps, as `Cairn.Pipeline.DetectChain` hands them over, so
-  # a board that keeps them is checked on them too. In CI's rockchip subset
-  # too, where the built-in board is Rockchip's.
-  @generic [
-    %Step{
-      name: :decoder,
-      element: Decoder,
-      covers: [:decode, :scale],
-      input: :h264,
-      output: :rgb
-    },
-    %Step{name: :infer, element: Inference, covers: [:infer], input: :rgb, output: :detections}
-  ]
-
+  # On the base's own steps, as the loader checks it, so a board that keeps
+  # them is checked on them too. In CI's rockchip subset too, where the
+  # built-in board is Rockchip's.
   test "the built-in board conforms" do
-    opts = [generic: @generic, requires: Loader.requires()]
+    opts = [generic: DetectChain.base_steps("conformance"), requires: Loader.requires()]
     assert Conformance.check(Cairn.Board.module(), opts) == :ok
   end
 end

@@ -88,6 +88,18 @@ defmodule Cairn.Board.LoaderTest do
       assert Application.spec(extra, :vsn) == ~c"0.1.0"
     end
 
+    test "a board that rewrites the base's steps is checked on the real ones", %{tmp_dir: tmp} do
+      # Matches only a context whose `generic` opens with the base's decoder.
+      chain =
+        "'detect_chain'(\#{generic := [\#{name := decoder} | _]} = C) -> " <>
+          "'Elixir.Cairn.Board.Generic':'detect_chain'(C)."
+
+      %{dir: dir, board: board} = board_dir(tmp, overrides: %{detect_chain: chain})
+
+      assert :ok = Loader.attach(dir)
+      assert Cairn.Board.module() == board
+    end
+
     test "start/0 with no board attached does nothing" do
       assert :ok = Loader.start()
     end

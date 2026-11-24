@@ -15,7 +15,10 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=${WORK:-$(mktemp -d)}
 rel=${REL:-}
+# Absolute, because the boot runs from inside $work.
 mkdir -p "$work"
+work=$(cd "$work" && pwd)
+if [ -n "$rel" ]; then rel=$(cd "$rel" && pwd); fi
 log=$work/boot-test.log
 : >"$log"
 
@@ -37,6 +40,9 @@ fi
 say "building the fixture board"
 "$root/tools/ci/build-fixture-board.sh" "$work/board" >>"$log" 2>&1 || fail "fixture build (see $log)"
 contract=$(sed -n 's/^{contract, \([0-9]*\)}\.$/\1/p' "$work/board/board.manifest")
+
+# A reused WORK holds the last run's copies, and `cp -R` would nest into them.
+rm -rf "$work"/board-{contract,shadow,shipped,nonif,noprofiles}
 
 # Wrong contract: the same directory, the manifest one number off.
 cp -R "$work/board" "$work/board-contract"

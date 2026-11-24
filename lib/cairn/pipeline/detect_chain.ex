@@ -71,6 +71,13 @@ defmodule Cairn.Pipeline.DetectChain do
     end
   end
 
+  @doc """
+  The base's own steps for a camera with no motion gate, as `detect_chain/1`
+  receives them in `generic`: what conformance checks a board's chain on.
+  """
+  @spec base_steps(String.t()) :: [Step.t()]
+  def base_steps(camera_id), do: generic(%{id: camera_id}, %{}, nil)
+
   defp generic(camera, stream_params, gate) do
     decoder = %Step{
       name: :decoder,

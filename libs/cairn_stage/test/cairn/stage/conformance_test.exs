@@ -60,7 +60,7 @@ defmodule Cairn.Stage.ConformanceTest do
     def detect_chain(context), do: context.generic
 
     @impl true
-    def decoders, do: ["fake"]
+    def decoders, do: T.get(:decoders, ["fake"])
 
     @impl true
     def backends do
@@ -140,6 +140,23 @@ defmodule Cairn.Stage.ConformanceTest do
              "#{where}: conversions name no evidence",
              "#{where}: conversion \"yolox\" => :maybe is not :proven or {:unproven, reason}"
            ]
+  end
+
+  test "a struct or an improper list where a menu belongs is a violation, not a crash" do
+    requires = [requires: %{backends: ["fake"], decoders: ["fake"]}]
+    good = caps(%{})
+    put(:backends, %URI{})
+    assert {:error, [message]} = Conformance.check(Board, requires)
+    assert message =~ "backends/0 is %URI{"
+
+    put(:backends, put_in(good["fake"][:conversions], %{contracts: %URI{}}))
+    assert {:error, [message]} = Conformance.check(Board, requires)
+    assert message =~ "conversions is %{contracts: %URI{"
+
+    put(:backends, good)
+    put(:decoders, ["fake" | :bad])
+    assert {:error, [message]} = Conformance.check(Board, requires)
+    assert message =~ ~s(decoders/0 is ["fake" | :bad], not a list of strings)
   end
 
   test "a step whose element is not loaded, or is not an element" do
