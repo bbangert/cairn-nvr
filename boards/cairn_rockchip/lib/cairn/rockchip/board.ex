@@ -8,7 +8,7 @@ defmodule Cairn.Rockchip.Board do
 
   Every other name gets the base's own libraries — the ffmpeg-backed decoder,
   the onnxruntime engine and its canary — and `DecodeScale` opens through the
-  base's decoder host. All three arrive in the `base` map
+  base's decoder host. They arrive in the `base` map
   (`t:Cairn.Stage.Board.base/0`): this library depends only on `cairn_stage`,
   so it cannot name a base module itself.
   """
