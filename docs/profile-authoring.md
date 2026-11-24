@@ -18,8 +18,8 @@ other route — a camera's `plugin:` names a `plugins:` group, every group must
 name a `profile:` (one without is a config error), and the group's cameras run
 what that profile names.
 
-Shipped profiles live in `priv/profiles/`; a board's own live in the directory
-its release names (`Cairn.Stage.Board.profiles_dir/0`); yours live wherever
+Shipped profiles live in `priv/profiles/`; a board's own live in its
+`Cairn.Stage.Board.profiles_dir/0`; yours live wherever
 you point `profile_dirs:`. The schema and the `profile …:` messages quoted
 below come from `Cairn.Config.Profile`; the `backend:` and `decoder:` menus
 come from the node's board.

@@ -1,11 +1,12 @@
 defmodule Cairn.Stage.Conformance do
   @moduledoc """
-  Whether a board module keeps the contract, checked before the base runs
-  any of it: every callback exported, every capability map of the documented
-  shape, every step's element loaded and a Membrane element or bin, every
-  library a backend or decoder names loaded and exporting its behaviour, and
-  `profiles_dir/0` a directory. An engine library that loaded must report
-  the expected contract number and `Cairn.Stage.EngineNif.frame_meta_keys/0`.
+  Whether a board module keeps the contract, checked before the base relies
+  on any of it: every callback exported, every capability map of the
+  documented shape, every step's element loaded and a Membrane element or
+  bin, every library a backend or decoder names loaded and exporting its
+  behaviour, `profiles_dir/0` a directory, and every name the base requires
+  offered. An engine library that loaded must report the expected contract
+  number and `Cairn.Stage.EngineNif.frame_meta_keys/0`.
 
   Plain functions, so the base's loader and a board's own suite run the same
   check. It does not validate a chain (`Cairn.Stage.Chain`): that needs the
@@ -22,19 +23,22 @@ defmodule Cairn.Stage.Conformance do
   Options: `:contract`, the number engine libraries must report (default
   `Cairn.Stage.contract/0`); `:generic`, the steps handed to
   `detect_chain/1` as the context's `generic` (default none, so only the
-  board's own steps are checked).
+  board's own steps are checked); `:requires`, the `backends` and `decoders`
+  names the board must offer, as `%{backends: [...], decoders: [...]}`
+  (default none).
   """
   @spec check(module(), keyword()) :: :ok | {:error, [String.t()]}
   def check(board, opts \\ []) do
     contract = Keyword.get(opts, :contract, Stage.contract())
     generic = Keyword.get(opts, :generic, [])
+    requires = Keyword.get(opts, :requires, %{})
 
     violations =
       with :ok <- loaded(board, "board module"),
            [] <- missing(board, Board) do
         name(board) ++
           backends(board, contract) ++
-          decoders(board, generic) ++ profiles_dir(board)
+          decoders(board, generic) ++ profiles_dir(board) ++ required(board, requires)
       else
         {:error, violation} -> [violation]
         missing -> ["board module #{inspect(board)} does not export #{Enum.join(missing, ", ")}"]
@@ -157,33 +161,38 @@ defmodule Cairn.Stage.Conformance do
     end
   end
 
-  # A library that did not load is the board's preflight to report, by
-  # name, and the node runs without it. One that loaded but predates
-  # `contract/0` raises `:nif_not_loaded` from it: a mismatch like any other.
+  # A library that did not load is reported when an engine opens on it, and
+  # the node runs without it.
   defp reports(module, contract) do
     judge(module, :available?, [], fn
       true -> contract_violation(module, contract) ++ keys_violation(module)
-      _not_loaded -> []
+      false -> []
+      other -> ["engine library #{inspect(module)}.available?/0 is #{inspect(other)}"]
     end)
   end
 
+  # `contract/0` is exported by now (`library/4`): a loaded library that
+  # predates it raises `:nif_not_loaded`, a mismatch like any other.
   defp contract_violation(module, contract) do
-    case call(module, :contract, []) do
-      {:ok, ^contract} ->
+    case module.contract() do
+      ^contract ->
         []
 
-      {:ok, other} ->
+      other ->
         [
           "engine library #{inspect(module)} reports contract #{inspect(other)}; " <>
             "this base has contract #{contract}"
         ]
-
-      {:error, _raised} ->
-        [
-          "engine library #{inspect(module)} loaded a library with no contract/0; " <>
-            "this base has contract #{contract}"
-        ]
     end
+  catch
+    :error, :nif_not_loaded ->
+      [
+        "engine library #{inspect(module)} loaded a library with no contract/0; " <>
+          "this base has contract #{contract}"
+      ]
+
+    kind, reason ->
+      ["engine library #{inspect(module)}.contract() raised #{banner(kind, reason)}"]
   end
 
   defp keys_violation(module) do
@@ -256,6 +265,19 @@ defmodule Cairn.Stage.Conformance do
 
   defp step(where, other), do: ["#{where}: #{inspect(other)} is not a %Cairn.Stage.Step{}"]
 
+  # Malformed menus were reported above.
+  defp required(board, requires) do
+    for {fun, kind} <- [backends: "backend", decoders: "decoder"],
+        needed = Map.get(requires, fun, []),
+        {:ok, offered} <- [call(board, fun, [])],
+        names = if(is_map(offered), do: Map.keys(offered), else: offered),
+        is_list(names),
+        name <- needed -- names do
+      "#{inspect(board)}.#{fun}/0 offers no #{inspect(name)}; this base requires that " <>
+        "#{kind} of every board"
+    end
+  end
+
   defp profiles_dir(board) do
     judge(board, :profiles_dir, [], fn
       nil ->
@@ -286,6 +308,9 @@ defmodule Cairn.Stage.Conformance do
     kind, reason ->
       {:error,
        "#{inspect(module)}.#{fun}(#{Enum.map_join(args, ", ", &inspect/1)}) raised " <>
-         String.replace_prefix(Exception.format_banner(kind, reason, []), "** ", "")}
+         banner(kind, reason)}
   end
+
+  defp banner(kind, reason),
+    do: String.replace_prefix(Exception.format_banner(kind, reason, []), "** ", "")
 end

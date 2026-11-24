@@ -1,6 +1,7 @@
 defmodule Cairn.Board.ConformanceTest do
   use ExUnit.Case, async: true
 
+  alias Cairn.Board.Loader
   alias Cairn.Pipeline.{Decoder, Inference}
   alias Cairn.Stage.{Conformance, Step}
 
@@ -19,6 +20,7 @@ defmodule Cairn.Board.ConformanceTest do
   ]
 
   test "the built-in board conforms" do
-    assert Conformance.check(Cairn.Board.module(), generic: @generic) == :ok
+    opts = [generic: @generic, requires: Loader.requires()]
+    assert Conformance.check(Cairn.Board.module(), opts) == :ok
   end
 end

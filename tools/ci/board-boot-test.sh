@@ -23,6 +23,8 @@ say() { echo "[board-boot] $*" | tee -a "$log"; }
 fail() {
   say "FAIL: $*"
   tail -40 "$log"
+  # A daemon's own output is run_erl's, not the log's.
+  for f in "$work"/tmp/log/erlang.log.*; do [ -f "$f" ] && tail -40 "$f"; done
   exit 1
 }
 
@@ -98,6 +100,9 @@ refused() { # name board-dir want
 }
 
 stop() { cairn stop >>"$log" 2>&1 || true; }
+# `stop` returns once the stop is requested; a start under the same sname
+# before the node is gone would be refused for the name.
+gone() { for _ in $(seq 1 30); do cairn pid >/dev/null 2>&1 || return 0; sleep 1; done; return 1; }
 trap stop EXIT
 
 say "booting with CAIRN_BOARD_DIR=$work/board-shadow"
@@ -124,7 +129,10 @@ expect "cairn_stage is the release's copy" \
 expect "the config names the fixture's profile" \
   'c = Cairn.Config.Server.get(); {c.profiles |> Map.keys() |> Enum.sort(), Enum.map(c.plugin_groups, &{&1.name, &1.profile.name})}' \
   '{["fixture-fake", "generic-ort"], [{"det", "fixture-fake"}]}'
+expect "the booted drain holds the board's libraries" ':sys.get_state(Cairn.Native.Drain).libraries' \
+  '[Cairn.FixtureBoard.Native, CairnOrt, Cairn.Native]'
 stop
+gone || fail "node still up 30 s after stop"
 trap - EXIT
 
 got=$(CAIRN_BOARD_DIR=$work/board cairn eval 'IO.inspect({Cairn.Board.module(), :code.get_mode()})' 2>&1) ||

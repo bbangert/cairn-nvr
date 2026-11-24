@@ -153,10 +153,12 @@ Attaching checks the contract number against `Cairn.Stage.contract/0`, then appe
 
 A board obeys these rules:
 
-- It depends on `cairn_stage` and on applications the release ships, never on `:cairn`. Its application starts inside `:cairn`'s start, before `:cairn`'s tree, so it cannot use `:cairn`'s processes; a dependency on `:cairn` would hang the boot, and the loader refuses it.
+- It depends on `cairn_stage`, on applications the release ships, and on applications its directory carries, never on `:cairn`. Its application starts inside `:cairn`'s start, before `:cairn`'s tree, so it cannot use `:cairn`'s processes; a dependency on `:cairn` would hang the boot, and the loader refuses it.
 - It is started `:permanent`: a board application that fails to start, or exits later, halts the node.
-- It is built for this release's contract number. A different number is refused, naming both, before any board code is on the path; an engine library's `contract/0` must report the same number.
+- It is built for this release's contract number. A different number is refused, naming both, before any board code is on the path; an engine library that loaded must report the same number from `contract/0`. One that did not load is never opened: the host refuses it by name.
 - An application the release already ships is not taken from the directory: the release's copy is loaded first and is the one that runs. A board application the release ships is refused.
+- `backends/0` offers `ort` and `decoders/0` offers `auto`: the base's shipped profile and its defaults name them, so the loader refuses a board without either.
+- A NIF module that fails its `on_load` refuses the boot. One whose absence should not stop the node loads without its library and reports through `load_error/0`.
 - It implements no protocol: the release's protocols are consolidated, so a board's `defimpl` never dispatches.
 - The directory is trusted code. Every application under `lib/` is loaded and every `on_load` runs with the node's privileges, in an eval VM too, so the directory must not be writable by the service's user. The contract number is a compatibility check, not a signature.
 

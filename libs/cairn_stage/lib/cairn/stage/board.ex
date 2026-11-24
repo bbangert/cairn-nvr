@@ -3,8 +3,8 @@ defmodule Cairn.Stage.Board do
   What a node's board provides: its detect chain, the `decoder:` and
   `backend:` names it accepts, and the NIF modules behind them. A node runs
   one board: one attached from a board directory, else the one its release
-  was built with.
-  `Cairn.Stage.Conformance` checks a module against this behaviour.
+  was built with. `Cairn.Stage.Conformance` checks a module against this
+  behaviour.
   """
 
   alias Cairn.Stage.Step

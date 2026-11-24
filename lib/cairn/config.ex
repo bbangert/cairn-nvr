@@ -845,7 +845,7 @@ defmodule Cairn.Config do
 
   # -- profiles ---------------------------------------------------------------
 
-  # The release's own dirs first, operator dirs last — `Profile.load_dirs/2`
+  # The base's and the node's board's own dirs first, operator dirs last — `Profile.load_dirs/2`
   # gives later files the name on a collision (with a warning), so an
   # operator file shadows either. The origin decides whether a rung may name
   # a file to fetch.
@@ -869,8 +869,9 @@ defmodule Cairn.Config do
   end
 
   @doc """
-  The release's own profile directories: the base's shipped one, then the
-  board's (`c:Cairn.Stage.Board.profiles_dir/0`).
+  The base's and the node's board's own profile directories, in that order
+  (`c:Cairn.Stage.Board.profiles_dir/0`): trusted, so a rung in them may name
+  a file to fetch.
   """
   @spec release_profile_dirs(module()) :: [Path.t()]
   def release_profile_dirs(board \\ Cairn.Board.module()),

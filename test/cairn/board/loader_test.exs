@@ -221,6 +221,14 @@ defmodule Cairn.Board.LoaderTest do
       assert :persistent_term.get(@key, nil) == nil
     end
 
+    test "a board without the decoder the base requires", %{tmp_dir: tmp} do
+      overrides = %{decoders: "'decoders'() -> [<<\"sw\">>]."}
+      %{dir: dir, board: board} = board_dir(tmp, overrides: overrides)
+
+      assert {:error, message} = Loader.attach(dir)
+      assert message =~ ~s(#{inspect(board)}.decoders/0 offers no "auto"; this base requires)
+    end
+
     test "a manifest naming an application the directory does not hold", %{tmp_dir: tmp} do
       %{dir: dir} = board_dir(tmp, manifest_app: :not_here)
       assert {:error, message} = Loader.attach(dir)

@@ -344,10 +344,16 @@ defmodule Cairn.Board.Loader do
       else: {:error, "board module #{inspect(board)} is not in application #{app}"}
   end
 
+  # Every config load checks each profile's backend against the board, and
+  # the base's own `generic-ort.yml` and the `backend:` default are `ort`; a
+  # profile with no `decoder:` opens `auto`.
+  @doc false
+  def requires, do: %{backends: ["ort"], decoders: ["auto"]}
+
   # After the load, so it judges the code the node would run; before the
   # board is recorded, so no reader ever sees one that fails it.
   defp conforms(dir, %{board: board, contract: contract}) do
-    case Conformance.check(board, contract: contract) do
+    case Conformance.check(board, contract: contract, requires: requires()) do
       :ok ->
         :ok
 

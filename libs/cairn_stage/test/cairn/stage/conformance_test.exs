@@ -166,10 +166,32 @@ defmodule Cairn.Stage.ConformanceTest do
     assert message =~ "loaded a library with no contract/0; this base has contract 3"
   end
 
-  test "a library that did not load is not asked, which preflight reports instead" do
+  test "a contract/0 that fails is named with its raise" do
+    put(:contract, fn -> raise "boom" end)
+    assert {:error, [message]} = Conformance.check(Board)
+    assert message == "engine library #{inspect(Library)}.contract() raised (RuntimeError) boom"
+  end
+
+  test "a library that did not load is not asked; a malformed available? is a violation" do
     put(:available?, false)
     put(:contract, fn -> raise "asked" end)
     assert Conformance.check(Board) == :ok
+
+    put(:available?, :maybe)
+    assert {:error, [message]} = Conformance.check(Board)
+    assert message == "engine library #{inspect(Library)}.available?/0 is :maybe"
+  end
+
+  test "a backend or decoder the base requires, missing" do
+    requires = %{backends: ["fake", "ort"], decoders: ["auto"]}
+    assert {:error, violations} = Conformance.check(Board, requires: requires)
+
+    assert violations == [
+             ~s(#{inspect(Board)}.backends/0 offers no "ort"; this base requires that backend of every board),
+             ~s(#{inspect(Board)}.decoders/0 offers no "auto"; this base requires that decoder of every board)
+           ]
+
+    assert Conformance.check(Board, requires: %{backends: ["fake"], decoders: ["fake"]}) == :ok
   end
 
   test "an engine decoding other frame metadata keys" do
