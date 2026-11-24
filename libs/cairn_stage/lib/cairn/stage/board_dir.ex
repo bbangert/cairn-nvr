@@ -9,10 +9,12 @@ defmodule Cairn.Stage.BoardDir do
   release's copy is the one that runs, so the board must be built against
   that version. Versions are compared, never bytes, because the same version
   builds differently from one checkout to another (macros embed the deps
-  path; optional dependencies change what compiles). Also refused: an
-  application in neither the `.rel` nor the build, unless optional; a
-  dependency on `:cairn`; another ERTS; a `defimpl` of a protocol the
-  directory does not ship.
+  path; optional dependencies change what compiles). An application the
+  build lacks is taken from the toolchain (OTP, Elixir), and shipped from
+  there unless the `.rel` lists it. Also refused: an application in none of
+  these, unless optional; a dependency on `:cairn`; another ERTS; a
+  `defimpl` of a protocol the directory does not ship; an `out` that exists
+  and is neither empty nor a board directory.
 
   Reads `.app` files and beam attributes only; no module is loaded, so a
   board NIF's `on_load` never runs here.
@@ -28,9 +30,10 @@ defmodule Cairn.Stage.BoardDir do
         ]
 
   @doc """
-  Writes the directory at `out`, replacing it, or writes nothing and returns
-  every problem found. `lib_dir` is the board build's `lib`, holding
-  `<app>/ebin/<app>.app` for the board application and its dependencies;
+  Writes the directory at `out`, replacing an empty directory or a previous
+  board directory, or writes nothing and returns every problem found.
+  `lib_dir` is the board build's `lib`, holding `<app>/ebin/<app>.app` for
+  the board application and its dependencies;
   `rel` is the core release's `releases/<vsn>/<name>.rel`.
   """
   @spec write(opts()) :: :ok | {:error, [String.t()]}
@@ -43,9 +46,12 @@ defmodule Cairn.Stage.BoardDir do
       {shipped, closure_errors} = walk([board_app], rel_apps, lib_dir, MapSet.new([app]), [], [])
 
       errors =
-        erts_errors(erts) ++
-          board_errors(board_app, Keyword.fetch!(opts, :board), rel_apps) ++
-          closure_errors ++ protocol_errors(shipped)
+        Enum.uniq(
+          erts_errors(erts) ++
+            board_errors(board_app, Keyword.fetch!(opts, :board), rel_apps) ++
+            closure_errors ++
+            protocol_errors(shipped) ++ out_errors(Keyword.fetch!(opts, :out))
+        )
 
       if errors == [], do: emit(shipped, opts), else: {:error, errors}
     else
@@ -88,25 +94,45 @@ defmodule Cairn.Stage.BoardDir do
     shipped_by_core ++ in_app
   end
 
+  defp out_errors(out) do
+    if replaceable?(out),
+      do: [],
+      else: ["#{out} exists and is not a board directory; refusing to replace it"]
+  end
+
+  defp replaceable?(out) do
+    not File.exists?(out) or
+      (File.dir?(out) and
+         (File.ls(out) == {:ok, []} or File.regular?(Path.join(out, "board.manifest"))))
+  end
+
   # Breadth first from the board application. A `.rel`-listed application
   # ends its branch: the release carries its dependencies. An optional one
-  # found nowhere is skipped, as a release skips it.
+  # found nowhere is skipped, as a release skips it. Every edge is judged,
+  # so an application optional for one parent and required by another is
+  # still reported; `seen` only keeps one from being shipped twice.
   defp walk([], _rel_apps, _lib_dir, _seen, shipped, errors),
     do: {Enum.reverse(shipped), Enum.reverse(errors)}
 
   defp walk([app | rest], rel_apps, lib_dir, seen, shipped, errors) do
-    deps = app.deps |> Enum.reject(&MapSet.member?(seen, &1)) |> Enum.uniq()
-
-    {queue, errors} =
-      Enum.reduce(deps, {rest, errors}, fn dep, {queue, errors} ->
+    {queue, seen, errors} =
+      app.deps
+      |> Enum.uniq()
+      |> Enum.reduce({rest, seen, errors}, fn dep, {queue, seen, errors} ->
         case dependency(dep, app, rel_apps, lib_dir) do
-          {:ship, dep_app} -> {queue ++ [dep_app], errors}
-          :skip -> {queue, errors}
-          {:error, message} -> {queue, [message | errors]}
+          {:ship, dep_app} -> enqueue(dep_app, queue, seen, errors)
+          :skip -> {queue, seen, errors}
+          {:error, message} -> {queue, seen, [message | errors]}
         end
       end)
 
-    walk(queue, rel_apps, lib_dir, Enum.into(deps, seen), [app | shipped], errors)
+    walk(queue, rel_apps, lib_dir, seen, [app | shipped], errors)
+  end
+
+  defp enqueue(%{name: name} = app, queue, seen, errors) do
+    if MapSet.member?(seen, name),
+      do: {queue, seen, errors},
+      else: {queue ++ [app], MapSet.put(seen, name), errors}
   end
 
   # The loader refuses the same at boot, which is too late to find out.
@@ -117,15 +143,12 @@ defmodule Cairn.Stage.BoardDir do
          "and depends on cairn_stage, not on the base, and the loader refuses it"}
 
   defp dependency(dep, parent, rel_apps, lib_dir) do
-    case {Map.fetch(rel_apps, dep), built(lib_dir, dep)} do
+    case {Map.fetch(rel_apps, dep), find(lib_dir, dep)} do
       {{:ok, rel_vsn}, {:ok, %{vsn: vsn}}} ->
         same_version(dep, vsn, rel_vsn)
 
-      {{:ok, rel_vsn}, {:error, _}} ->
-        case toolchain_vsn(dep) do
-          {:ok, vsn} -> same_version(dep, vsn, rel_vsn)
-          :error -> {:error, "application #{dep} is in the core release but not in this build"}
-        end
+      {{:ok, _}, {:error, _}} ->
+        {:error, "application #{dep} is in the core release but not in this build"}
 
       {:error, {:ok, dep_app}} ->
         {:ship, dep_app}
@@ -135,8 +158,8 @@ defmodule Cairn.Stage.BoardDir do
           do: :skip,
           else:
             {:error,
-             "application #{dep}, which #{parent.name} depends on, is neither in the core " <>
-               "release nor in the build's lib directory"}
+             "application #{dep}, which #{parent.name} depends on, is in neither the core " <>
+               "release, the build's lib directory nor the toolchain"}
     end
   end
 
@@ -147,9 +170,36 @@ defmodule Cairn.Stage.BoardDir do
       {:error,
        "application #{app} is #{built} in the board's build but #{rel} in the core release"}
 
-  defp built(lib_dir, app) do
-    ebin = Path.join([lib_dir, to_string(app), "ebin"])
+  # OTP's and Elixir's own applications are not in a Mix build's lib. Mix
+  # prunes the code path to the applications the project lists, so one only
+  # a dependency needs can be off it: the Elixir and OTP installs are
+  # searched too. Nothing is loaded.
+  defp find(lib_dir, app) do
+    with {:error, _} = missing <- built(lib_dir, app) do
+      case toolchain_dir(app) do
+        nil -> missing
+        dir -> descriptor(Path.join(dir, "ebin"), app)
+      end
+    end
+  end
 
+  defp toolchain_dir(app) do
+    case :code.lib_dir(app) do
+      dir when is_list(dir) ->
+        to_string(dir)
+
+      _ ->
+        elixir = Path.join([:code.lib_dir(:elixir), "..", to_string(app)])
+
+        if File.dir?(elixir),
+          do: Path.expand(elixir),
+          else: Path.wildcard(Path.join([:code.root_dir(), "lib", "#{app}-*"])) |> List.last()
+    end
+  end
+
+  defp built(lib_dir, app), do: descriptor(Path.join([lib_dir, to_string(app), "ebin"]), app)
+
+  defp descriptor(ebin, app) do
     with {:ok, spec} <- app_file(ebin, app) do
       {:ok,
        %{
@@ -161,16 +211,6 @@ defmodule Cairn.Stage.BoardDir do
          modules: Keyword.get(spec, :modules, []),
          dir: Path.dirname(ebin)
        }}
-    end
-  end
-
-  # OTP's and Elixir's own applications are not in a Mix build's lib.
-  defp toolchain_vsn(app) do
-    with dir when is_list(dir) <- :code.lib_dir(app),
-         {:ok, spec} <- app_file(Path.join(to_string(dir), "ebin"), app) do
-      {:ok, to_string(Keyword.fetch!(spec, :vsn))}
-    else
-      _ -> :error
     end
   end
 

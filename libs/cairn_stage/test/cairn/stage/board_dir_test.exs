@@ -81,6 +81,7 @@ defmodule Cairn.Stage.BoardDirTest do
     File.ln_s!(Path.join(dir, "src/priv"), Path.join(lib, "fb/priv"))
 
     File.mkdir_p!(Path.join(dir, "out/stale"))
+    File.write!(Path.join(dir, "out/board.manifest"), "")
     assert :ok = write(dir, put_rel(dir, shared: "1.0.0"))
 
     out = Path.join(dir, "out")
@@ -121,8 +122,8 @@ defmodule Cairn.Stage.BoardDirTest do
     assert {:error, [error]} = write(dir, put_rel(dir, []))
 
     assert error ==
-             "application nowhere, which only depends on, is neither in the core release " <>
-               "nor in the build's lib directory"
+             "application nowhere, which only depends on, is in neither the core release, " <>
+               "the build's lib directory nor the toolchain"
   end
 
   test "a dependency on cairn is refused", %{tmp_dir: dir} = c do
@@ -147,6 +148,50 @@ defmodule Cairn.Stage.BoardDirTest do
              "application fb is shipped by the core release; the loader refuses it",
              "board module Other is not among application fb's modules"
            ]
+  end
+
+  test "an out that is neither empty nor a board directory is refused and left alone",
+       %{tmp_dir: dir} = c do
+    put_app(Path.join(dir, "lib"), :fb, "0.1.0", @base, [c.board])
+    out = Path.join(dir, "out")
+    File.mkdir_p!(out)
+    File.write!(Path.join(out, "mine.txt"), "keep")
+
+    assert {:error, [error]} = write(dir, put_rel(dir, []))
+    assert error == "#{out} exists and is not a board directory; refusing to replace it"
+    assert File.read!(Path.join(out, "mine.txt")) == "keep"
+
+    File.rm!(Path.join(out, "mine.txt"))
+    assert :ok = write(dir, put_rel(dir, []))
+  end
+
+  test "a dependency required by one parent is reported whichever parent is visited first",
+       %{tmp_dir: dir} = c do
+    lib = Path.join(dir, "lib")
+    put_app(lib, :a, "1.0.0", @base ++ [:x], [], optional_applications: [:x])
+    put_app(lib, :b, "1.0.0", @base ++ [:x], [])
+
+    for order <- [[:a, :b], [:b, :a]] do
+      put_app(lib, :fb, "0.1.0", @base ++ order, [c.board])
+      assert {:error, [error]} = write(dir, put_rel(dir, []))
+
+      assert error ==
+               "application x, which b depends on, is in neither the core release, " <>
+                 "the build's lib directory nor the toolchain"
+    end
+  end
+
+  test "a toolchain application the release does not list is shipped from the toolchain",
+       %{tmp_dir: dir} = c do
+    put_app(Path.join(dir, "lib"), :fb, "0.1.0", @base ++ [:xmerl], [c.board])
+    [xmerl] = Path.wildcard(Path.join([:code.root_dir(), "lib", "xmerl-*"]))
+    "xmerl-" <> vsn = Path.basename(xmerl)
+
+    assert :ok = write(dir, put_rel(dir, []))
+    assert File.exists?(Path.join(dir, "out/lib/xmerl-#{vsn}/ebin/xmerl.app"))
+
+    assert :ok = write(dir, put_rel(dir, xmerl: vsn))
+    refute File.exists?(Path.join(dir, "out/lib/xmerl-#{vsn}"))
   end
 
   test "an implementation of a protocol the directory does not ship is refused",

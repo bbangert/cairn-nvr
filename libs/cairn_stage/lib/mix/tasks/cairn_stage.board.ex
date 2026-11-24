@@ -51,11 +51,12 @@ defmodule Mix.Tasks.CairnStage.Board do
   defp parse(args) do
     case OptionParser.parse(args, strict: [core_rel: :string, out: :string]) do
       {opts, [], []} ->
-        with {:ok, rel} <- Keyword.fetch(opts, :core_rel),
-             {:ok, out} <- Keyword.fetch(opts, :out) do
+        # An empty `--out` would expand to the working directory.
+        with {:ok, rel} when rel != "" <- Keyword.fetch(opts, :core_rel),
+             {:ok, out} when out != "" <- Keyword.fetch(opts, :out) do
           {rel, out}
         else
-          :error -> usage()
+          _ -> usage()
         end
 
       _ ->
