@@ -21,15 +21,18 @@ defmodule Cairn.Board.LoaderTest do
         do: System.put_env("CAIRN_BOARD_DIR", before_env),
         else: System.delete_env("CAIRN_BOARD_DIR")
 
+      # `File.ls!/1` below it: an ebin path can hold glob characters.
       for ebin <- Path.wildcard(Path.join(tmp, "**/ebin")) do
-        for app_file <- Path.wildcard(Path.join(ebin, "*.app")) do
-          app = app_file |> Path.basename(".app") |> String.to_atom()
+        files = File.ls!(ebin)
+
+        for file <- files, Path.extname(file) == ".app" do
+          app = file |> Path.basename(".app") |> String.to_atom()
           Application.stop(app)
           Application.unload(app)
         end
 
-        for beam <- Path.wildcard(Path.join(ebin, "*.beam")) do
-          mod = beam |> Path.basename(".beam") |> String.to_atom()
+        for file <- files, Path.extname(file) == ".beam" do
+          mod = file |> Path.basename(".beam") |> String.to_atom()
           :code.purge(mod)
           :code.delete(mod)
           :code.purge(mod)
