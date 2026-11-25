@@ -9,7 +9,12 @@ defmodule Cairn.Board.ConformanceTest do
   # them is checked on them too. In CI's rockchip subset too, where the
   # built-in board is Rockchip's.
   test "the built-in board conforms" do
-    opts = [generic: DetectChain.base_steps("conformance"), requires: Loader.requires()]
+    opts = [
+      generic: DetectChain.base_steps("conformance"),
+      requires: Loader.requires(),
+      base: Cairn.Board.base()
+    ]
+
     assert Conformance.check(Cairn.Board.module(), opts) == :ok
   end
 end

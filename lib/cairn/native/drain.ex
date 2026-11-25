@@ -40,8 +40,8 @@ defmodule Cairn.Native.Drain do
   end
 
   @doc """
-  The NIF modules `board` names: the engine of each backend, then the decode
-  library of each decoder, each once.
+  The NIF modules `board` answers with: the engine of each backend, then
+  the decode library of each decoder, each once.
   """
   @spec libraries(module()) :: [module()]
   def libraries(board \\ Cairn.Board.module()) do

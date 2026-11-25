@@ -9,13 +9,24 @@ defmodule Cairn.Stage.Conformance do
   number and `Cairn.Stage.EngineNif.frame_meta_keys/0`.
 
   Plain functions, so the base's loader and a board's own suite run the same
-  check. It does not validate a chain (`Cairn.Stage.Chain`): that needs the
-  base's own steps and a camera's gate, and the base checks each camera's
-  chain as it builds it.
+  check. A board's suite has no base to lend, so it is lent a stand-in: a
+  library the board answers with that is the stand-in's is not checked, and
+  the loader checks the same answer against the real base. It does not
+  validate a chain (`Cairn.Stage.Chain`): that needs the base's own steps
+  and a camera's gate, and the base checks each camera's chain as it builds
+  it.
   """
 
   alias Cairn.Stage
   alias Cairn.Stage.{Board, Capabilities, DecoderNif, EngineNif, Step}
+
+  # Atoms no module is named, so none of a board's own libraries can be
+  # mistaken for a lent one and go unchecked.
+  @stand_in %{
+    decoder: Cairn.Stage.Conformance.StandIn.Decoder,
+    host: Cairn.Stage.Conformance.StandIn.Host,
+    engine: %{module: Cairn.Stage.Conformance.StandIn.Engine, canary: "stand-in-canary"}
+  }
 
   @doc """
   `:ok`, or every violation found, each naming what it is about.
@@ -25,20 +36,24 @@ defmodule Cairn.Stage.Conformance do
   `detect_chain/1` as the context's `generic` (default none, so only the
   board's own steps are checked); `:requires`, the `backends` and `decoders`
   names the board must offer, as `%{backends: [...], decoders: [...]}`
-  (default none).
+  (default none); `:base`, the `t:Cairn.Stage.Board.base/0` handed to every
+  callback that takes one (default the stand-in).
   """
   @spec check(module(), keyword()) :: :ok | {:error, [String.t()]}
   def check(board, opts \\ []) do
     contract = Keyword.get(opts, :contract, Stage.contract())
     generic = Keyword.get(opts, :generic, [])
     requires = Keyword.get(opts, :requires, %{})
+    base = Keyword.get(opts, :base, @stand_in)
+    lent = if base == @stand_in, do: [@stand_in.decoder, @stand_in.engine.module], else: []
+    lend = %{base: base, lent: lent}
 
     violations =
       with :ok <- loaded(board, "board module"),
            [] <- missing(board, Board) do
         name(board) ++
-          backends(board, contract) ++
-          decoders(board, generic) ++ profiles_dir(board) ++ required(board, requires)
+          backends(board, contract, lend) ++
+          decoders(board, generic, lend) ++ profiles_dir(board) ++ required(board, requires)
       else
         {:error, violation} -> [violation]
         missing -> ["board module #{inspect(board)} does not export #{Enum.join(missing, ", ")}"]
@@ -75,11 +90,11 @@ defmodule Cairn.Stage.Conformance do
     end)
   end
 
-  defp backends(board, contract) do
+  defp backends(board, contract, lend) do
     judge(board, :backends, [], fn
       backends when is_map(backends) and not is_struct(backends) and map_size(backends) > 0 ->
         Enum.flat_map(Enum.sort(backends), fn {backend, caps} ->
-          capabilities(board, backend, caps) ++ engine(board, backend, contract)
+          capabilities(board, backend, caps) ++ engine(board, backend, contract, lend)
         end)
 
       other ->
@@ -139,23 +154,25 @@ defmodule Cairn.Stage.Conformance do
     end
   end
 
-  defp engine(board, backend, contract) do
-    judge(board, :engine, [backend], fn
+  defp engine(board, backend, contract, lend) do
+    judge(board, :engine, [backend, lend.base], fn
       %{module: module, canary: canary} when is_binary(canary) ->
-        library(module, "backend #{inspect(backend)}'s engine", EngineNif, fn ->
+        library(module, "backend #{inspect(backend)}'s engine", EngineNif, lend, fn ->
           reports(module, contract)
         end)
 
       other ->
-        ["#{inspect(board)}.engine(#{inspect(backend)}) is #{inspect(other)}"]
+        ["#{inspect(board)}.engine(#{inspect(backend)}, base) is #{inspect(other)}"]
     end)
   end
 
-  defp library(module, what, behaviour, loaded_check) do
-    with :ok <- loaded(module, what),
+  defp library(module, what, behaviour, lend, loaded_check) do
+    with false <- module in lend.lent,
+         :ok <- loaded(module, what),
          [] <- missing(module, behaviour) do
       loaded_check.()
     else
+      true -> []
       {:error, violation} -> [violation]
       missing -> ["#{what} #{inspect(module)} does not export #{Enum.join(missing, ", ")}"]
     end
@@ -171,7 +188,7 @@ defmodule Cairn.Stage.Conformance do
     end)
   end
 
-  # `contract/0` is exported by now (`library/4`): a loaded library that
+  # `contract/0` is exported by now (`library/5`): a loaded library that
   # predates it raises `:nif_not_loaded`, a mismatch like any other.
   defp contract_violation(module, contract) do
     case module.contract() do
@@ -210,12 +227,12 @@ defmodule Cairn.Stage.Conformance do
     end)
   end
 
-  defp decoders(board, generic) do
+  defp decoders(board, generic, lend) do
     judge(board, :decoders, [], fn
       [_ | _] = names ->
         if strings?(names) do
-          Enum.flat_map(names, &decoder(board, &1)) ++
-            Enum.flat_map([nil | names], &chain(board, &1, generic))
+          Enum.flat_map(names, &decoder(board, &1, lend)) ++
+            Enum.flat_map([nil | names], &chain(board, &1, generic, lend))
         else
           ["#{inspect(board)}.decoders/0 is #{inspect(names)}, not a list of strings"]
         end
@@ -229,19 +246,20 @@ defmodule Cairn.Stage.Conformance do
 
   defp proper?(list), do: is_list(list) and not List.improper?(list)
 
-  defp decoder(board, name) do
-    judge(board, :decoder_backend, [name], fn module ->
-      library(module, "decoder #{inspect(name)}'s library", DecoderNif, fn -> [] end)
+  defp decoder(board, name, lend) do
+    judge(board, :decoder_backend, [name, lend.base], fn module ->
+      library(module, "decoder #{inspect(name)}'s library", DecoderNif, lend, fn -> [] end)
     end)
   end
 
-  defp chain(board, decoder, generic) do
+  defp chain(board, decoder, generic, lend) do
     context = %{
       camera_id: "conformance",
       stream_params: %{},
       decoder: decoder,
       motion: nil,
-      generic: generic
+      generic: generic,
+      base: lend.base
     }
 
     where = "#{inspect(board)}.detect_chain/1 for decoder #{inspect(decoder)}"

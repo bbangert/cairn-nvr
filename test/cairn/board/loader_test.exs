@@ -100,6 +100,18 @@ defmodule Cairn.Board.LoaderTest do
       assert Cairn.Board.module() == board
     end
 
+    test "a board is lent the base's own libraries", %{tmp_dir: tmp} do
+      # Matches only the real base, so a stand-in would make it raise.
+      engine =
+        "'engine'(N, \#{engine := \#{module := 'Elixir.CairnOrt'}} = B) -> " <>
+          "'Elixir.Cairn.Board.Generic':'engine'(N, B)."
+
+      %{dir: dir, board: board} = board_dir(tmp, overrides: %{engine: engine})
+
+      assert :ok = Loader.attach(dir)
+      assert Cairn.Board.module() == board
+    end
+
     test "start/0 with no board attached does nothing" do
       assert :ok = Loader.start()
     end
