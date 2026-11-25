@@ -57,7 +57,10 @@ defmodule Cairn.Stage.ConformanceTest do
       [step | context.generic]
     end
 
-    def detect_chain(context), do: context.generic
+    def detect_chain(context) do
+      send(self(), {:base, :detect_chain, context.base})
+      context.generic
+    end
 
     @impl true
     def decoders, do: T.get(:decoders, ["fake"])
@@ -76,12 +79,27 @@ defmodule Cairn.Stage.ConformanceTest do
       })
     end
 
+    # `:lent` answers with the base's own libraries, as a board does for the
+    # names it does not provide.
     @impl true
-    def decoder_backend(_decoder), do: T.get(:library, Cairn.Stage.ConformanceTest.Library)
+    def decoder_backend(_decoder, base) do
+      send(self(), {:base, :decoder_backend, base})
+
+      case T.get(:library, Cairn.Stage.ConformanceTest.Library) do
+        :lent -> base.decoder
+        library -> library
+      end
+    end
 
     @impl true
-    def engine(_backend),
-      do: %{module: T.get(:library, Cairn.Stage.ConformanceTest.Library), canary: "probe"}
+    def engine(_backend, base) do
+      send(self(), {:base, :engine, base})
+
+      case T.get(:library, Cairn.Stage.ConformanceTest.Library) do
+        :lent -> base.engine
+        library -> %{module: library, canary: "probe"}
+      end
+    end
 
     @impl true
     def preflight, do: %{decoders: %{}, backends: %{}}
@@ -113,12 +131,43 @@ defmodule Cairn.Stage.ConformanceTest do
     assert Conformance.check(Board) == :ok
   end
 
+  test "the base given is what every callback taking one receives" do
+    base = %{decoder: Library, host: Library, engine: %{module: Library, canary: "probe"}}
+    put(:library, :lent)
+    assert Conformance.check(Board, base: base) == :ok
+
+    for fun <- [:decoder_backend, :engine, :detect_chain],
+        do: assert_received({:base, ^fun, ^base})
+  end
+
+  test "the stand-in's libraries go unchecked; a real base's are checked" do
+    put(:library, :lent)
+    assert Conformance.check(Board) == :ok
+    assert_received {:base, :engine, %{engine: %{module: stand_in}}}
+    refute Code.ensure_loaded?(stand_in)
+
+    base = %{decoder: NoSuchDecoder, host: Library, engine: %{module: Library, canary: "probe"}}
+    assert {:error, [message]} = Conformance.check(Board, base: base)
+    assert message =~ ~s(decoder "fake"'s library NoSuchDecoder is not loaded)
+
+    put(:contract, 7)
+    assert {:error, [message]} = Conformance.check(Board, base: %{base | decoder: Library})
+    assert message =~ "reports contract 7"
+  end
+
+  test "a malformed engine answer names the arity called" do
+    put(:library, :lent)
+    base = %{decoder: Library, host: Library, engine: :oops}
+    assert {:error, [message]} = Conformance.check(Board, base: base)
+    assert message == "#{inspect(Board)}.engine(\"fake\", base) is :oops"
+  end
+
   test "a module that is not loaded, or does not export every callback" do
     assert {:error, [message]} = Conformance.check(NoSuchBoard)
     assert message =~ "board module NoSuchBoard is not loaded"
 
     assert {:error, [message]} = Conformance.check(Partial)
-    assert message =~ "does not export artifacts/1, backends/0, decoder_backend/1"
+    assert message =~ "does not export artifacts/1, backends/0, decoder_backend/2"
   end
 
   test "capability maps of the wrong shape, each named" do

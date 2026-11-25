@@ -673,13 +673,15 @@ defmodule Cairn.Native.Host do
   # none is left driven through a module it was not opened with.
   defp libraries(state, decoder, backend) do
     board = Cairn.Board.module()
-    decode_library = board.decoder_backend(decoder)
+    base = Cairn.Board.base()
+    decode_library = board.decoder_backend(decoder, base)
 
     %{
       state
       | decode_library: decode_library,
         native: Keyword.get(state.opts, :native_module, decode_library),
-        ort: Keyword.get_lazy(state.opts, :ort_module, fn -> board.engine(backend).module end)
+        ort:
+          Keyword.get_lazy(state.opts, :ort_module, fn -> board.engine(backend, base).module end)
     }
   end
 
@@ -687,7 +689,9 @@ defmodule Cairn.Native.Host do
     state.opts
     |> Keyword.get(:canary, [])
     |> Keyword.merge(Application.get_env(:cairn, Canary, []))
-    |> Keyword.put_new_lazy(:command, fn -> Cairn.Board.module().engine(config.backend).canary end)
+    |> Keyword.put_new_lazy(:command, fn ->
+      Cairn.Board.module().engine(config.backend, Cairn.Board.base()).canary
+    end)
   end
 
   # Token-gated, because a reopen can complete before the retired caller is

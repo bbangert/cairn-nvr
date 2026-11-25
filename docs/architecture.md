@@ -91,7 +91,7 @@ Everything that differs between SoC families — the decoders and NPU runtimes o
 
 - **`libs/cairn_stage`, the contract.** `Cairn.Stage.Board` is the behaviour a board implements. `Cairn.Stage.Step` and `Cairn.Stage.Chain` say what a detect chain is and check one. `DecoderNif` and `EngineNif` are the behaviours a board's NIF modules meet, `FrameMeta` and `DmaFrame` the frame formats that pass between elements. `SampleGate` and `DecoderCore` are the sampling rule and the decode element's lifecycle, held here so every board's decoder behaves alike. The library depends on Membrane and on nothing of Cairn's.
 - **The base, `:cairn`.** Everything else in this document, and the generic board (`Cairn.Board.Generic`): decode through `cairn-native`, ONNX Runtime and QNN through `cairn-ort`.
-- **A board library under `boards/`.** Today `boards/cairn_rockchip`: its elements (`DecodeScale`, `Download`), its NIF crate over MPP, librga and RKNN, its probe binary and its profiles. Its Elixir depends on `cairn_stage` and never on the base. The base libraries it reuses are lent to it by name in `config/boards/rockchip.exs`: the generic decoder and engine, for a camera that does not ask for `rkmpp` and a backend that is not `rknn`, and the decoder host, which its own decode element opens through as well. Its Rust crate is the exception to that separation: it has path dependencies on `plugins/cairn-detect` and `plugins/cairn-ort`.
+- **A board library under `boards/`.** Today `boards/cairn_rockchip`: its elements (`DecodeScale`, `Download`), its NIF crate over MPP, librga and RKNN, its probe binary and its profiles. Its Elixir depends on `cairn_stage` and never on the base. The base libraries it reuses reach it as the `base` map the base passes to `detect_chain/1`, `decoder_backend/2` and `engine/2` (`Cairn.Board.base/0` builds it): the generic decoder and engine, for a camera that does not ask for `rkmpp` and a backend that is not `rknn`, and the decoder host, which its own decode element opens through as well. Its Rust crate is the exception to that separation: it has path dependencies on `plugins/cairn-detect` and `plugins/cairn-ort`.
 
 `CAIRN_BOARD` (default `generic`) picks the board a release is built with. `mix.exs` adds the board library as a dependency; `config/config.exs` imports `config/boards/<board>.exs`, which names the board module; `Cairn.Board` reads that name at compile time, as its default; and the Dockerfile's runtime stage is `vendor-<board>`. A board attached at boot from a board directory replaces the default (see [Board directories](#board-directories)).
 
@@ -103,17 +103,17 @@ Everything that differs between SoC families — the decoders and NPU runtimes o
 | `detect_chain/1` | The steps of one camera's detect branch (below) |
 | `decoders/0` | The `decoder:` names a profile may use |
 | `backends/0` | The `backend:` names, each with its capabilities: the `model:` key naming its artifact, whether NMS may be fused into the graph, whether shapes are dynamic, whether the CPU baseline needs an FP32 twin, whether it is experimental (absent means it is), and, for a backend whose artifact is converted from the export, which decode contracts the conversion was measured to detect on |
-| `decoder_backend/1` | The decode NIF module behind a decoder name |
-| `engine/1` | The engine NIF module behind a backend name, and the canary executable that probe-loads a model for it |
+| `decoder_backend/2` | The decode NIF module behind a decoder name; the second argument is `base`, the base's own libraries |
+| `engine/2` | The engine NIF module behind a backend name, and the canary executable that probe-loads a model for it; the second argument is `base` |
 | `preflight/0` | Which of those names cannot work on this host, and why (a missing device, library or NIF) — a profile naming one is valid and would do nothing |
 | `artifacts/1` | Runtime files the release does not carry, which the base fetches at first start and keeps only if they hash to the pinned sha256 |
 | `profiles_dir/0` | Where the board's shipped profiles are |
 
 ### The detect chain
 
-`detect_chain/1` returns a camera's detect branch as a list of `%Cairn.Stage.Step{}`: the element to build, its child name, the stages it `covers`, and its `input` and `output` format tags (`:h264`, `:rgb`, `:dma_frame`, `:detections`). The base hands it a context holding the camera's id and stream parameters, its resolved `decoder:` name, its motion gate config, and `generic` — the base's own steps for that camera — so a board can keep any of them without depending on the base.
+`detect_chain/1` returns a camera's detect branch as a list of `%Cairn.Stage.Step{}`: the element to build, its child name, the stages it `covers`, and its `input` and `output` format tags (`:h264`, `:rgb`, `:dma_frame`, `:detections`). The base hands it a context holding the camera's id and stream parameters, its resolved `decoder:` name, its motion gate config, `generic` — the base's own steps for that camera — and `base` — the base's decoder, decoder host and engine — so a board can keep or reuse any of them without depending on the base.
 
-The generic board returns `generic` unchanged: `:decoder` (H.264 in, RGB out) → `:motion_gate` when the camera has one → `:infer`. The Rockchip board, for `decoder: rkmpp`, replaces the decode step with two of its own and keeps the rest: `:decoder` (`DecodeScale`: H.264 in, a frame in a dma-buf out) → `:download` (dma-buf to RGB) → the base's gate and `:infer`. Inference is the base's element on every board; which engine it reaches is `engine/1`'s answer.
+The generic board returns `generic` unchanged: `:decoder` (H.264 in, RGB out) → `:motion_gate` when the camera has one → `:infer`. The Rockchip board, for `decoder: rkmpp`, replaces the decode step with two of its own and keeps the rest: `:decoder` (`DecodeScale`: H.264 in, a frame in a dma-buf out) → `:download` (dma-buf to RGB) → the base's gate and `:infer`. Inference is the base's element on every board; which engine it reaches is `engine/2`'s answer.
 
 `Cairn.Pipeline.DetectChain` checks the list with `Cairn.Stage.Chain.validate/2` before anything is built from it, and a chain that fails raises at pipeline build, naming the rule:
 
@@ -129,7 +129,7 @@ The generic board returns `generic` unchanged: `:decoder` (H.264 in, RGB out) �
 A second board, `boards/cairn_foo`, needs:
 
 1. A Mix project depending on `cairn_stage` only: a module implementing the nine `Cairn.Stage.Board` callbacks, its NIF modules (`EngineNif`, and `DecoderNif` if it decodes) written to load without their library, and its profiles under `priv/profiles`.
-2. `config/boards/foo.exs`, naming the module and lending it whichever base libraries it reuses.
+2. `config/boards/foo.exs`, naming the module. A base library it reuses comes from the `base` map, not from config.
 3. A `board_deps/1` clause in `mix.exs`.
 4. In the image: a `vendor-foo` runtime stage; its library, NIF and profiles copied into the release-build stage, which names `boards/cairn_rockchip` by path today and checks the Rockchip release for the last two; a vendor-libraries stage if it needs vendor userspace; a branch in `tools/container/build-rust-aarch64.sh` if it has a Rust crate; its canary executable on the PATH.
 5. In `.github/workflows/container.yml`: the `board` option and its add-on mapping, with a `deploy/vagus-addon/<addon>/config.yaml`.
@@ -155,7 +155,7 @@ A board's Mix project writes its directory with `mix cairn_stage.board --core-re
 - An application the `.rel` does not list is written, with its dependencies. One the build lacks, an OTP or Elixir application, is taken from the toolchain.
 - An application in none of these places is refused, unless it is optional for the application that needs it. So is the board application itself in the `.rel`, a dependency on `:cairn`, an ERTS other than the `.rel`'s, a `defimpl` of a protocol the directory does not ship, and an `--out` that exists and is neither empty nor a previous board directory.
 
-Attaching checks the contract number against `Cairn.Stage.contract/0`, then appends every `lib/*/ebin` to the code path and loads every application with all its modules, which runs each `on_load`. It requires the board application to be the directory's copy, runs `Cairn.Stage.Conformance.check/2` on the board module, handing `detect_chain/1` the base's own steps as `generic`, and only then records the board. `:cairn`'s start then starts the board application. Any failure stops the boot: `start/2` returns `{:error, {:board, message}}`, the log reads `Application cairn exited: … returned an error: {:board, "…"}`, and the VM halts with OTP's `application_start_failure` slogan carrying the same message.
+Attaching checks the contract number against `Cairn.Stage.contract/0`, then appends every `lib/*/ebin` to the code path and loads every application with all its modules, which runs each `on_load`. It requires the board application to be the directory's copy, runs `Cairn.Stage.Conformance.check/2` on the board module, handing `detect_chain/1` the base's own steps as `generic` and every callback that takes one the `base` from `Cairn.Board.base/0`, and only then records the board. `:cairn`'s start then starts the board application. Any failure stops the boot: `start/2` returns `{:error, {:board, message}}`, the log reads `Application cairn exited: … returned an error: {:board, "…"}`, and the VM halts with OTP's `application_start_failure` slogan carrying the same message.
 
 A board obeys these rules:
 

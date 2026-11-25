@@ -118,6 +118,7 @@ defmodule Cairn.SoakMonitor do
   defp sample(state) do
     memory = :erlang.memory()
     board = Cairn.Board.module()
+    base = Cairn.Board.base()
 
     %{
       at: DateTime.utc_now(),
@@ -132,9 +133,10 @@ defmodule Cairn.SoakMonitor do
       # the board names for it, so a release whose board NIF failed reads
       # false although CairnOrt loaded. The keys keep their names for
       # sample-file continuity.
-      native_available: loaded?(Enum.map(board.decoders(), &board.decoder_backend/1)),
+      native_available:
+        loaded?(for decoder <- board.decoders(), do: board.decoder_backend(decoder, base)),
       ort_available:
-        loaded?(for backend <- Map.keys(board.backends()), do: board.engine(backend).module),
+        loaded?(for backend <- Map.keys(board.backends()), do: board.engine(backend, base).module),
       host_restarts: state.host_restarts,
       presence_ledger: ets_size(Cairn.PresenceLedger),
       counts: state.counts,

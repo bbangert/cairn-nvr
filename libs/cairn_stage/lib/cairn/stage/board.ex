@@ -20,8 +20,21 @@ defmodule Cairn.Stage.Board do
           stream_params: map(),
           decoder: String.t() | nil,
           motion: term() | nil,
-          generic: [Step.t()]
+          generic: [Step.t()],
+          base: base()
         }
+
+  @typedoc """
+  The base's own libraries, passed to every callback that may answer with
+  one, because a board depends only on this library and cannot name them:
+  the decode library, the decoder host a board's decode element opens
+  through, and the engine with its canary.
+  """
+  @type base :: %{decoder: module(), host: module(), engine: engine()}
+
+  # `canary` is the probe-load executable run before a model is loaded in
+  # the VM; it must link the same stages the engine does.
+  @type engine :: %{module: module(), canary: String.t()}
 
   @typedoc """
   One backend's claims, answered at config load with no engine running.
@@ -70,11 +83,9 @@ defmodule Cairn.Stage.Board do
   @callback backends() :: %{String.t() => capabilities()}
 
   # Takes the name because one board can carry several decode libraries.
-  @callback decoder_backend(decoder_name :: String.t()) :: module()
+  @callback decoder_backend(decoder_name :: String.t(), base()) :: module()
 
-  # `canary` is the probe-load executable run before a model is loaded in
-  # the VM; it must link the same stages the engine does.
-  @callback engine(backend_name :: String.t()) :: %{module: module(), canary: String.t()}
+  @callback engine(backend_name :: String.t(), base()) :: engine()
 
   # Each provided name whose device is absent on this host, with the reason,
   # per namespace: a profile naming one is valid but would do nothing. Both

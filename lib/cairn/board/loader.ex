@@ -357,7 +357,8 @@ defmodule Cairn.Board.Loader do
     opts = [
       contract: contract,
       generic: DetectChain.base_steps("conformance"),
-      requires: requires()
+      requires: requires(),
+      base: Cairn.Board.base()
     ]
 
     case Conformance.check(board, opts) do

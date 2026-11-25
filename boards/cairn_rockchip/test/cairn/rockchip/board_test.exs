@@ -1,35 +1,23 @@
 defmodule Cairn.Rockchip.BoardTest do
-  # The `:generic` env and `CAIRN_RKNN_LIBRARY` are VM-global.
+  # `CAIRN_RKNN_LIBRARY` and the `:devices` env are VM-global.
   use ExUnit.Case, async: false
 
   alias Cairn.Rockchip.{Board, DecodeScale, Download, Native}
   alias Cairn.Stage.{Capabilities, Chain, Step}
 
   # This suite has no base app, so stand-in atoms play the base's libraries.
-  @generic [
+  @base %{
     decoder: :base_decoder,
     host: :base_host,
     engine: %{module: :base_engine, canary: "base-canary"}
-  ]
-
-  setup do
-    previous = Application.fetch_env(:cairn_rockchip, :generic)
-    Application.put_env(:cairn_rockchip, :generic, @generic)
-
-    on_exit(fn ->
-      case previous do
-        {:ok, value} -> Application.put_env(:cairn_rockchip, :generic, value)
-        :error -> Application.delete_env(:cairn_rockchip, :generic)
-      end
-    end)
-  end
+  }
 
   test "rknn is this library's engine and probe; everything else is the base's" do
-    assert Board.engine("rknn") == %{module: Native, canary: "cairn-rockchip-probe"}
-    assert Board.engine("ort") == @generic[:engine]
-    assert Board.decoder_backend("sw") == :base_decoder
-    assert Board.decoder_backend("auto") == :base_decoder
-    assert Board.decoder_backend("rkmpp") == Native
+    assert Board.engine("rknn", @base) == %{module: Native, canary: "cairn-rockchip-probe"}
+    assert Board.engine("ort", @base) == @base.engine
+    assert Board.decoder_backend("sw", @base) == :base_decoder
+    assert Board.decoder_backend("auto", @base) == :base_decoder
+    assert Board.decoder_backend("rkmpp", @base) == Native
   end
 
   test "the menus offer no qnn, rkmpp only by name, and only rknn needs a twin" do
@@ -81,7 +69,8 @@ defmodule Cairn.Rockchip.BoardTest do
       stream_params: %{min_score: %{}, motion_json: if(gate?, do: "{}")},
       decoder: decoder,
       motion: nil,
-      generic: generic(gate?)
+      generic: generic(gate?),
+      base: @base
     }
   end
 

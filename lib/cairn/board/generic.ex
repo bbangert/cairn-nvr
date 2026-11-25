@@ -63,10 +63,11 @@ defmodule Cairn.Board.Generic do
   end
 
   @impl true
-  def decoder_backend(_decoder), do: Cairn.Native
+  def decoder_backend(_decoder, base), do: base.decoder
 
+  # The base's ORT engine for qnn too: qnn is an onnxruntime execution provider.
   @impl true
-  def engine(_backend), do: %{module: CairnOrt, canary: "cairn-detect"}
+  def engine(_backend, base), do: base.engine
 
   @impl true
   def preflight, do: %{decoders: %{}, backends: %{}}

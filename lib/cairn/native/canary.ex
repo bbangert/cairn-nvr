@@ -51,7 +51,7 @@ defmodule Cairn.Native.Canary do
       `config :cairn, Cairn.Native.Canary, binary: …` and then to `:command`
       on `PATH`. Absent everywhere is an error, not a skip.
     * `:command` — the executable's name, `cairn-detect` unless given;
-      `Cairn.Native.Host` passes the board's (`c:Cairn.Stage.Board.engine/1`).
+      `Cairn.Native.Host` passes the board's (`c:Cairn.Stage.Board.engine/2`).
     * `:timeout_ms` — a QNN HTP graph compile is multiple seconds and a cold
       one can be tens; the default is #{@timeout_ms} ms.
   """

@@ -5,8 +5,8 @@ defmodule Cairn.FixtureBoard.Board do
 
   `decoder: fake` replaces the base's decode step with `FakeDecode`;
   `backend: fake` is experimental, and its conversion of `yolov10` is
-  unproven. `ort`, `auto` and `sw` are the base's own libraries, named here
-  by module until the base lends them through the contract.
+  unproven. `ort`, `auto` and `sw` are the base's own libraries, lent in
+  `base`.
   """
 
   @behaviour Cairn.Stage.Board
@@ -60,12 +60,12 @@ defmodule Cairn.FixtureBoard.Board do
   end
 
   @impl true
-  def decoder_backend("fake"), do: Native
-  def decoder_backend(_decoder), do: Cairn.Native
+  def decoder_backend("fake", _base), do: Native
+  def decoder_backend(_decoder, base), do: base.decoder
 
   @impl true
-  def engine("fake"), do: %{module: Native, canary: "cairn-fixture-probe"}
-  def engine(_backend), do: %{module: CairnOrt, canary: "cairn-detect"}
+  def engine("fake", _base), do: %{module: Native, canary: "cairn-fixture-probe"}
+  def engine(_backend, base), do: base.engine
 
   @impl true
   def preflight, do: %{decoders: %{}, backends: %{}}

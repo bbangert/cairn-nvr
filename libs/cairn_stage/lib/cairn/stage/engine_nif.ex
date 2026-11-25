@@ -1,7 +1,7 @@
 defmodule Cairn.Stage.EngineNif do
   @moduledoc """
   The inference NIF surface the host loads a model and runs streams through.
-  A board names its module per `backend:` (`c:Cairn.Stage.Board.engine/1`);
+  A board names its module per `backend:` (`c:Cairn.Stage.Board.engine/2`);
   errors are `{reason, message}` in the crate's vocabulary.
   """
 
