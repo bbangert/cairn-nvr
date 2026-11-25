@@ -137,7 +137,7 @@ A board that brings a new backend registers it from its own crate: a `Descriptor
 
 ### Board directories
 
-`CAIRN_BOARD_DIR` names a directory holding a board built apart from the release. `Cairn.Board.Loader` attaches it in `Cairn.Application.start/2`, before the supervision tree starts, and `bin/cairn eval` attaches it on the first `Cairn.Board.module/0`. Empty or unset means `Cairn.Board.Generic`.
+`CAIRN_BOARD_DIR` names a directory holding a board built apart from the release. [boards.md](boards.md) is the guide to building one in a repository of its own. `Cairn.Board.Loader` attaches it in `Cairn.Application.start/2`, before the supervision tree starts, and `bin/cairn eval` attaches it on the first `Cairn.Board.module/0`. Empty or unset means `Cairn.Board.Generic`.
 
 ```
 <dir>/board.manifest
