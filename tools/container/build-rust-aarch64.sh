@@ -11,7 +11,8 @@
 #                         -> rockchip/cairn-rockchip-probe       (its canary)
 #
 # in separate directories, because the image copies rockchip/ wholesale onto
-# PATH and rockchip-nif/ into the board library's priv/native.
+# PATH and rockchip-nif/ into the priv/native of the board-build stage, which
+# writes the board directory.
 #
 # Cross, never qemu (D-C3), for everything arch-native this repository builds
 # (these NIFs and binaries, fastrpc, the Rockchip vendor libraries). BEAM

@@ -2,7 +2,14 @@
 # x86 smoke of the container image (tier1-container 1.4). Needs docker with
 # buildx; the repo devcontainer has none, so this is a handoff/CI script.
 #
-# Asserts, in order:
+# Usage: smoke-x86.sh [generic|rockchip]   (default generic)
+#
+# rockchip: the Rockchip image is arm64 only, so what x86 can check is its
+# composition. The amd64 `core` image boots with the `board-dir` stage's
+# board directory attached as vendor-rockchip attaches it; the loader takes
+# it, the board NIF loads, and a config naming rk3566-tier1 loads.
+#
+# generic asserts, in order:
 #   1. the amd64 image builds;
 #   2. the release boots and serves the UI on :4000;
 #   3. /api/cameras answers with the configured camera;
@@ -14,11 +21,22 @@
 #      still served from the rows, and the file's cameras: key earns the
 #      "remove the key" warning rather than a re-import.
 #
-# Everything is logged to smoke-x86.log next to this script.
+# Everything is logged next to this script, to smoke-x86.log (rockchip:
+# smoke-x86-rockchip.log).
 set -uo pipefail
 
+board=${1:-generic}
+case "$board" in
+generic) log_name=smoke-x86.log ;;
+rockchip) log_name=smoke-x86-rockchip.log ;;
+*)
+  echo "usage: $0 [generic|rockchip]" >&2
+  exit 2
+  ;;
+esac
+
 cd "$(dirname "$0")"
-LOG="$PWD/smoke-x86.log"
+LOG="$PWD/$log_name"
 : >"$LOG"
 say() { echo "[smoke] $*" | tee -a "$LOG"; }
 
@@ -30,10 +48,6 @@ fail() {
   exit 1
 }
 
-say "building linux/amd64 image"
-docker buildx build --platform linux/amd64 -t cairn:smoke --load ../.. >>"$LOG" 2>&1 ||
-  fail "image build (see $LOG)"
-
 WORK=$(mktemp -d)
 # The container writes into the /data bind mount as root (soak samples, logs)
 # once it lives long enough, and an unprivileged runner's rm then fails —
@@ -41,6 +55,57 @@ WORK=$(mktemp -d)
 # smoke that passed. Best-effort only; CI runners are ephemeral.
 trap 'docker rm -f cairn-smoke >/dev/null 2>&1 || true; rm -rf "$WORK" 2>/dev/null || true' EXIT
 mkdir -p "$WORK/config" "$WORK/data"
+
+wait_ui() {
+  for _ in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/ || true)
+    [ "$code" = 200 ] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+if [ "$board" = rockchip ]; then
+  say "building the linux/amd64 core image and the Rockchip board directory"
+  docker buildx build --platform linux/amd64 --target core -t cairn:smoke-core --load ../.. \
+    >>"$LOG" 2>&1 || fail "core image build (see $LOG)"
+  docker buildx build --platform linux/amd64 --target board-dir \
+    --output "type=local,dest=$WORK/board" ../.. >>"$LOG" 2>&1 ||
+    fail "board directory build (see $LOG)"
+  cat >"$WORK/config/config.yml" <<'EOF'
+plugins:
+  det:
+    profile: rk3566-tier1
+    allow_experimental: true
+EOF
+  # The artifact store off: it would download librknnrt and the profile's
+  # rungs, none of which can run here.
+  docker rm -f cairn-smoke >>"$LOG" 2>&1 || true
+  docker run -d --name cairn-smoke -p 4000:4000 \
+    -v "$WORK/config:/config" -v "$WORK/data:/data" -v "$WORK/board:/opt/cairn/board:ro" \
+    -e CAIRN_BOARD_DIR=/opt/cairn/board -e ELIXIR_ERL_OPTIONS="-cairn artifacts false" \
+    cairn:smoke-core >>"$LOG" 2>&1 || fail "docker run"
+  wait_ui || fail "UI never served 200 (last: $code)"
+  say "PASS: UI serves 200 with the board attached"
+  expect() { # name expression expected
+    got=$(docker exec cairn-smoke bin/cairn rpc "IO.puts(inspect(($2)))" 2>&1) ||
+      fail "$1: rpc failed: $got"
+    [ "$got" = "$3" ] || fail "$1: got $got, want $3"
+    say "PASS: $1: $got"
+  }
+  expect "board" 'Cairn.Board.module()' 'Cairn.Rockchip.Board'
+  expect "board NIF loaded" 'Cairn.Rockchip.Native.load_error()' 'nil'
+  expect "the config runs rk3566-tier1" \
+    'Enum.map(Cairn.Config.Server.get().plugin_groups, &{&1.name, &1.profile.name})' \
+    '[{"det", "rk3566-tier1"}]'
+  docker rm -f cairn-smoke >>"$LOG" 2>&1
+  say "smoke complete — full log at $LOG"
+  exit 0
+fi
+
+say "building linux/amd64 image"
+docker buildx build --platform linux/amd64 -t cairn:smoke --load ../.. >>"$LOG" 2>&1 ||
+  fail "image build (see $LOG)"
 cp smoke/config.yml "$WORK/config/config.yml"
 
 say "booting container"
@@ -50,12 +115,7 @@ docker run -d --name cairn-smoke -p 4000:4000 \
   fail "docker run"
 
 say "waiting for the UI"
-for _ in $(seq 1 60); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/ || true)
-  [ "$code" = 200 ] && break
-  sleep 2
-done
-[ "$code" = 200 ] || fail "UI never served 200 (last: $code)"
+wait_ui || fail "UI never served 200 (last: $code)"
 say "PASS: UI serves 200"
 
 # Through a LAN-looking Host header too: prod once shipped force_ssl with a
@@ -115,12 +175,7 @@ fi
 say "restarting the container for the second-boot import check"
 docker restart cairn-smoke >>"$LOG" 2>&1 || fail "docker restart"
 
-for _ in $(seq 1 60); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/ || true)
-  [ "$code" = 200 ] && break
-  sleep 2
-done
-[ "$code" = 200 ] || fail "UI never served 200 after the restart (last: $code)"
+wait_ui || fail "UI never served 200 after the restart (last: $code)"
 
 cameras=$(curl -s -H "Authorization: Bearer smoke-token" http://localhost:4000/api/cameras)
 echo "$cameras" >>"$LOG"
