@@ -34,7 +34,7 @@ it. Details in `docs/architecture.md`.
 - **Detection**: in the VM — `plugins/cairn-detect` (hardware decode,
   ONNX Runtime, optional QNN on Qualcomm NPUs) linked into the node's NIFs. A board
   adds its own elements: the Rockchip one (`boards/cairn_rockchip`, which the
-  `CAIRN_BOARD=rockchip` image attaches as a board directory) decodes through
+  Rockchip image attaches as a board directory) decodes through
   MPP and detects on the RK3566 NPU through RKNN, experimental until it has
   soaked. New
   models are a hardware-profile edit, not code. The retired external

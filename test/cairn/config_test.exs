@@ -1255,9 +1255,9 @@ defmodule Cairn.ConfigTest do
     @shadow_dir "test/support/fixtures/profiles/shadow"
     @bad_dir "test/support/fixtures/profiles/bad"
 
-    # `rk-test` is an experimental qnn profile, so the group acknowledges the
+    # `qnn-test` is an experimental qnn profile, so the group acknowledges the
     # backend; an ort profile ignores the key.
-    defp profiled_map(profile \\ "rk-test") do
+    defp profiled_map(profile \\ "qnn-test") do
       base_map()
       |> Map.put("profile_dirs", [@profiles_dir])
       |> Map.put("plugins", %{
@@ -1305,7 +1305,7 @@ defmodule Cairn.ConfigTest do
       assert {:ok, config, []} = Config.from_map(profiled_map())
 
       assert [%{profile: %Profile{} = profile}] = config.plugin_groups
-      assert profile.name == "rk-test"
+      assert profile.name == "qnn-test"
       assert profile.backend == "qnn"
       assert profile.experimental
       assert profile.fps_band == [2, 4]
@@ -1340,12 +1340,12 @@ defmodule Cairn.ConfigTest do
 
     test "a board's unusable backend or decoder warns for a group that selects it" do
       warning =
-        "plugin det: profile rk-test names backend \"qnn\", which the bench board " <>
+        "plugin det: profile qnn-test names backend \"qnn\", which the bench board " <>
           "provides but cannot use on this host: no /dev/fastrpc"
 
       assert {:ok, _config, [^warning]} = Config.from_map(profiled_map(), board: BenchBoard)
       assert {:ok, _config, []} = Config.from_map(profiled_map())
-      # rk-test is still loaded, but no group runs it.
+      # qnn-test is still loaded, but no group runs it.
       assert {:ok, _config, []} = Config.from_map(profiled_map("minimal"), board: BenchBoard)
 
       warning =
@@ -1359,7 +1359,7 @@ defmodule Cairn.ConfigTest do
     @untried %{"qnn" => [%{name: "lib.so", failure: nil}]}
 
     defp unfetched(reason) do
-      "plugin det: profile rk-test runs backend \"qnn\", which needs lib.so, " <>
+      "plugin det: profile qnn-test runs backend \"qnn\", which needs lib.so, " <>
         "not downloaded yet: #{reason} — the download is retried until it succeeds; " <>
         "no camera can run on this group before then"
     end
@@ -1375,7 +1375,7 @@ defmodule Cairn.ConfigTest do
       restarting = %{"qnn" => [%{name: "lib.so", failure: :restarting}]}
 
       message =
-        "plugin det: profile rk-test runs backend \"qnn\", which needs lib.so, " <>
+        "plugin det: profile qnn-test runs backend \"qnn\", which needs lib.so, " <>
           "whose status is unknown: the artifact store is restarting — the config reloads " <>
           "once it is back; no camera can run on this group before then"
 
@@ -1383,7 +1383,7 @@ defmodule Cairn.ConfigTest do
 
       # Another backend's artifact is nobody's concern here.
       assert {:ok, _config, []} =
-               Config.from_map(profiled_map(), artifacts: %{"rknn" => @untried["qnn"]})
+               Config.from_map(profiled_map(), artifacts: %{"fake" => @untried["qnn"]})
     end
 
     test "for a group no camera runs on it warns, beside the board's own warning" do
@@ -1393,7 +1393,7 @@ defmodule Cairn.ConfigTest do
 
       # A NIF that did not load is reported though the download would not fix it.
       preflight =
-        "plugin det: profile rk-test names backend \"qnn\", which the nif board provides " <>
+        "plugin det: profile qnn-test names backend \"qnn\", which the nif board provides " <>
           "but cannot use on this host: the board NIF did not load (:x)"
 
       assert {:ok, _config, [^message, ^preflight]} =
@@ -1548,7 +1548,7 @@ defmodule Cairn.ConfigTest do
 
       assert Enum.any?(
                warnings,
-               &(&1 =~ "profile rk-test supersedes the global tracking.bbd/oru")
+               &(&1 =~ "profile qnn-test supersedes the global tracking.bbd/oru")
              )
     end
 
@@ -1602,7 +1602,7 @@ defmodule Cairn.ConfigTest do
     test "reid warns once that no key selects its embedder, however many groups" do
       two_groups =
         profiled_map()
-        |> put_in(["plugins", "other"], %{"profile" => "rk-test", "allow_experimental" => true})
+        |> put_in(["plugins", "other"], %{"profile" => "qnn-test", "allow_experimental" => true})
         |> put_plugin(1, "other")
 
       for map <- [profiled_map(), two_groups] do
@@ -2081,7 +2081,7 @@ defmodule Cairn.ConfigTest do
       map =
         base_map()
         |> Map.put("profile_dirs", ["test/support/fixtures/profiles/valid"])
-        |> Map.put("plugins", %{"det" => %{"profile" => "rk-test"}})
+        |> Map.put("plugins", %{"det" => %{"profile" => "qnn-test"}})
         |> put_plugin(0, "det")
 
       assert {:error, errors} = Config.from_map(map)
@@ -2093,7 +2093,7 @@ defmodule Cairn.ConfigTest do
         base_map()
         |> Map.put("profile_dirs", ["test/support/fixtures/profiles/valid"])
         |> Map.put("plugins", %{
-          "det" => %{"profile" => "rk-test", "allow_experimental" => true}
+          "det" => %{"profile" => "qnn-test", "allow_experimental" => true}
         })
         |> put_plugin(0, "det")
 
@@ -3134,9 +3134,9 @@ defmodule Cairn.ConfigTest do
     # Rule 1, both sides. No shipped family fuses NMS into its export — every
     # catalog row is NMS-free or host-side — so the reject side cannot be built
     # from a real profile, and the rule is exercised against the row a future
-    # catalog addition would have. Coverage composes: rule 2's fixture tests
-    # (rockchip_release_test.exs, where a backend on the menu has
-    # `conversions`) run the public parse path through the same
+    # catalog addition would have. Coverage composes: rule 2's tests with a
+    # board attached whose backend has `conversions` (fixture_board_test.exs,
+    # rockchip_release_test.exs) run the public parse path through the same
     # `check_capabilities/5`, so the wiring is proven there and only the
     # branches need direct calls — giving the two rules separate entry points
     # breaks that composition and needs a public-path test for each.

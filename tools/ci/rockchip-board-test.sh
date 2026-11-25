@@ -9,8 +9,8 @@
 # here, since it opens librknnrt, MPP and librga only when an engine or a
 # decoder is opened; their absence is a preflight refusal, not a load failure.
 #
-# Builds the release (MIX_ENV=prod mix release, CAIRN_BOARD unset) unless REL
-# names a built one; CARGO overrides the command, e.g. CARGO="cargo +1.100.0".
+# Builds the release (MIX_ENV=prod mix release) unless REL names a built one;
+# CARGO overrides the command, e.g. CARGO="cargo +1.100.0".
 # Needs core's deps fetched, cargo, and the FFmpeg 7.1 the crate links: its
 # own config points at /opt/ffmpeg7, and FFMPEG_PKG_CONFIG_PATH plus
 # RUSTFLAGS="" (no rpath) take a distro's instead. CI's rockchip-board job,
@@ -43,7 +43,7 @@ if [ -n "$rel" ]; then
   rel=$(cd "$rel" && pwd)
 else
   say "building the prod release with no board"
-  (cd "$root" && env -u CAIRN_BOARD MIX_ENV=prod mix release --overwrite) >>"$log" 2>&1 ||
+  (cd "$root" && MIX_ENV=prod mix release --overwrite) >>"$log" 2>&1 ||
     fail "release build (see $log)"
   rel=$root/_build/prod/rel/cairn
 fi

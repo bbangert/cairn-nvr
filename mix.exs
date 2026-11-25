@@ -1,10 +1,6 @@
 defmodule Cairn.MixProject do
   use Mix.Project
 
-  # The board this release is built for; `config/config.exs` picks
-  # `config/boards/<board>.exs` from the same variable.
-  @board System.get_env("CAIRN_BOARD", "generic")
-
   def project do
     [
       app: :cairn,
@@ -19,10 +15,10 @@ defmodule Cairn.MixProject do
       dialyzer: [
         plt_add_apps: [:mix, :ex_unit],
         # A path dependency in the PLT goes stale: dialyxir rebuilds on the lock
-        # file and the app list, neither of which a change under `libs/` or
-        # `boards/` touches. Analysed as project code instead.
-        plt_ignore_apps: path_apps(),
-        paths: Enum.map([:cairn | path_apps()], &"_build/#{Mix.env()}/lib/#{&1}/ebin"),
+        # file and the app list, neither of which a change under `libs/`
+        # touches. Analysed as project code instead.
+        plt_ignore_apps: [:cairn_stage],
+        paths: Enum.map([:cairn, :cairn_stage], &"_build/#{Mix.env()}/lib/#{&1}/ebin"),
         plt_core_path: "priv/plts",
         plt_local_path: "priv/plts"
       ],
@@ -132,18 +128,7 @@ defmodule Cairn.MixProject do
       {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false},
       {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false},
       {:cairn_stage, path: "libs/cairn_stage"}
-    ] ++ board_deps(@board)
-  end
-
-  defp path_apps, do: [:cairn_stage | Enum.map(board_deps(@board), &elem(&1, 0))]
-
-  defp board_deps("generic"), do: []
-  defp board_deps("rockchip"), do: [{:cairn_rockchip, path: "boards/cairn_rockchip"}]
-
-  defp board_deps(board) do
-    Mix.raise(
-      "CAIRN_BOARD=#{inspect(board)} is not a board this tree can build; known: generic, rockchip"
-    )
+    ]
   end
 
   # Aliases are shortcuts or tasks specific to the current project.

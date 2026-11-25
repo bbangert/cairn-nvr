@@ -14,7 +14,7 @@ defmodule Cairn.ArtifactsTest do
   @content "the runtime library"
   @sha256 :sha256 |> :crypto.hash(@content) |> Base.encode16(case: :lower)
   @env "CAIRN_ARTIFACTS_TEST_LIBRARY"
-  @artifact %{name: "lib.so", url: "https://h/lib.so", sha256: @sha256, backend: "rknn"}
+  @artifact %{name: "lib.so", url: "https://h/lib.so", sha256: @sha256, backend: "fake"}
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_artifacts_#{System.unique_integer([:positive])}")
@@ -124,7 +124,7 @@ defmodule Cairn.ArtifactsTest do
       File.write!(file(ctx), "not it")
       start_store(ctx, [artifact()])
       refute File.exists?(file(ctx))
-      assert %{"rknn" => [%{name: "lib.so", failure: nil}]} = Artifacts.unusable(ctx.store)
+      assert %{"fake" => [%{name: "lib.so", failure: nil}]} = Artifacts.unusable(ctx.store)
       assert Artifacts.state(@sha256, ctx.store) == {:missing, nil}
 
       start_fetcher(ctx, writes(@content))
@@ -142,7 +142,7 @@ defmodule Cairn.ArtifactsTest do
       stop_supervised!(ctx.store)
       refute_received {:"$gen_cast", _message}
 
-      assert %{"rknn" => [%{name: "lib.so", failure: :restarting}]} =
+      assert %{"fake" => [%{name: "lib.so", failure: :restarting}]} =
                Artifacts.unusable(ctx.store)
 
       assert Artifacts.unusable(:"#{ctx.store}_never") == %{}
@@ -164,7 +164,7 @@ defmodule Cairn.ArtifactsTest do
       refute File.exists?(partial)
       assert {:error, :enoent} = File.lstat(file(ctx))
       assert File.read!(target) == @content
-      assert %{"rknn" => [_missing]} = Artifacts.unusable(ctx.store)
+      assert %{"fake" => [_missing]} = Artifacts.unusable(ctx.store)
       assert_receive {:"$gen_cast", :work}, @wait
     end
 
@@ -176,7 +176,7 @@ defmodule Cairn.ArtifactsTest do
       refute File.exists?(file(ctx))
       stop_supervised!(ctx.store)
       start_store(ctx, [artifact(%{env: @env})])
-      assert %{"rknn" => [_missing]} = Artifacts.unusable(ctx.store)
+      assert %{"fake" => [_missing]} = Artifacts.unusable(ctx.store)
       assert System.get_env(@env) == file(ctx)
 
       stop_supervised!(ctx.store)
@@ -221,18 +221,6 @@ defmodule Cairn.ArtifactsTest do
       assert Artifacts.state(sha_of("none"), ctx.store) == {:missing, :unlisted}
     end
 
-    test "the Rockchip profile's two rungs, from this repo's models release" do
-      release = "https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/"
-      entries = Profile.fetch_entries(["boards/cairn_rockchip/priv/profiles"])
-
-      assert Enum.map(entries, & &1.name) == ~w(yolox_s_640_i8.rknn yolox_tiny_416_i8.rknn)
-
-      for entry <- entries do
-        assert entry.sha256 =~ ~r/\A[0-9a-f]{64}\z/
-        assert entry.url == release <> entry.name
-      end
-    end
-
     test "fetch_entries/1 takes each well-formed fetched rung once, skipping the rest" do
       dir = Path.join(System.tmp_dir!(), "cairn_fetch_#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
@@ -241,13 +229,13 @@ defmodule Cairn.ArtifactsTest do
 
       File.write!(Path.join(dir, "a.yml"), """
       model_ladder:
-        - {sha256: #{sha}, url: "https://h/m/x.rknn?sig=1"}
-        - {sha256: #{sha}, url: "https://h/m/x.rknn?sig=1"}
-        - {sha256: #{sha}, url: "http://h/x.rknn"}
-        - {sha256: #{sha}, url: "https://u:p@h/x.rknn"}
-        - {sha256: #{sha}, url: "https://h/p.rknn", pack: p}
-        - {sha256: abc, url: "https://h/y.rknn"}
-        - {url: "https://h/z.rknn"}
+        - {sha256: #{sha}, url: "https://h/m/x.bin?sig=1"}
+        - {sha256: #{sha}, url: "https://h/m/x.bin?sig=1"}
+        - {sha256: #{sha}, url: "http://h/x.bin"}
+        - {sha256: #{sha}, url: "https://u:p@h/x.bin"}
+        - {sha256: #{sha}, url: "https://h/p.bin", pack: p}
+        - {sha256: abc, url: "https://h/y.bin"}
+        - {url: "https://h/z.bin"}
       """)
 
       File.write!(Path.join(dir, "b.yml"), "model_ladder: [")
@@ -255,7 +243,7 @@ defmodule Cairn.ArtifactsTest do
       File.write!(Path.join(dir, "d.yml"), "model_ladder: [junk, [#{sha}]]")
 
       assert Profile.fetch_entries([dir]) == [
-               %{name: "x.rknn", url: "https://h/m/x.rknn?sig=1", sha256: @sha256}
+               %{name: "x.bin", url: "https://h/m/x.bin?sig=1", sha256: @sha256}
              ]
     end
   end
@@ -275,7 +263,7 @@ defmodule Cairn.ArtifactsTest do
         log =
           capture_log(fn ->
             start_fetcher(ctx, writes(unquote(written)), reload: reloading({:error, ["refused"]}))
-            unusable = %{"rknn" => [%{name: "lib.so", failure: unquote(failure)}]}
+            unusable = %{"fake" => [%{name: "lib.so", failure: unquote(failure)}]}
             assert_receive {:attempt, 3, _artifact, ^unusable}, @wait
           end)
 
@@ -331,7 +319,7 @@ defmodule Cairn.ArtifactsTest do
                 {7, "the fetch answered :weird"},
                 {8, "the fetch took longer than 0 s"}
               ] do
-            assert_receive {:attempt, ^n, _artifact, %{"rknn" => [%{failure: ^expected}]}}, @wait
+            assert_receive {:attempt, ^n, _artifact, %{"fake" => [%{failure: ^expected}]}}, @wait
             # Doubling from 10 ms, capped at 40.
             if n == 5, do: assert(%{backoff: 40} = :sys.get_state(ctx.fetcher))
 

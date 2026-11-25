@@ -400,8 +400,8 @@ ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force
 
 # Path dependencies (`libs/`) resolve at deps.get, so they come in with
-# mix.exs. No `boards/`: this release carries no board, and CAIRN_BOARD is
-# not declared in this stage, so mix.exs and config/config.exs read generic.
+# mix.exs. No `boards/`: this release carries no board; `board-build` below
+# writes the Rockchip one as a directory.
 COPY mix.exs mix.lock ./
 COPY libs libs
 RUN mix deps.get --only prod

@@ -250,34 +250,6 @@ defmodule Cairn.Native.HostTest do
     end
   end
 
-  if Cairn.Board.module() == Cairn.Rockchip.Board do
-    describe "the decode library on the Rockchip board" do
-      test "rkmpp and sw each refuse the other's chain", %{id: id} do
-        for {decoder, foreign} <- [{"rkmpp", Cairn.Native}, {"sw", Cairn.Rockchip.Native}] do
-          host = start_host(config: %{model: "m.onnx", backend: "qnn", decoder: decoder})
-          assert_receive {:init, _config}
-
-          assert {:error, {:config, message}} =
-                   Host.open_decoder(host, id, %{}, {2560, 1920}, foreign)
-
-          assert message =~ "(#{decoder})"
-        end
-
-        refute_received {:open_decoder, _camera_id, _params}
-      end
-
-      test "auto and sw are one library, so an sw chain opens under either", %{id: id} do
-        for decoder <- ["auto", "sw"] do
-          host = start_host(config: %{model: "m.onnx", backend: "qnn", decoder: decoder})
-          assert_receive {:init, _config}
-
-          assert {:ok, %{module: NativeStub}} =
-                   Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Native)
-        end
-      end
-    end
-  end
-
   describe "streams" do
     test "open, push, close", %{id: id} do
       host = start_host()
@@ -759,9 +731,9 @@ defmodule Cairn.Native.HostTest do
     end
 
     test "a named CPU twin is what the baseline measures, under the accelerator's name" do
-      host = start_host(config: %{model: "m.rknn", backend: "rknn", cpu_twin: @stub_onnx})
+      host = start_host(config: %{model: "m.fake", backend: "fake", cpu_twin: @stub_onnx})
 
-      assert_receive {:init, %{model: "m.rknn"}}
+      assert_receive {:init, %{model: "m.fake"}}
       assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, _opts}
       assert settled_baseline(host) == 45.0
 
@@ -770,24 +742,24 @@ defmodule Cairn.Native.HostTest do
 
       log =
         capture_log(fn ->
-          host = start_host(config: %{model: "m.rknn", backend: "rknn", cpu_twin: @stub_onnx})
+          host = start_host(config: %{model: "m.fake", backend: "fake", cpu_twin: @stub_onnx})
           assert settled_baseline(host) == nil
         end)
 
-      assert log =~ "no CPU baseline for m.rknn: it said nothing"
+      assert log =~ "no CPU baseline for m.fake: it said nothing"
     end
 
     test "a named CPU twin that is missing is said, not skipped silently" do
       log =
         capture_log(fn ->
-          host = start_host(config: %{model: "m.rknn", backend: "rknn", cpu_twin: "gone.onnx"})
+          host = start_host(config: %{model: "m.fake", backend: "fake", cpu_twin: "gone.onnx"})
 
-          assert_receive {:init, %{model: "m.rknn"}}
+          assert_receive {:init, %{model: "m.fake"}}
           assert GenServer.call(host, :probe).cpu_baseline_ms == nil
         end)
 
       refute_received {:cpu_baseline, _config, _passes, _opts}
-      assert log =~ "no CPU baseline for m.rknn: its CPU twin gone.onnx does not exist"
+      assert log =~ "no CPU baseline for m.fake: its CPU twin gone.onnx does not exist"
     end
   end
 end
