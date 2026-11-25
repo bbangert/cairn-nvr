@@ -26,11 +26,6 @@ Cairn.Repo.delete_all(Cairn.Tracks.Track)
 # tools/ci/build-fixture-board.sh <dir> <release's cairn.rel> builds (the
 # boot test builds one in $WORK/board). Run it with:
 # CAIRN_FIXTURE_BOARD_DIR=<dir> mix test --only fixture_board
-#
-# :rockchip_board is the Rockchip board's attached suite, which its own
-# repository (bbangert/cairn-rockchip) runs, never this one.
-ExUnit.start(
-  exclude: [:integration, :native_parity, :e2e_membrane, :fixture_board, :rockchip_board]
-)
+ExUnit.start(exclude: [:integration, :native_parity, :e2e_membrane, :fixture_board])
 
 Ecto.Adapters.SQL.Sandbox.mode(Cairn.Repo, :manual)

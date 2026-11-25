@@ -40,13 +40,13 @@ plugins:
     # The profile's filename, without .yml. A group is nothing but this
     # reference and your consent flags — the external-plugin `command:` form
     # died with membrane port phase 6.
-    profile: rk3566-tier1
+    profile: qcs6490-tier1
     # Required to run a profile whose backend the node's board marks
-    # experimental: each release offers `ort` plus its own (`qnn` on the
-    # generic board, `rknn` on the Rockchip one), and both of those are
-    # marked so. Both halves are needed — the profile says
-    # `experimental: true`, you say `allow_experimental: true` — because one
-    # is the author's claim and the other is your consent.
+    # experimental: every board offers `ort` plus its own (`qnn` on the
+    # generic board), and the generic board marks `qnn` so. Both halves are
+    # needed — the profile says `experimental: true`, you say
+    # `allow_experimental: true` — because one is the author's claim and the
+    # other is your consent.
     allow_experimental: true
 
 cameras:
@@ -67,10 +67,10 @@ actually runs must name an artifact for its own backend.
 name: my-board             # optional; when present it must equal the filename
 tier: 2                    # optional; the capability rung this profile claims
 experimental: true         # this profile is unproven — see below
-backend: rknn              # which runtime executes the model
+backend: qnn               # which runtime executes the model
 model:                     # one artifact path per backend, not one model
   onnx: models/yolox_tiny.onnx
-  rknn: models/yolox_tiny_rk3566.rknn
+  qnn: models/yolox_tiny-qdq-a8.onnx
 model_profile: yolox       # the detector family, from the Rust catalog
 input_size: 416            # square N; the model's own geometry when omitted
 decoder: auto              # the *video* decode path — not the backend
@@ -94,25 +94,20 @@ where the engine opens them. Nothing here rewrites a path, because a rewrite
 would check one file and hand the engine another.
 
 `model:` is keyed per backend rather than being a single path because backends
-consume different files. An `.rknn` is compiled from an `.onnx` by a host-side
-toolchain; a QNN profile loads a QDQ-quantized graph which is still an `.onnx`
-by format but is not the same file as the fp32 export. One profile can
+consume different files. A QNN profile loads a QDQ-quantized graph which is
+still an `.onnx` by format but is not the same file as the fp32 export, and a
+board's own backend may take a format compiled from the export by a host-side
+toolchain (cairn-rockchip's `.rknn`). One profile can
 therefore carry the artifacts for several backends, and its own `backend:`
 picks which one the engine loads.
 
-A backend whose artifact the CPU cannot run (`rknn` on the Rockchip board)
-also needs `onnx:`: the FP32 export the `.rknn` was converted from, its **CPU
-twin**. The node's health check judges the accelerator against one CPU pass
-of the same model, and that pass is measured on the twin. No `onnx:` on such
+A backend whose artifact the CPU cannot run (its capabilities' `cpu_twin`:
+neither of the generic board's; cairn-rockchip's `rknn` is one) also needs
+`onnx:`: the FP32 export the artifact was converted from, its **CPU twin**.
+The node's health check judges the accelerator against one CPU pass of the
+same model, and that pass is measured on the twin. No `onnx:` on such
 a profile — or on any rung of such a ladder — fails the load; one that names
 a file not on disk loads with a warning and no health ratio.
-
-An `.rknn` has its mean and std folded in at conversion and is fed the frame's
-bytes, so the `model_profile:` beside it must name the family it was converted
-as: the channel order and scale are the ones in "Input conventions" in
-`tools/rknn-export/README.md`, and nothing at load can check them. A family
-with per-channel statistics folded in (`rfdetr`) is refused at open: the
-packer has no path for it.
 
 ## `tier:` — the ascending capability ladder
 
@@ -161,8 +156,8 @@ with detection configured on the node (N — the count of configured
 cameras, never the runtime detection toggle) and resolves the first rung
 whose budget covers N at the tier's floor rate. A small fleet gets the
 most accurate model the board can afford; a growing one walks down the
-ladder; nobody configures a model, ever. Each board's release ships one:
-`qcs6490-tier1.yml` in the generic release, `rk3566-tier1.yml` in Rockchip's.
+ladder; nobody configures a model, ever. The generic board ships one,
+`qcs6490-tier1.yml`; cairn-rockchip ships `rk3566-tier1.yml`.
 
 ```yaml
 tier: 1                        # required — the floor rate is the tier's
@@ -259,23 +254,22 @@ Two consequences worth an operator's attention:
 
 | field | menu | where the menu lives |
 |---|---|---|
-| `backend` | `ort`, `qnn` | the node's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors the `ORT` and `QNN` descriptors in `plugins/cairn-detect/src/infer/backend.rs`, and the Rockchip board's the `RKNN` descriptor in its own crate |
+| `backend` | `ort`, `qnn` | the node's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors the `ORT` and `QNN` descriptors in `plugins/cairn-detect/src/infer/backend.rs`; an attached board's mirror its own crate's |
 | `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr`, `yolov8split`, `yolo26split` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the node's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
-The `backend` and `decoder` menus shown are the generic board's. The
-Rockchip board's backends are `ort` and `rknn`, its decoders `auto`, `sw`
-and `rkmpp` (MPP decode + RGA scale in `boards/cairn_rockchip`), and its
-`auto` never picks `rkmpp`.
+The `backend` and `decoder` menus shown are the generic board's; an attached
+board's are its own. cairn-rockchip's (`rknn`, `rkmpp`), and what a profile
+naming them must say, are its [docs/profiles.md](https://github.com/bbangert/cairn-rockchip/blob/main/docs/profiles.md).
 
 Each catalog row is a decode contract listing the model families it applies
 to: `yolo11` and `yolov8` share one row because several Ultralytics
 generations export byte-identical tensor layouts, and the error messages say
 which decode contract a family resolves to. `yolov8split` and `yolo26split`
 are rows of their own for the same generations exported with the head cut
-before its box decode (`tools/rknn-export`): the tensors differ, so the
-contract does.
+before its box decode (cairn-rockchip's `tools/rknn-export` builds them):
+the tensors differ, so the contract does.
 
 `decoder:` and `backend:` are different knobs that both sound like "how do I
 run this fast". `decoder:` is the **video** path — how H.264 frames get
@@ -292,12 +286,9 @@ if that is all there is". The distinction is worth the refusal on a board: on
 QCS6490 the ASIC decodes the whole fleet for about 2% CPU where software decode
 costs several times that per camera — decode is the term this knob controls;
 the scale/convert after it is paid on both paths — and before this a profile
-naming `v4l2` on a box without it just quietly ran the software decoder. On
-RK3566 that fallback would not even carry the fleet: software decode of one
-15 fps substream ran at the edge of keeping up on the HA Green. A board that
-knows its devices also says so at
-config load: the Rockchip board warns when a profile names `rkmpp` and
-`/dev/mpp_service`, `/dev/rga` or `/dev/dma_heap/system` is missing.
+naming `v4l2` on a box without it just quietly ran the software decoder. A
+board that knows its devices also says so at config load, with the `cannot
+use on this host` warning below; the generic board reports none.
 
 `labels:` is indexed positionally, so the file has to match the family's class
 space: 80 lines for yolox and the Ultralytics families, 91 for rfdetr, which
@@ -319,12 +310,11 @@ runs the gates, the parity harness and the accuracy work, and it never gets a
 measured band, because nothing ships there and a number from it would describe
 hardware no deployment has. That is why `generic-ort.yml` — a profile for any
 host's CPU rather than a hardware class — keeps a declared `[5, 5]` and is
-expected to keep it. Neither board file has a band to measure: both are ladders,
-which derive the rate per rung, and what a ladder owes measurement instead is
-each rung's `engine_budget` (D-L6). A measurement records the cpufreq governor
-it ran under: on QCS6490 the default one makes a plausible-looking wrong number
-(`docs/npu-backends.md`), and RK3566's budgets were taken under the governors as
-found.
+expected to keep it. `qcs6490-tier1.yml` has no band to measure: it is a
+ladder, which derives the rate per rung, and what a ladder owes measurement
+instead is each rung's `engine_budget` (D-L6). A measurement records the
+cpufreq governor it ran under: on QCS6490 the default one makes a
+plausible-looking wrong number (`docs/npu-backends.md`).
 
 `sample_fps` is optional, and **the band validates it, the band never supplies
 it** (D-P4): leave `sample_fps:` unset and the group's cameras are sampled at
@@ -418,13 +408,11 @@ device attached.
 | backend | artifact key | runs a fused-NMS export | takes dynamic shapes | needs a CPU twin |
 |---|---|---|---|---|
 | `ort` | `model.onnx` | yes | yes | no |
-| `rknn` | `model.rknn` | no | no | yes |
 | `qnn` | `model.qnn` | no | no | no |
 
-The generic board's table has the `ort` and `qnn` rows, the Rockchip
-board's the `ort` and `rknn` rows.
+These are the generic board's rows; an attached board's table is its own.
 
-Two rules come out of it, both from `docs/npu-backends.md`:
+Two rules come out of it:
 
 1. **A backend that cannot run the NMS op needs a family that does not need
    one.** Either an NMS-free head (`yolov10`'s end-to-end head, `rfdetr`'s
@@ -435,33 +423,14 @@ Two rules come out of it, both from `docs/npu-backends.md`:
    suppression fused into its graph is refused on the NPU backends without
    anyone having to remember the rule exists.
 
-2. **An rknn conversion that was not measured to detect must say so.**
-   `yolox`, `yolov8split` and `yolo26split` converted to INT8 with
-   rknn-toolkit2 2.3.2, ran on the RK3566 NPU and detected. A profile pairing
-   `rknn` with any other family is refused unless it declares
-   `experimental: true`, and then loads with a warning that gives the same
-   reason:
-
-   - **The stock whole head** (`yolov8` and its row: `yolov9`, `yolo11`,
-     `yolo26`) carries pixel-range boxes and 0..1 scores in one tensor. INT8
-     gives a tensor one scale, which zeroes the scores: yolov8, yolo11 and
-     yolo26 converted and detected nothing in the toolkit's simulator (yolov9
-     was not tried). For a v8, v11 or 26 model, export the split head and
-     name `yolov8split` (or `yolo26split`) instead.
-   - **The end-to-end head** (`yolov10`), measured on yolo26's export of it:
-     no detections in INT8 in the simulator, and in FP16 on the board the
-     right scores and classes with wrong boxes.
-   - **`rfdetr`**: its INT8 scores are unusable in the simulator, and no
-     INT8 build was run on the board. Its FP16 build crashed librknnrt 2.3.2
-     there: the runtime has no GridSample op.
-
-   The verdict is per decode contract, not per model size: a yolox_nano
-   build passes this rule and detected nothing in INT8 in the simulator.
-   FP16 is not a way around it. The backend opens INT8 artifacts only and
-   refuses an FP16 build at load; the FP16 results above come from the
-   bench harness, where FP16 also ran about three times slower than INT8
-   end to end (yolox_s at 640: 310 ms a frame against 101).
-   `tools/rknn-export/README.md` in the source tree has the measurements.
+2. **A conversion that was not measured to detect must say so.** A backend
+   whose artifact is converted from the export lists, in its capabilities'
+   `conversions`, the decode contracts its conversion was measured to detect
+   on. A profile pairing it with any other family is refused unless it
+   declares `experimental: true`, and then loads with a warning that gives
+   the same reason. Neither of the generic board's backends lists any;
+   cairn-rockchip's `rknn` verdicts are in its
+   [docs/profiles.md](https://github.com/bbangert/cairn-rockchip/blob/main/docs/profiles.md#which-families-convert).
 
 Both rules need a family to read. A profile that leaves `model_profile:` unset
 lets the engine sniff the family from the model's own tensor shapes, which is
@@ -473,19 +442,17 @@ on a non-`ort` backend.
 Written here rather than invented as validation, because a check that cannot
 see what it is checking is worse than a sentence you can read.
 
-**RKNN is sequential per context, and the engine holds one.** librknnrt
-documents no async submission and no batching: one inference at a time per
-context. Nothing in a profile can say otherwise — there is no batch size and
-no concurrency field — so this is a sizing fact, not a setting. Further
-contexts of one model do overlap on the RK3566
-(`docs/evidence/rk3566-capacity-20261118.md`), but that is not something a
-profile can ask for: if an rk3566 budget looks achievable only by overlapping
-inferences, it is not achievable.
+**Nothing in a profile sets batching or concurrency.** There is no batch
+size and no concurrency field, so how many inferences an engine overlaps is a
+sizing fact its budgets were measured under, not a setting.
+cairn-rockchip's RKNN engine, for one, runs one at a time
+([its sizing notes](https://github.com/bbangert/cairn-rockchip/blob/main/docs/profiles.md#sizing)).
 
 **A fixed-geometry artifact pins `input_size:` and config load cannot
-check it.** Both NPU backends compile the model at one input geometry, so an
-`input_size:` that disagrees with the compiled artifact is wrong in a way
-config load cannot detect: it cannot open an `.rknn` to look. The engine can:
+check it.** A backend without dynamic shapes (`qnn`, and cairn-rockchip's
+`rknn`) runs the model at one input geometry, so an `input_size:` that
+disagrees with the artifact is wrong in a way config load cannot detect: it
+does not open the artifact to look. The engine can:
 its probe-load refuses a model whose own shape contradicts the size it was
 given, after the config has loaded, and no camera detects. Set it
 to the geometry you converted at. On `ort` the same field means something looser — RF-DETR
@@ -513,12 +480,10 @@ profile my-board: sample_fps must be an integer between 1 and 30, got "fast"
 profile my-board: sample_fps 6 contradicts fps_band [8, 12] — a declared
   sample_fps must fall inside its own fps_band
 profile my-board: tracking.bbd must be true, false or a params mapping, got 1
-profile my-board: model_profile yolov10 is not a proven rknn conversion: its
-  end-to-end output detects nothing in INT8 in the toolkit's simulator and
-  has wrong boxes in FP16 on the board, both measured on yolo26's export of
-  that head — experimental: true loads it regardless (measurements:
-  tools/rknn-export/README.md)
-profile my-board: model artifact models/gone.rknn does not exist or is not a
+profile my-board: model_profile <family> is not a proven <backend> conversion:
+  <the board's reason> — experimental: true loads it regardless
+  (measurements: <the board's evidence>)
+profile my-board: model artifact models/gone.onnx does not exist or is not a
   regular file (relative paths resolve against this node's working directory)
 profile my-board: labels file models/gone.names does not exist or is not a
   regular file …
@@ -531,23 +496,23 @@ profile my-board: model_ladder rung 1 names a file to fetch (sha256:/url:),
 And the ones about attaching it, which name the plugin group instead:
 
 ```
-plugin detect: unknown profile "rk3566" — no such file in priv/profiles, the
+plugin detect: unknown profile "qcs6490" — no such file in priv/profiles, the
   board's profiles or any profile_dirs entry
-plugin detect: profile my-board uses backend rknn, which is experimental on
-  the rockchip board — a profile naming it must declare experimental: true
-plugin detect: profile my-board uses backend rknn, which is experimental
+plugin detect: profile my-board uses backend qnn, which is experimental on
+  the generic board — a profile naming it must declare experimental: true
+plugin detect: profile my-board uses backend qnn, which is experimental
   — set allow_experimental: true on this plugin group to run it anyway
-plugin detect: profile my-board names no model.rknn artifact for its rknn
+plugin detect: profile my-board names no model.qnn artifact for its qnn
   backend — the engine takes its model from the profile alone
-plugin detect: profile my-board runs backend rknn, whose artifact the CPU
+plugin detect: profile my-board runs backend <backend>, whose artifact the CPU
   baseline cannot run, but it names no model.onnx — name the model's FP32
   ONNX twin there
-plugin detect: profile my-board runs backend "rknn", which needs librknnrt.so,
+plugin detect: profile my-board runs backend "<backend>", which needs <file>,
   not downloaded yet: the last fetch failed: <why> — the download is retried
   until it succeeds; no camera can run on this group before then
-plugin detect: profile rk3566-tier1 needs yolox_s_640_i8.rknn (ladder rung 1),
-  not downloaded yet: the fetch has not been tried — the download is retried
-  until it succeeds; no camera can run on this group before then
+plugin detect: profile <profile> needs <file> (ladder rung 1), not downloaded
+  yet: the fetch has not been tried — the download is retried until it
+  succeeds; no camera can run on this group before then
 ```
 
 The last two are errors only while a camera runs on the group, else
@@ -569,18 +534,21 @@ tracking.reid fuses embeddings, and no config or profile key selects the
   pinned with one outside this config
 camera front: track: has no effect at tier 1 — tier 1 runs no tracker and
   persists no track rows; record: gates presence recordings
-plugin detect: profile my-board names backend "rknn", which the <board> board
-  provides but cannot use on this host: <the board's reason>
+plugin detect: profile my-board names backend "<backend>", which the <board>
+  board provides but cannot use on this host: <the board's reason>
 profile my-board: CPU twin models/gone.onnx does not exist or is not a regular
-  file — rknn will load and detect, but its health cannot be judged against
-  the CPU
+  file — <backend> will load and detect, but its health cannot be judged
+  against the CPU
 profile my-board: model_ladder rung 2: experimental: true loads model_profile
-  yolov10, which is not a proven rknn conversion: <the same reason>
+  <family>, which is not a proven <backend> conversion: <the same reason>
 ```
 
 The `cannot use on this host` warning is raised once per selected profile,
 for `backend:` and `decoder:` alike, from the board's own check of the host.
-The generic board reports nothing unusable and never raises it.
+The generic board reports nothing unusable and never raises it. The
+placeholders are filled by a board that has CPU twins, conversion verdicts,
+fetched artifacts or a host check; cairn-rockchip's messages, with its real
+reasons, are in its [docs/profiles.md](https://github.com/bbangert/cairn-rockchip/blob/main/docs/profiles.md#messages-about-rknn-and-rkmpp).
 
 A profile's *files* are checked only for a profile some group actually runs, so
 a board profile for hardware this node does not have costs it nothing.
@@ -599,11 +567,12 @@ the decoder and backend it names. Write the file, drop it in a
 `profile_dirs:` directory, restart or hit Reload. Everything the file names is
 already in the code: if it loads, every value in it is one cairn implements. If
 it does not load, the error says which value is not. A SoC whose decoder or
-NPU runtime the code does not have needs a board library first — RK3566
-needed `boards/cairn_rockchip` — and `docs/architecture.md` says what one is.
+NPU runtime the code does not have needs a board first — RK3566 needed
+cairn-rockchip, built in its own repository — and `docs/boards.md` says how
+to build one.
 
 The path into the repo is the same file: if the board is one others will meet,
-open a PR adding it to `priv/profiles/` or its board's own directory — that is
+open a PR adding it to `priv/profiles/` or to its board's repository — that is
 a data change, and the review is about whether the claims in it are true, not
 about whether the code can run it. Follow what the shipped ones do:
 
@@ -618,8 +587,8 @@ about whether the code can run it. Follow what the shipped ones do:
   it came from) and mark the file DRAFT while any NON-pack budget is
   provisional — the test suite refuses a shipped ladder without the notes
   (D-L6; pack rungs keep provisional notes until their packs ship).
-  `rk3566-tier1.yml` is the worked example: both budgets measured, each
-  note naming its runs.
+  cairn-rockchip's `rk3566-tier1.yml` is the worked example: both budgets
+  measured, each note naming its runs.
 
 Changing a *shipped* profile is a behaviour change for everyone running that
 board. Adding a comment or correcting a band is cheap; changing a stage set
@@ -630,7 +599,7 @@ should carry the measurement that justifies it.
 The three global booleans predate profiles and still load. What they reach is
 narrow: the cameras of a group whose profile runs a tracker and has no
 `tracking:` block. No profile cairn ships is one — `generic-ort` carries a
-block and the two ladders are tier 1 — so on a shipped profile they change
+block and `qcs6490-tier1` is tier 1 — so on a shipped profile they change
 nothing.
 
 They were introduced as fleet-wide rollout
@@ -661,17 +630,18 @@ and relies on them.
 
 ## What cairn ships
 
-Three profiles, each with its reasoning in the file, and each loaded only by
-the release that can run it:
+Two profiles, each with its reasoning in the file: `generic-ort` on every
+board, `qcs6490-tier1` on the generic board only.
 
 | profile | where | backend | rate | stages | notes |
 |---|---|---|---|---|---|
 | `generic-ort` | `priv/profiles/` | `ort` | band 5–5 | twin gate only | yolox at 416 on the CPU; the one non-experimental profile |
 | `qcs6490-tier1` | `priv/profiles/generic/` (generic board) | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: seven rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
-| `rk3566-tier1` | `boards/cairn_rockchip/priv/profiles/` | `rknn` | derived per rung | none (tier 1) | two fetched Apache YOLOX rungs with baked CPU twins, `decoder: rkmpp`, claim 9 cameras; both budgets boundary-measured (`docs/evidence/rk3566-capacity-20261118.md`) |
 
-The two ladders are `experimental: true` because their backends have not
-proven out in soak: a group naming one needs your `allow_experimental: true`.
+The ladder is `experimental: true` because `qnn` has not proven out in soak:
+a group naming it needs your `allow_experimental: true`. A board attached
+from its own repository ships its own profiles; cairn-rockchip's
+`rk3566-tier1` is described in its [docs/profiles.md](https://github.com/bbangert/cairn-rockchip/blob/main/docs/profiles.md#rk3566-tier1).
 
 A group that named the retired `qcs6490` placeholder now fails with
 "unknown profile" — point it at `qcs6490-tier1`. The placeholder was a
