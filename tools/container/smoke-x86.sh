@@ -88,7 +88,8 @@ EOF
   wait_ui || fail "UI never served 200 (last: $code)"
   say "PASS: UI serves 200 with the board attached"
   expect() { # name expression expected
-    got=$(docker exec cairn-smoke bin/cairn rpc "IO.puts(inspect(($2)))" 2>&1) ||
+    # The last line: the VM without libsctp opens with an ESOCK warning.
+    got=$(docker exec cairn-smoke bin/cairn rpc "IO.puts(inspect(($2)))" 2>&1 | tail -n 1) ||
       fail "$1: rpc failed: $got"
     [ "$got" = "$3" ] || fail "$1: got $got, want $3"
     say "PASS: $1: $got"
