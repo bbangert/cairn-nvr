@@ -22,7 +22,7 @@ not transfer between them (D-M6, confirmed by spike 0.4).
 |---|---|---|---|---|
 | QCS6490 | mainline | Venus, V4L2 stateful M2M | `h264_v4l2m2m` | `v4l2` — **measured**, spike 0.3 |
 | RK3576 | mainline 7.0+ | `rkvdec` VDPU383, V4L2 **stateless** (request API) | not by `h264_v4l2m2m`; unsettled | none: no profile, not measured |
-| RK3566 | vendor BSP 6.1 | MPP, `/dev/mpp_service` | only in the `ffmpeg-rockchip` fork (`h264_rkmpp`) | `rkmpp`, the Rockchip release's own MPP binding, not ffmpeg |
+| RK3566 | vendor BSP 6.1 | MPP, `/dev/mpp_service` | only in the `ffmpeg-rockchip` fork (`h264_rkmpp`) | `rkmpp`, the Rockchip board's own MPP binding, not ffmpeg |
 
 The NPU half forks less than the decode half does: RK3566 and RK3576 share one
 runtime (`librknnrt`), one converter (rknn-toolkit2, only `--target` differs)

@@ -446,7 +446,6 @@ jobs:
             _build
             boards/cairn_rockchip/deps
             boards/cairn_rockchip/_build
-            boards/cairn_rockchip/priv/plts
             boards/cairn_rockchip/native/cairn_rockchip/target
             ~/.cargo/registry
             ~/.cache/ort.pyke.io

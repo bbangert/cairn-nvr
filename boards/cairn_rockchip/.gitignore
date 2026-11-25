@@ -2,5 +2,3 @@
 /deps/
 # The cdylib is copied here as a build artifact.
 /priv/native/
-# Dialyzer PLTs
-/priv/plts/
