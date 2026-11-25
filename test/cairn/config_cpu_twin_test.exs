@@ -96,11 +96,18 @@ defmodule Cairn.ConfigCpuTwinTest do
   end
 
   test "a twin on disk passes and reaches the native config" do
-    dir = profile_dir("a", accel(accel: @stub, onnx: @stub))
+    # Two files, so a twin that resolved to the accelerator's artifact fails.
+    artifact =
+      Path.join(System.tmp_dir!(), "cairn_twin_#{System.unique_integer([:positive])}.bin")
+
+    File.write!(artifact, "")
+    on_exit(fn -> File.rm(artifact) end)
+
+    dir = profile_dir("a", accel(accel: artifact, onnx: @stub))
     assert {:ok, config, warnings} = Config.from_map(map("a", [dir]))
     refute Enum.any?(warnings, &(&1 =~ "CPU twin"))
 
-    assert {:ok, %{model: @stub, cpu_twin: @stub, backend: "accel"}} =
+    assert {:ok, %{model: ^artifact, cpu_twin: @stub, backend: "accel"}} =
              Config.native_model_config(config)
   end
 
