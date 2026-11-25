@@ -1,7 +1,0 @@
-# An unproven rknn conversion, acknowledged: it loads, with a warning that
-# gives the reason.
-experimental: true
-backend: rknn
-model:
-  rknn: test/support/fixtures/models/stub.rknn
-model_profile: yolov10

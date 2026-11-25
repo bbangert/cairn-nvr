@@ -1,6 +1,0 @@
-# Rule 2: yolo26's whole head is unproven with the rest of yolov8's row, and
-# the refusal names yolo26 as written.
-backend: rknn
-model:
-  rknn: test/support/fixtures/models/stub.rknn
-model_profile: yolo26

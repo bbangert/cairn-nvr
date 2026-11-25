@@ -1,7 +1,0 @@
-# onnx is pinned below pip's latest: newer releases break rknn-toolkit2's
-# load_onnx ("module 'onnx' has no attribute 'mapping'").
-rknn-toolkit2==2.3.2
-onnx==1.16.1
-numpy==1.26.4
-onnxruntime==1.26.0
-opencv-python==4.11.0.86

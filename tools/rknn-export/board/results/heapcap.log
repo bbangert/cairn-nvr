@@ -1,3 +1,0 @@
-JSON:{"heap": "/dev/rk_dma_heap/rk-dma-heap-cma", "nv12_1088_buffers": 10, "stopped_by": "[Errno 12] Cannot allocate memory", "cma_free_before_mb": 157, "cma_free_at_peak_mb": 127, "cma_free_after_mb": 157}
-[exit 0]
-:ok
