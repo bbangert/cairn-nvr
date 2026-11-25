@@ -45,8 +45,8 @@ on:
         default: false
 
 # Baseline for every job; publish alone raises itself to packages: write —
-# the PR jobs build (and smoke runs) PR-authored code and must not hold a
-# token that can push the images vagus pulls anonymously.
+# the PR job builds and runs PR-authored code and must not hold a token that
+# can push the images vagus pulls anonymously.
 permissions:
   contents: read
 
@@ -75,8 +75,9 @@ jobs:
       EVENT: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # qemu for the arm64 release-build and runtime stages; the Rust stage
-      # cross-compiles on the build host (D-C3) and never emulates.
+      # qemu for the arm64 release-build, runtime-base, core and vendor-generic
+      # stages; native-build and ort-libs run on the build host (D-C3) and
+      # never emulate.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - if: env.PUSH == 'true'

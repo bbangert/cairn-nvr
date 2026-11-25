@@ -92,9 +92,9 @@ defmodule Cairn.PipelineOwner do
   # The least a pipeline is given to put its first fragment in the ring. That
   # costs a spawn, a connect (ffmpeg's own RTSP timeout is 10 s), a probe and
   # a GOP: an absolute cost, not the operator's tolerance for a stream gone
-  # silent. With nine cameras starting at once on a four-core board, eight
-  # got their first bytes 11.7–14.2 s in and the 15 s default bounced four
-  # healthy bridges.
+  # silent. With nine cameras starting at once on a quad Cortex-A55 board,
+  # the slowest measured, eight got their first bytes 11.7–14.2 s in and the
+  # 15 s default bounced four healthy bridges.
   @first_fragment_ms 60_000
 
   @roles [:main, :sub]

@@ -245,9 +245,9 @@ COPY --from=ort-libs /opt/ort /opt/ort
 # ---------------------------------------------------------------------------
 # The base every board image is `FROM`: the release with no board. A board
 # image adds its vendor userspace and its board directory and sets
-# CAIRN_BOARD_DIR. A board built elsewhere must be built on the toolchain the
-# labels name: the loader refuses another contract and the board directory
-# task another ERTS.
+# CAIRN_BOARD_DIR. A board must be built on the toolchain the labels name:
+# the loader refuses another contract and the board directory task another
+# ERTS.
 FROM runtime-base AS core
 WORKDIR /app
 COPY --from=release-build /app/_build/prod/rel/cairn ./

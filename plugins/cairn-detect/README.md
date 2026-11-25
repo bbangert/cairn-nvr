@@ -777,8 +777,9 @@ and kept outside the repo (2026-11-16). On ORT, `yolov8split` returns for
 yolov8n and yolo11n exactly the objects their stock exports give under
 `yolov8`, and `yolo26split` returns for yolo26n those of its end-to-end
 export under `yolov10`, less a few overlapping same-label duplicates that
-graph emits and this profile's NMS removes. On a board's NPU the INT8
-rungs of yolov8n/s, yolo11n and yolo26n/s resolve by sniff and put boxes
+graph emits and this profile's NMS removes. On the one NPU these INT8 rungs
+have been measured on (a board repository's export), those of yolov8n/s,
+yolo11n and yolo26n/s resolve by sniff and put boxes
 where FP32 on ORT does (median IoU 0.96–0.98); their scores run lower,
 by about 0.1 on the yolo26 rungs, so a score threshold tuned on FP32 does
 not carry over.

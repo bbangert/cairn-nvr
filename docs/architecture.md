@@ -93,7 +93,7 @@ Everything that differs between SoC families — the decoders and NPU runtimes o
 - **The base, `:cairn`.** Everything else in this document, and the generic board (`Cairn.Board.Generic`): decode through `cairn-native`, ONNX Runtime and QNN through `cairn-ort`.
 - **A board library under `boards/`.** Today `boards/cairn_rockchip`: its elements (`DecodeScale`, `Download`), its NIF crate over MPP, librga and RKNN, its probe binary and its profiles. Its Elixir depends on `cairn_stage` and never on the base. The base libraries it reuses reach it as the `base` map the base passes to `detect_chain/1`, `decoder_backend/2` and `engine/2` (`Cairn.Board.base/0` builds it): the generic decoder and engine, for a camera that does not ask for `rkmpp` and a backend that is not `rknn`, and the decoder host, which its own decode element opens through as well. Its Rust crate is the exception to that separation: it has path dependencies on `plugins/cairn-detect` and `plugins/cairn-ort`.
 
-The base's Mix project knows one board, `Cairn.Board.Generic`, which a node runs unless a board directory is attached at boot (see [Board directories](#board-directories)); a board library is never compiled into the release. The image's release is built that way, as the `core` stage, and the Dockerfile's `CAIRN_BOARD` build argument picks the runtime stage `vendor-<board>`, which for `rockchip` adds the board directory that the `board-build` stage writes from `boards/cairn_rockchip` and sets `CAIRN_BOARD_DIR`.
+The base's Mix project knows one board, `Cairn.Board.Generic`, which a node runs unless a board directory is attached at boot (see [Board directories](#board-directories)); a board library is never compiled into the release. The image's release is built that way, as the `core` stage; the add-on is `vendor-generic`, `FROM core`. A board repository's image is `FROM` the published base image, adding its board directory and setting `CAIRN_BOARD_DIR` (see [docs/boards.md](boards.md)).
 
 ### What a board answers
 
@@ -126,12 +126,11 @@ The generic board returns `generic` unchanged: `:decoder` (H.264 in, RGB out) �
 
 ### Adding a board
 
-A second board, `boards/cairn_foo`, needs:
+A board, in a repository of its own, needs:
 
 1. A Mix project depending on `cairn_stage` only: a module implementing the nine `Cairn.Stage.Board` callbacks, named by the project's `cairn_board:` key, its NIF modules (`EngineNif`, and `DecoderNif` if it decodes) written to load without their library, and its profiles under `priv/profiles`. A base library it reuses comes from the `base` map, not from config.
-2. In the image: a `vendor-foo` runtime stage `FROM core`, adding its board directory and `CAIRN_BOARD_DIR`; a stage that writes that directory, as `board-build` does for `boards/cairn_rockchip`, and checks it holds the NIF and profiles; a vendor-libraries stage if it needs vendor userspace; a branch in `tools/container/build-rust-aarch64.sh` if it has a Rust crate; its canary executable on the PATH.
-3. In `.github/workflows/container.yml`: the `board` option and its add-on mapping, with a `deploy/vagus-addon/<addon>/config.yaml`.
-4. In CI: a job for the library standing alone — its format check, compile, dialyzer and own suite — that also boots its board directory on the prod release and runs the base's tests that need it attached (as `rockchip-board` runs `tools/ci/rockchip-board-test.sh` and then `rockchip_release_test.exs`), and the five Rust gates for its crate.
+2. In its own repository's image: `FROM` the base image `cairn-nvr-base-aarch64`, adding its board directory, `CAIRN_BOARD_DIR`, any vendor userspace it needs and its canary executable on the PATH (see [docs/boards.md](boards.md)).
+3. In its own CI: its format check, compile, dialyzer and own suite, its board directory booted on a core release with the attached suite run against it, and the five Rust gates for its crate.
 
 A board that brings a new backend registers it from its own crate: a `Descriptor` (name and capabilities) and a `Provider` that opens it, handed to `cairn_detect::cli::run` by its probe binary and to `Engine::with_provider` by its NIF. `plugins/cairn-detect` names only the backends it opens itself, `ort` and `qnn`. Whether a backend is experimental, and which decode contracts its conversion is proven for, the board declares in `backends/0`; the base reads both through `Cairn.Stage.Capabilities`.
 

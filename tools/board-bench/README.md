@@ -48,7 +48,7 @@ one `rtsp://` URL per line — same decode+inference load plus real
 network arrival. The plugin binds RTP on loopback only, so feeds always
 run on the board.
 
-## An unpublished image on a bench board
+## An unpublished image
 
 A manual dispatch of `container.yml` that is not asked to push uploads the
 image as the `cairn-image` artifact, a `docker load` tarball:
@@ -57,6 +57,9 @@ image as the `cairn-image` artifact, a `docker load` tarball:
 gh workflow run container.yml --ref <branch> -f push=false
 gh run download <run-id> -n cairn-image -D stage/   # cairn-image.tar
 ```
+
+Pass `-f push=false` explicitly: a ref whose workflow predates the input
+rejects the run instead of publishing. The artifact expires after three days.
 
 ## Rockchip boards
 

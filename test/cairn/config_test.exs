@@ -3530,6 +3530,7 @@ defmodule Cairn.ConfigTest do
     # from the parsed rungs, paired by order.
     test "every shipped ladder budget carries provenance; non-pack provisional ⇒ DRAFT" do
       shipped = Path.wildcard("priv/profiles/**/*.yml")
+      assert "priv/profiles/generic/qcs6490-tier1.yml" in shipped
 
       for path <- shipped,
           raw = File.read!(path),

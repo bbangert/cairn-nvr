@@ -17,6 +17,11 @@
 # Everything is logged next to this script, to smoke-x86.log.
 set -uo pipefail
 
+if [ "$#" -ne 0 ]; then
+  echo "usage: $0 (no arguments; the image is the generic one)" >&2
+  exit 2
+fi
+
 cd "$(dirname "$0")"
 LOG="$PWD/smoke-x86.log"
 : >"$LOG"

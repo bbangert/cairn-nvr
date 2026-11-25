@@ -182,8 +182,8 @@ defmodule Cairn.BoardPipeline.Collector do
   # Gaps land in 10 ms buckets: the histogram's key count is then bounded by
   # the gap range, not the run length — exact-ms keys under scheduler jitter
   # would grow ~1:1 with gap_count on an hour run. 10 ms is 5% of the 200 ms
-  # gap at the default 5 fps (2% at the 2 fps the Green cells ran), well under
-  # what the p50 is read for.
+  # gap at the default 5 fps (2% at 2 fps), well under what the p50 is read
+  # for.
   @gap_bucket_ms 10
 
   defp new_cam do
@@ -502,8 +502,8 @@ defmodule Cairn.BoardPipeline do
       element's pad, so the host-side tracker closure stays out.
 
   A run that measured ends with one `board-pipeline: engine …` line per host
-  and one `board-pipeline: result …` line, `key=value` pairs for a ladder
-  script to cut.
+  and one `board-pipeline: result …` line, `key=value` pairs for a board
+  repository's ladder script to cut.
   """
 
   alias Cairn.BoardPipeline.{Board, Collector, Pipe}
@@ -745,8 +745,8 @@ defmodule Cairn.BoardPipeline do
 
     obs = Enum.map(cameras, fn {id, _} -> get_in(summary.cams, [id, :observations]) || 0 end)
 
-    # No `result` line for a run that observed nothing: a ladder script would
-    # take it for a cell that ran.
+    # No `result` line for a run that observed nothing: a board repository's
+    # ladder script would take it for a cell that ran.
     if Enum.sum(obs) == 0,
       do: {:error, :no_observations},
       else: {:ok, %{engines: engines, obs: obs}}
