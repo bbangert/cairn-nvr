@@ -6,8 +6,8 @@ defmodule Cairn.Board.Loader do
   for the board application and any application the release does not ship.
   The manifest is `:file.consult/1` terms, each key exactly once:
 
-      {app, cairn_rockchip}.
-      {board, 'Elixir.Cairn.Rockchip.Board'}.
+      {app, cairn_fixture_board}.
+      {board, 'Elixir.Cairn.FixtureBoard.Board'}.
       {contract, 1}.
 
   The board application's version is its `.app` `vsn`, not a manifest key.

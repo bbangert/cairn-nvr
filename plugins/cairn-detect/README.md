@@ -134,7 +134,7 @@ from one process, see [Multiplexed mode](#multiplexed-mode).
 | flag | required | meaning |
 |------|----------|---------|
 | `--model` | yes | detection model, as the artifact `--backend` loads (an `.onnx` for `ort` and `qnn`): yolox `[1,A,5+nc]`, detr `[1,Q,4]`+`[1,Q,nc]`, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
-| `--backend` | no | inference runtime: `ort` (default) and `qnn` (needs `--qnn-library`). A board library's binary adds the backends it registers (the Rockchip board's `cairn-rockchip-probe` adds `rknn`, loading `librknnrt.so` or `CAIRN_RKNN_LIBRARY`). A name the binary does not carry exits 1 with `fatal: --backend: …` listing the ones it does, before the hello line. Not the same knob as `--decoder`, which picks the *video* decode path |
+| `--backend` | no | inference runtime: `ort` (default) and `qnn` (needs `--qnn-library`). A board library's binary adds the backends it registers. A name the binary does not carry exits 1 with `fatal: --backend: …` listing the ones it does, before the hello line. Not the same knob as `--decoder`, which picks the *video* decode path |
 | `--labels` | no | newline-separated class names, **indexed by class id** — line 1 is class 0. Must match the model: a count that disagrees with the model's class count is a startup error, because positional indexing would emit every detection under another class's name. Ids past the end, and blank lines (unnamed slots), fall back to the numeric id |
 | `--allow-label-mismatch` | no | start anyway when `--labels` and the model disagree about the class count. For a deliberately partial label file; the mislabelling it permits is silent |
 | `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |
@@ -777,8 +777,9 @@ and kept outside the repo (2026-11-16). On ORT, `yolov8split` returns for
 yolov8n and yolo11n exactly the objects their stock exports give under
 `yolov8`, and `yolo26split` returns for yolo26n those of its end-to-end
 export under `yolov10`, less a few overlapping same-label duplicates that
-graph emits and this profile's NMS removes. On an RK3566's NPU the INT8
-rungs of yolov8n/s, yolo11n and yolo26n/s resolve by sniff and put boxes
+graph emits and this profile's NMS removes. On the one NPU these INT8 rungs
+have been measured on (a board repository's export), those of yolov8n/s,
+yolo11n and yolo26n/s resolve by sniff and put boxes
 where FP32 on ORT does (median IoU 0.96–0.98); their scores run lower,
 by about 0.1 on the yolo26 rungs, so a score threshold tuned on FP32 does
 not carry over.
@@ -810,10 +811,10 @@ axis is the logits. Both export conventions work, and a model where the pair
 is genuinely ambiguous is an error naming the outputs rather than a guess.
 
 The split heads bind the other way, by **name**: exactly `box0`..`box2` and
-`cls0`..`cls2`, because those names are set and asserted by this repo's own
-exporter (`tools/rknn-export`) and the shapes do not always tell a level's box
-tensor from its class tensor (a 64-class DFL head's are one shape). A missing name is an error, never a fallback to
-position; `sum0`..`sum2` and any other output are ignored.
+`cls0`..`cls2`, because the exporter that splits the heads (a board
+repository's) sets and asserts those names, and the shapes do not always tell
+a level's box tensor from its class tensor (a 64-class DFL head's are one
+shape). A missing name is an error, never a fallback to position; `sum0`..`sum2` and any other output are ignored.
 
 **Adding a family is adding a profile**, not editing the decode path: a
 `ModelProfile` is a name, an `InputSpec` (size, encoding, resize policy) and an
