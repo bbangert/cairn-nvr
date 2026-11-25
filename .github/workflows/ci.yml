@@ -80,12 +80,6 @@ jobs:
   sobelow:
     name: Sobelow
     runs-on: ubuntu-latest
-    # Per board: the board picks a dependency and a config file.
-    strategy:
-      matrix:
-        board: [generic, rockchip]
-    env:
-      CAIRN_BOARD: ${{ matrix.board }}
 
     steps:
       - uses: actions/checkout@v7
@@ -102,9 +96,9 @@ jobs:
           path: |
             deps
             _build
-          key: mix-sobelow-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          key: mix-sobelow-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            mix-sobelow-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+            mix-sobelow-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
 
       - run: mix deps.get
 
@@ -117,12 +111,6 @@ jobs:
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
-    # Per board: the board picks a dependency and a config file.
-    strategy:
-      matrix:
-        board: [generic, rockchip]
-    env:
-      CAIRN_BOARD: ${{ matrix.board }}
 
     steps:
       - uses: actions/checkout@v7
@@ -139,17 +127,17 @@ jobs:
           path: |
             deps
             _build
-          key: mix-dialyzer-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          key: mix-dialyzer-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            mix-dialyzer-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+            mix-dialyzer-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
 
       - name: Cache dialyzer PLTs
         uses: actions/cache@v6
         with:
           path: priv/plts
-          key: plt-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          key: plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            plt-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+            plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
 
       - run: mix deps.get
 
@@ -188,57 +176,6 @@ jobs:
 
       - name: Full-pipeline integration test (real ffmpeg)
         run: mix test --only integration
-
-  test-rockchip:
-    name: Test (CAIRN_BOARD=rockchip)
-    runs-on: ubuntu-latest
-    # Not the full suite: it assumes the generic menu (qnn profiles and
-    # ladders, hardware decoder names), so config_test.exs and its kin are
-    # generic-only; rockchip_release_test.exs covers that menu instead.
-    env:
-      CAIRN_BOARD: rockchip
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: erlef/setup-beam@v1
-        id: beam
-        with:
-          version-file: mise.toml
-          version-type: strict
-
-      - name: Install ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-
-      - name: Cache deps and build
-        uses: actions/cache@v6
-        with:
-          path: |
-            deps
-            _build
-          key: mix-test-rockchip-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            mix-test-rockchip-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
-
-      - run: mix deps.get
-
-      - run: mix compile --warnings-as-errors
-
-      - run: >-
-          mix test
-          test/cairn/rockchip_release_test.exs
-          test/cairn/camera_tracker_test.exs
-          test/cairn/camera_tracker_control_test.exs
-          test/cairn/camera_tracker_recorder_test.exs
-          test/cairn/camera_tracker_restore_test.exs
-          test/cairn/event_extractor_test.exs
-          test/cairn/pipeline/reconnect_integration_test.exs
-          test/cairn/native/
-          test/cairn/config_server_test.exs
-          test/cairn/config_server_update_test.exs
-          test/cairn/config_source_test.exs
-          test/cairn/artifacts_test.exs
-          test/cairn/board/
 
   board-loader:
     name: Board loader (prod release + fixture board)
@@ -457,17 +394,19 @@ jobs:
           echo "image=hexpm/elixir:$(arg ELIXIR_VERSION)-erlang-$(arg OTP_VERSION)-debian-$(arg DEBIAN_TAG)" >> "$GITHUB_OUTPUT"
 
   rockchip-board:
-    name: Rockchip board (mix test, board directory booted)
+    name: Rockchip board (mix test, dialyzer, board directory booted)
     needs: release-toolchain
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # tools/ci/rockchip-board-test.sh: the board built alone, NIF included,
     # as a board directory against the prod release's cairn.rel, and booted
-    # on that release; then the board's own suite, built without the base,
-    # after the script so that its NIF tests find the library it left in
-    # priv/native. In the image the Dockerfile builds the release and the
-    # board in, not on setup-beam: it is Debian 13, whose FFmpeg 7.1 the NIF
-    # links (the runner's Ubuntu ships 6.1).
+    # on that release; then the base's suite that needs that directory
+    # attached, and the board's own suite, built without the base, after the
+    # script so that its NIF tests find the library it left in priv/native.
+    # No sobelow: the board is not a Phoenix application. In the image the
+    # Dockerfile builds the release and the board in, not on setup-beam: it
+    # is Debian 13, whose FFmpeg 7.1 the NIF links (the runner's Ubuntu ships
+    # 6.1).
     container: ${{ needs.release-toolchain.outputs.image }}
     env:
       # As in the cairn-detect job: the crate's cargo config points at a
@@ -523,9 +462,18 @@ jobs:
       - run: mix compile --warnings-as-errors
         working-directory: boards/cairn_rockchip
 
+      - run: mix dialyzer --format github
+        working-directory: boards/cairn_rockchip
+
       - run: mix deps.get
 
       - run: tools/ci/rockchip-board-test.sh
+        env:
+          WORK: ${{ runner.temp }}/rockchip-board
+
+      - run: mix test --only rockchip_board test/cairn/rockchip_release_test.exs
+        env:
+          CAIRN_ROCKCHIP_BOARD_DIR: ${{ runner.temp }}/rockchip-board/board
 
       - run: mix test
         working-directory: boards/cairn_rockchip

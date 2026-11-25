@@ -8,7 +8,17 @@ defmodule Cairn.Rockchip.MixProject do
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       cairn_board: Cairn.Rockchip.Board,
-      deps: deps()
+      deps: deps(),
+      # As the base's: a path dependency in the PLT goes stale, so
+      # `cairn_stage` is analysed as project code. `:mix` for its board task.
+      # The PLTs sit outside `priv`, which the board directory copies whole.
+      dialyzer: [
+        plt_add_apps: [:mix],
+        plt_ignore_apps: [:cairn_stage],
+        paths: Enum.map([:cairn_rockchip, :cairn_stage], &"_build/#{Mix.env()}/lib/#{&1}/ebin"),
+        plt_core_path: "_build/plts",
+        plt_local_path: "_build/plts"
+      ]
     ]
   end
 
@@ -21,7 +31,8 @@ defmodule Cairn.Rockchip.MixProject do
   defp deps do
     [
       {:cairn_stage, path: "../../libs/cairn_stage"},
-      {:membrane_h264_format, "~> 0.6.1"}
+      {:membrane_h264_format, "~> 0.6.1"},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 end

@@ -100,7 +100,7 @@ by format but is not the same file as the fp32 export. One profile can
 therefore carry the artifacts for several backends, and its own `backend:`
 picks which one the engine loads.
 
-A backend whose artifact the CPU cannot run (`rknn` on a Rockchip release)
+A backend whose artifact the CPU cannot run (`rknn` on the Rockchip board)
 also needs `onnx:`: the FP32 export the `.rknn` was converted from, its **CPU
 twin**. The node's health check judges the accelerator against one CPU pass
 of the same model, and that pass is measured on the twin. No `onnx:` on such
@@ -265,7 +265,7 @@ Two consequences worth an operator's attention:
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
 The `backend` and `decoder` menus shown are the generic board's. The
-Rockchip release's backends are `ort` and `rknn`, its decoders `auto`, `sw`
+Rockchip board's backends are `ort` and `rknn`, its decoders `auto`, `sw`
 and `rkmpp` (MPP decode + RGA scale in `boards/cairn_rockchip`), and its
 `auto` never picks `rkmpp`.
 

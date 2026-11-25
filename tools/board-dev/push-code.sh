@@ -7,10 +7,9 @@
 #
 # What rides: every app's ebin from the assembled release (deps included —
 # pushing "just cairn" would miss a dep bump silently), cairn's priv —
-# priv/profiles, priv/repo AND priv/static — and a compiled-in board app's
-# (its profiles), plus runtime.exs, sys.config and the boot artifacts below.
-# The Rockchip image's board is a board directory instead, which this never
-# reaches: there a CAIRN_BOARD=rockchip push is refused as a new dep.
+# priv/profiles, priv/repo AND priv/static — plus runtime.exs, sys.config and
+# the boot artifacts below. A board is a board directory beside the release,
+# which this never reaches: board code changes need a real image.
 # What cannot ride: NIFs/canary (arch-native), ERTS, apt packages,
 # Dockerfile-level anything.
 #
@@ -70,8 +69,8 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 (cd "$REL" && tar czf "$STAGE/push.tgz" \
-  --exclude='*.so' --exclude='lib/cairn*/priv/native' \
-  lib/*/ebin lib/cairn*/priv \
+  --exclude='*.so' --exclude='lib/cairn-*/priv/native' \
+  lib/*/ebin lib/cairn-*/priv \
   releases/*/runtime.exs releases/*/sys.config \
   releases/*/start.boot releases/*/start.script releases/*/cairn.rel releases/*/consolidated)
 

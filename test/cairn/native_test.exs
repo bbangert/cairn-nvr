@@ -94,7 +94,7 @@ defmodule Cairn.NativeTest do
         Config.normalize(
           model: "m.onnx",
           backend: "qnn",
-          decoder: "rkmpp",
+          decoder: "fake",
           input_size: "640x352",
           model_profile: "yolox",
           allow_label_mismatch: true,

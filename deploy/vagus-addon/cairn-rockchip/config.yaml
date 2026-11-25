@@ -1,5 +1,5 @@
-# Cairn NVR for RK3566 boards (HA Green): the image built with
-# CAIRN_BOARD=rockchip.
+# Cairn NVR for RK3566 boards (HA Green): the image the Dockerfile builds
+# with the build argument CAIRN_BOARD=rockchip.
 name: Cairn NVR (Rockchip)
 version: "0.1.8"
 slug: cairn_rockchip

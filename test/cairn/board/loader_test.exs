@@ -281,15 +281,13 @@ defmodule Cairn.Board.LoaderTest do
   end
 
   describe "Cairn.Board.module/0" do
-    test "is the built-in board with CAIRN_BOARD_DIR unset or empty" do
-      built_in = Application.get_env(:cairn, :board, Generic)
-
+    test "is the generic board with CAIRN_BOARD_DIR unset or empty" do
       System.delete_env("CAIRN_BOARD_DIR")
-      assert Cairn.Board.module() == built_in
+      assert Cairn.Board.module() == Generic
 
       :persistent_term.erase(@key)
       System.put_env("CAIRN_BOARD_DIR", "")
-      assert Cairn.Board.module() == built_in
+      assert Cairn.Board.module() == Generic
     end
 
     test "attaches from CAIRN_BOARD_DIR, as under bin/cairn eval", %{tmp_dir: tmp} do

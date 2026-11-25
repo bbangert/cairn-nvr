@@ -1,6 +1,6 @@
 # A single-model profile exercising most schema fields (qnn is experimental,
 # so a group running this one has to set allow_experimental: true).
-name: rk-test
+name: qnn-test
 experimental: true
 backend: qnn
 model:

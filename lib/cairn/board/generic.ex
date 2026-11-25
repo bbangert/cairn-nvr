@@ -1,6 +1,6 @@
 defmodule Cairn.Board.Generic do
   @moduledoc """
-  The board of a release built without a vendor layer: the base's own detect
+  The board of a node with no board directory attached: the base's own detect
   chain (`Cairn.Pipeline.DetectChain`), the ffmpeg-backed decode library and
   the onnxruntime engine for every name it accepts.
   """
