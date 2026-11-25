@@ -1,8 +1,10 @@
 defmodule Cairn.Stage.Board do
   @moduledoc """
-  What a release's board provides: its detect chain, the `decoder:` and
-  `backend:` names it accepts, and the NIF modules behind them. One board is
-  compiled into a release.
+  What a node's board provides: its detect chain, the `decoder:` and
+  `backend:` names it accepts, and the NIF modules behind them. A node runs
+  one board: one attached from a board directory, else the one its release
+  was built with. `Cairn.Stage.Conformance` checks a module against this
+  behaviour.
   """
 
   alias Cairn.Stage.Step
@@ -71,7 +73,7 @@ defmodule Cairn.Stage.Board do
   @typedoc "`{:unproven, why}` carries the measured failure a config diagnostic states."
   @type conversion :: :proven | {:unproven, String.t()}
 
-  # Config errors name the release's board with it.
+  # Config errors name the node's board with it.
   @callback name() :: String.t()
 
   @callback detect_chain(context()) :: [Step.t()]

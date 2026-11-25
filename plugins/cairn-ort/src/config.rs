@@ -11,11 +11,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use cairn_detect::infer::{
-    BackendKind, InputSize, ModelProfile, QnnOptions, ScoreFloors, TrackFloorOverrides,
-};
+use cairn_detect::infer::{InputSize, ModelProfile, QnnOptions, ScoreFloors, TrackFloorOverrides};
 use cairn_detect::motion::{self, MotionConfig, MotionOverrides};
-use clap::ValueEnum;
 use rustler::NifMap;
 
 use crate::error::{NativeError, Result};
@@ -47,45 +44,24 @@ pub struct RawQnnOptions {
 #[derive(Debug)]
 pub struct InitConfig {
     pub model: PathBuf,
-    pub backend: BackendKind,
+    /// The name as sent: which backends it may name is the library's, so each
+    /// [`Engine`](crate::Engine) constructor resolves it.
+    pub backend: String,
     pub model_profile: Option<ModelProfile>,
     pub input_size: Option<InputSize>,
     pub labels: Option<PathBuf>,
     pub allow_label_mismatch: bool,
+    /// Checked in each [`Engine`](crate::Engine) constructor once `backend`
+    /// resolves, so an unknown name is refused as that, not as the embedder's.
     pub embedder_model: Option<PathBuf>,
     pub qnn: QnnOptions,
 }
 
 impl RawInitConfig {
     pub fn resolve(self) -> Result<InitConfig> {
-        let backend = enum_value::<BackendKind>("backend", &self.backend)?;
-        let embedder_model = self.embedder_model.map(PathBuf::from);
-        // The embedder's own open refuses both, but only after the detector's
-        // load — on qnn a multi-second HTP graph compile. `cli.rs`'s `serve`
-        // refuses them up front as well, so the hosts answer the same profile
-        // the same way.
-        if embedder_model.is_some() {
-            match backend {
-                BackendKind::Ort => {}
-                BackendKind::Qnn => {
-                    return Err(NativeError::Config(
-                        "the embedder does not run on qnn yet (no QDQ embedder artifact) \
-                         — drop embedder_model or use the ort backend"
-                            .to_string(),
-                    ))
-                }
-                kind @ BackendKind::Rknn => {
-                    return Err(NativeError::Config(format!(
-                        "the embedder runs on ort only, not {kind} — drop embedder_model \
-                         or use the ort backend"
-                    )))
-                }
-            }
-        }
-
         Ok(InitConfig {
             model: PathBuf::from(self.model),
-            backend,
+            backend: self.backend,
             model_profile: self
                 .model_profile
                 .as_deref()
@@ -100,7 +76,7 @@ impl RawInitConfig {
                 .map_err(|message| NativeError::Config(format!("input_size: {message}")))?,
             labels: self.labels.map(PathBuf::from),
             allow_label_mismatch: self.allow_label_mismatch,
-            embedder_model,
+            embedder_model: self.embedder_model.map(PathBuf::from),
             qnn: QnnOptions {
                 library: self.qnn.library.map(PathBuf::from),
                 soc_model: self.qnn.soc_model,
@@ -160,10 +136,6 @@ impl RawStreamParams {
     }
 }
 
-fn enum_value<T: ValueEnum>(field: &str, value: &str) -> Result<T> {
-    T::from_str(value, true).map_err(|message| NativeError::Config(format!("{field}: {message}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,21 +178,15 @@ mod tests {
         }
         .resolve()
         .unwrap();
-        assert_eq!(resolved.backend, BackendKind::Ort);
+        assert_eq!(resolved.backend, "ort");
         assert_eq!(resolved.input_size, Some(InputSize { w: 640, h: 352 }));
         assert!(resolved.model_profile.is_some());
     }
 
     #[test]
     fn a_name_no_flag_would_accept_is_refused_by_field() {
+        // `backend` is the engine constructors' to refuse (`engine.rs`).
         for (field, config) in [
-            (
-                "backend",
-                RawInitConfig {
-                    backend: "tensorrt".into(),
-                    ..init()
-                },
-            ),
             (
                 "input_size",
                 RawInitConfig {
@@ -239,21 +205,6 @@ mod tests {
             let error = config.resolve().unwrap_err();
             assert_eq!(error.reason(), "config", "{field}");
             assert!(error.message().contains(field), "{}", error.message());
-        }
-    }
-
-    #[test]
-    fn an_embedder_off_ort_is_refused_before_the_model_load() {
-        for backend in ["qnn", "rknn"] {
-            let error = RawInitConfig {
-                backend: backend.into(),
-                embedder_model: Some("osnet.onnx".into()),
-                ..init()
-            }
-            .resolve()
-            .unwrap_err();
-            assert_eq!(error.reason(), "config");
-            assert!(error.message().contains(backend), "{}", error.message());
         }
     }
 

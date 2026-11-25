@@ -11,6 +11,7 @@ defmodule Cairn.CairnOrtStub do
   @behaviour Cairn.Stage.EngineNif
 
   alias Cairn.NativeStub
+  alias Cairn.Stage.EngineNif
 
   @impl true
   def available?, do: control(:ort_available?, true)
@@ -74,6 +75,12 @@ defmodule Cairn.CairnOrtStub do
 
   defp timed(other, _micros), do: other
 
+  @impl true
+  def contract, do: Cairn.Stage.contract()
+
+  @impl true
+  def frame_meta_keys, do: EngineNif.frame_meta_keys()
+
   def cpu_baseline_ms(config, passes) do
     notify({:cpu_baseline_ms, config, passes})
 
@@ -98,7 +105,7 @@ defmodule Cairn.CairnOrtStub do
     end
   end
 
-  # Drain calls the release board's real modules, never a stub.
+  # Drain calls the node's board's real modules, never a stub.
   @impl true
   def drain_teardown(_timeout_ms), do: true
 

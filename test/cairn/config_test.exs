@@ -3055,12 +3055,11 @@ defmodule Cairn.ConfigTest do
       errors
     end
 
-    # The mirror itself. A row that drifts from
-    # `BackendKind::capabilities` in plugins/cairn-detect/src/infer/backend.rs
-    # is a change to what a profile may declare, not a refactor — the Rust side
-    # has the same test over the same values. `experimental` has no Rust
-    # mirror: it is the host's D-P10 policy, which keeps qnn behind the
-    # acknowledgement.
+    # The mirror itself. A row that drifts from its descriptor in
+    # plugins/cairn-detect/src/infer/backend.rs is a change to what a profile
+    # may declare, not a refactor — the Rust side has the same test over the
+    # same values. `experimental` has no Rust mirror: it is the host's D-P10
+    # policy, which keeps qnn behind the acknowledgement.
     test "the table carries a row per backend, matching the plugin's own" do
       assert Profile.capabilities("ort") == %{
                artifact: "onnx",
@@ -3083,31 +3082,35 @@ defmodule Cairn.ConfigTest do
              }
     end
 
-    # The mechanical half of the pairing: read the Rust rows out of the source
-    # and compare, so a coordinated Rust-side edit (table + its own test) still
-    # trips something here. The regex failing to find three rows is itself the
-    # tripwire — it means the Rust shape moved and the mirror needs re-pairing
-    # by hand. `artifact` is deliberately not compared: the two sides disagree
-    # for qnn by design (format vs `model:` key — see the comment on `Cairn.Board.Generic.backends/0`).
-    # rknn's row is the Rockchip board's, so this menu pairs two of the three;
-    # `rockchip_release_test.exs` pairs the third.
+    # The mechanical half of the pairing: read the Rust descriptors out of the
+    # source and compare, so a coordinated Rust-side edit (descriptor + its own
+    # test) still trips something here. The regex failing to find core's two is
+    # itself the tripwire — it means the Rust shape moved and the mirror needs
+    # re-pairing by hand. `artifact` is deliberately not compared: the two sides
+    # disagree for qnn by design (format vs `model:` key — see the comment on
+    # `Cairn.Board.Generic.backends/0`). rknn's descriptor is in the Rockchip
+    # board's crate, and `rockchip_release_test.exs` pairs it.
     test "the capability booleans match the plugin's source, mechanically" do
-      rust = File.read!("plugins/cairn-detect/src/infer/backend.rs")
+      # The test module's fakes are descriptors too.
+      [rust | _] =
+        "plugins/cairn-detect/src/infer/backend.rs"
+        |> File.read!()
+        |> String.split("#[cfg(test)]")
 
       rows =
         Regex.scan(
-          ~r/Self::(\w+) => Capabilities \{\s*supports_fused_nms: (\w+),\s*supports_dynamic_shapes: (\w+),/,
+          ~r/name: "(\w+)",\s*capabilities: Capabilities \{\s*supports_fused_nms: (\w+),\s*supports_dynamic_shapes: (\w+),/,
           rust
         )
 
-      assert length(rows) == 3,
-             "BackendKind::capabilities rows moved in backend.rs — re-pair the mirror " <>
+      assert Enum.map(rows, &Enum.at(&1, 1)) == ["ort", "qnn"],
+             "the ORT and QNN descriptors moved in backend.rs — re-pair the mirror " <>
                "(this regex and Cairn.Board.Generic.backends/0)"
 
-      for [_, kind, fused, dynamic] <- rows, kind != "Rknn" do
-        caps = kind |> String.downcase() |> Profile.capabilities()
-        assert caps.fused_nms == (fused == "true"), "fused_nms drifted for #{kind}"
-        assert caps.dynamic_shapes == (dynamic == "true"), "dynamic_shapes drifted for #{kind}"
+      for [_, name, fused, dynamic] <- rows do
+        caps = Profile.capabilities(name)
+        assert caps.fused_nms == (fused == "true"), "fused_nms drifted for #{name}"
+        assert caps.dynamic_shapes == (dynamic == "true"), "dynamic_shapes drifted for #{name}"
       end
     end
 

@@ -3,8 +3,8 @@
 //! Two things vary independently here and are separated on purpose. *Which
 //! runtime executes the model* is [`backend`]: one trait, two implementations
 //! here (onnxruntime on the CPU EP, and on Qualcomm's HTP via the QNN plugin
-//! EP), and one name — `rknn` — that a board library implements in its own
-//! crate. *How a family is fed and read* is everything else in this
+//! EP), and any other that a board library implements in its own crate and
+//! registers by name. *How a family is fed and read* is everything else in this
 //! module, and it is backend-agnostic: sniffing, sizing and decode work from a
 //! model's declared names and shapes, never from an SDK's types.
 //!
@@ -48,17 +48,18 @@ pub(super) const MAX_DETS: usize = 32;
 // What `infer::X` resolves to for the rest of this library and for the crates
 // that link it. An item is here because something outside `infer` names it,
 // not because it is `pub` inside (T1.4).
-pub use backend::{BackendKind, QnnOptions};
+pub use backend::{select, BackendKind, QnnOptions, Selected};
 // The backend seam, for a board library implementing `Backend` outside this
-// crate and opening a detector over it with `Detector::with_backend`.
+// crate and registering it as a `Provider`.
 pub use backend::{
-    Backend, InputElement, InputTensor, ModelIo, RknnOptions, SessionOptions, Tensors,
+    Backend, Capabilities, Descriptor, InputElement, InputTensor, ModelIo, Provider,
+    SessionOptions, Tensors,
 };
 pub use baseline::{
     cpu_baseline_ms, measure_cpu_baseline, open_baseline_detector, BASELINE_PASSES,
 };
 pub use detector::Detector;
-pub use embedder::{embed_persons, quantize_base64, Embedder};
+pub use embedder::{embed_persons, embedder_backend, quantize_base64, Embedder};
 pub use geometry::{Fit, InputSize, Projection};
 pub use heads::Raw;
 pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};

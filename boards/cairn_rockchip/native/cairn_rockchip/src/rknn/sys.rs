@@ -228,7 +228,6 @@ type InputsSetFn = unsafe extern "C" fn(Context, u32, *mut Input) -> c_int;
 type RunFn = unsafe extern "C" fn(Context, *mut c_void) -> c_int;
 type OutputsGetFn = unsafe extern "C" fn(Context, u32, *mut Output, *mut c_void) -> c_int;
 type OutputsReleaseFn = unsafe extern "C" fn(Context, u32, *mut Output) -> c_int;
-type SetCoreMaskFn = unsafe extern "C" fn(Context, c_int) -> c_int;
 type CreateMemFn = unsafe extern "C" fn(Context, u32) -> *mut TensorMem;
 type CreateMemFromFdFn =
     unsafe extern "C" fn(Context, c_int, *mut c_void, u32, c_int) -> *mut TensorMem;
@@ -258,7 +257,6 @@ pub struct Library {
     pub(super) run: RunFn,
     pub(super) outputs_get: OutputsGetFn,
     pub(super) outputs_release: OutputsReleaseFn,
-    pub(super) set_core_mask: SetCoreMaskFn,
     /// Or the first of them the runtime lacks, named.
     pub(super) mem: std::result::Result<MemApi, String>,
 }
@@ -300,7 +298,6 @@ impl Library {
             run: symbol!("rknn_run"),
             outputs_get: symbol!("rknn_outputs_get"),
             outputs_release: symbol!("rknn_outputs_release"),
-            set_core_mask: symbol!("rknn_set_core_mask"),
             mem,
         })
     }

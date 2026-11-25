@@ -293,10 +293,10 @@ fn classes(layout: Layout, nc: usize) -> Result<NonZeroUsize> {
 /// a *runtime* tensor shape — whatever the backend reported alongside the
 /// buffer. onnxruntime's extents are consistent with the buffer it hands back,
 /// so a wrap is unreachable there; a backend whose SDK reports the two
-/// separately, as RKNN's does, has no such guarantee. Either way this
-/// is the one place the "trust the dims" pattern is not defended, and a wrapped
-/// `need` would pass the length check and let the decode loop walk off the
-/// slice.
+/// separately, as a board NPU runtime's can, has no such guarantee. Either
+/// way this is the one place the "trust the dims" pattern is not defended,
+/// and a wrapped `need` would pass the length check and let the decode loop
+/// walk off the slice.
 fn require_values(have: usize, rows: usize, row: usize, dims: &[i64]) -> Result<()> {
     let need = rows
         .checked_mul(row)

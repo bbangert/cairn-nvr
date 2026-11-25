@@ -239,9 +239,9 @@ defmodule Cairn.Native.HostTest do
       assert_receive {:init, _config}
 
       assert {:error, {:config, message}} =
-               Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Rockchip.Native)
+               Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.FixtureBoard.Native)
 
-      assert message =~ "this chain decodes through Cairn.Rockchip.Native"
+      assert message =~ "this chain decodes through Cairn.FixtureBoard.Native"
       refute_received {:open_decoder, _camera_id, _params}
       assert %{^id => {:config, ^message}} = Host.status(host).decoder_failures
 

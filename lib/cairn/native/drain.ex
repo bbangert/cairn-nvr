@@ -12,7 +12,7 @@ defmodule Cairn.Native.Drain do
   Started *first* in the application tree precisely so it terminates *last*:
   supervisors stop children in reverse start order, so every camera and the
   host have already died — and queued their drops — by the time this
-  `terminate/2` runs the bounded drains. The libraries are the release board's
+  `terminate/2` runs the bounded drains. The libraries are the node's board's
   (`libraries/1`) rather than the host's injectable seams: the drain is about
   the real libraries loaded in this VM, whatever a test stubbed above them.
   """

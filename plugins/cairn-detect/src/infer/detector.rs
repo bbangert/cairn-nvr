@@ -69,7 +69,7 @@ impl LatencyWindow {
     }
 
     /// Records one run; on the report boundary, prints and resets the window.
-    fn record(&mut self, elapsed: Duration, kind: BackendKind) {
+    fn record(&mut self, elapsed: Duration, backend: &str) {
         self.total_runs += 1;
         self.window.push(elapsed);
         if self.window.len() < Self::REPORT_EVERY {
@@ -78,7 +78,7 @@ impl LatencyWindow {
         self.window.sort_unstable();
         let (p50, p95) = (self.percentile(50), self.percentile(95));
         note!(
-            "infer latency: backend={kind} n={} p50={:.2}ms p95={:.2}ms (total {})",
+            "infer latency: backend={backend} n={} p50={:.2}ms p95={:.2}ms (total {})",
             self.window.len(),
             p50.as_secs_f64() * 1000.0,
             p95.as_secs_f64() * 1000.0,
@@ -118,26 +118,10 @@ impl Detector {
         qnn: QnnOptions,
         io_quant: Option<IoQuant>,
     ) -> Result<Self> {
-        let options = SessionOptions {
-            qnn,
-            io_quant,
-            ..SessionOptions::default()
-        };
+        let options = SessionOptions { qnn, io_quant };
         let backend: Box<dyn Backend> = match backend {
             BackendKind::Ort => Box::new(OrtBackend::open(model, &options)?),
             BackendKind::Qnn => Box::new(QnnBackend::open(model, &options)?),
-            // This crate carries no rknn backend; a board library's arrives
-            // through `with_backend`. The host refuses a non-`ort` profile at
-            // config load unless the profile and the group both acknowledge
-            // it as experimental, so this is for the name that got here
-            // anyway. Spelled out rather than a wildcard so that a fourth
-            // kind is a compile error here rather than silently joining this
-            // refusal.
-            kind @ BackendKind::Rknn => bail!(
-                "backend {kind} is provided by a board library this build does not carry. \
-                 Its expected artifact is {} (see --backend).",
-                kind.capabilities().artifact
-            ),
         };
         Self::with_backend(
             backend,
@@ -222,14 +206,10 @@ impl Detector {
 
     /// Startup description of the runtime that opened this model and what it
     /// accepts — rendered here, like [`Detector::layout_summary`], so
-    /// `Capabilities` stays inside `infer` and `cli.rs` prints rather than
-    /// interprets it.
+    /// `cli.rs` prints rather than interprets it.
     pub fn backend_summary(&self) -> String {
-        format!(
-            "{} ({})",
-            self.backend.kind(),
-            self.backend.kind().capabilities()
-        )
+        let descriptor = self.backend.descriptor();
+        format!("{} ({})", descriptor.name, descriptor.capabilities)
     }
 
     pub fn profile(&self) -> ModelProfile {
@@ -283,12 +263,12 @@ impl Detector {
         // frame's values into the session's input (plus, for a uint8-IO
         // artifact, the output dequant the graph's stripped DequantizeLinear
         // used to do), no decode — so the number compares across backends
-        // and across the float/u8 contracts. `kind` is read first: the
+        // and across the float/u8 contracts. `name` is read first: the
         // returned tensors keep `backend` mutably borrowed.
-        let kind = self.backend.kind();
+        let name = self.backend.descriptor().name;
         let started = Instant::now();
         let tensors = self.backend.run(input)?;
-        self.latency.record(started.elapsed(), kind);
+        self.latency.record(started.elapsed(), name);
         // Extract every role this profile reads, by the name settled at
         // startup, so a multi-tensor family never depends on output ordering.
         let raw: Outputs<Raw> = match &self.outputs {
@@ -384,7 +364,7 @@ fn check_io_quant(io: &ModelIo, quant: Option<&IoQuant>, model: &Path) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::super::backend::Tensors;
+    use super::super::backend::{Capabilities, Descriptor, Tensors};
     use super::super::encoding::TensorLayout;
     use super::*;
 
@@ -466,33 +446,6 @@ mod tests {
         assert!(err.to_string().contains("uint8 outputs"), "{err}");
     }
 
-    /// Without the board library that provides it, `rknn` is refused by name
-    /// and before any model access — proven here by a path that does not
-    /// exist — so an argv naming it fails on the backend, not on the file.
-    #[test]
-    fn a_board_backend_this_build_lacks_is_refused_before_any_model_access() {
-        // Not `unwrap_err`: `Detector` has no `Debug`, deliberately.
-        let err = match Detector::open(
-            Path::new("does/not/exist"),
-            BackendKind::Rknn,
-            None,
-            None,
-            &Labels::load(None).unwrap(),
-            false,
-            QnnOptions::default(),
-            None,
-        ) {
-            Ok(_) => panic!("backend rknn opened without its board library"),
-            Err(err) => err,
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("backend rknn is provided by a board library this build does not carry"),
-            "{msg}"
-        );
-        assert!(msg.contains(".rknn"), "{msg}");
-    }
-
     type Seen = std::sync::Arc<std::sync::Mutex<Vec<([i64; 4], TensorLayout)>>>;
 
     /// A backend opened outside this crate, over a 96x64 yolox-shaped model.
@@ -519,8 +472,16 @@ mod tests {
         fn open(_: &Path, _: &SessionOptions) -> Result<Self> {
             unreachable!("built directly")
         }
-        fn kind(&self) -> BackendKind {
-            BackendKind::Rknn
+        fn descriptor(&self) -> &'static Descriptor {
+            static FAKE: Descriptor = Descriptor {
+                name: "fake",
+                capabilities: Capabilities {
+                    supports_fused_nms: false,
+                    supports_dynamic_shapes: false,
+                    artifact: ".fake",
+                },
+            };
+            &FAKE
         }
         fn io(&self) -> &ModelIo {
             &self.io
@@ -562,7 +523,7 @@ mod tests {
             let labels = Labels::load(None).unwrap();
             let mut detector = match Detector::with_backend(
                 Box::new(backend),
-                Path::new("m.rknn"),
+                Path::new("m.fake"),
                 None,
                 None,
                 &labels,
@@ -608,7 +569,7 @@ mod tests {
             };
             Detector::with_backend(
                 Box::new(backend),
-                Path::new("m.rknn"),
+                Path::new("m.fake"),
                 None,
                 None,
                 &Labels::load(None).unwrap(),
@@ -639,7 +600,7 @@ mod tests {
             Err(err) => format!("{err:#}"),
         };
         assert!(
-            err.contains("m.rknn") && err.contains("takes pixel bytes") && err.contains("rfdetr"),
+            err.contains("m.fake") && err.contains("takes pixel bytes") && err.contains("rfdetr"),
             "{err}"
         );
     }
@@ -652,7 +613,7 @@ mod tests {
     fn latency_window_reports_and_resets_on_the_boundary() {
         let mut window = LatencyWindow::new();
         for run in 0..(LatencyWindow::REPORT_EVERY * 2 + 3) {
-            window.record(Duration::from_millis(run as u64), BackendKind::Ort);
+            window.record(Duration::from_millis(run as u64), "ort");
             let filled = (run + 1) % LatencyWindow::REPORT_EVERY;
             assert_eq!(window.window.len(), filled, "after run {run}");
         }
