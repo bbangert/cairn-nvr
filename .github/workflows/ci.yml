@@ -461,10 +461,11 @@ jobs:
     needs: release-toolchain
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # The board's own suite, built without the base; then
     # tools/ci/rockchip-board-test.sh: the board built alone, NIF included,
     # as a board directory against the prod release's cairn.rel, and booted
-    # on that release. In the image the Dockerfile builds the release and the
+    # on that release; then the board's own suite, built without the base,
+    # after the script so that its NIF tests find the library it left in
+    # priv/native. In the image the Dockerfile builds the release and the
     # board in, not on setup-beam: it is Debian 13, whose FFmpeg 7.1 the NIF
     # links (the runner's Ubuntu ships 6.1).
     container: ${{ needs.release-toolchain.outputs.image }}
@@ -522,12 +523,12 @@ jobs:
       - run: mix compile --warnings-as-errors
         working-directory: boards/cairn_rockchip
 
-      - run: mix test
-        working-directory: boards/cairn_rockchip
-
       - run: mix deps.get
 
       - run: tools/ci/rockchip-board-test.sh
+
+      - run: mix test
+        working-directory: boards/cairn_rockchip
 
   cairn-detect:
     name: Rust · Format · Clippy · Test · Release build

@@ -3,7 +3,7 @@ defmodule Cairn.Rockchip.NativeTest do
 
   alias Cairn.Rockchip.Native
 
-  # CI runs this suite without building the library, so the module has to
+  # The suite also runs without the library built, so the module has to
   # still be there to say why it did not load.
   test "the module is usable whether or not the library loaded" do
     assert is_boolean(Native.available?())

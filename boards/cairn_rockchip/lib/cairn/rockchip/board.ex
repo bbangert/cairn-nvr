@@ -1,6 +1,6 @@
 defmodule Cairn.Rockchip.Board do
   @moduledoc """
-  The board of a Rockchip release: the base's generic detect chain, with the
+  The Rockchip board: the base's generic detect chain, with the
   RKNN engine (`Cairn.Rockchip.Native`) behind its inference step for
   `backend: rknn`, and for `decoder: rkmpp` its decode step replaced by MPP
   decode and RGA scale (`Cairn.Rockchip.DecodeScale`) plus the

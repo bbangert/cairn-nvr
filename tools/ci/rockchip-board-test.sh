@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # rockchip-board-test.sh: builds boards/cairn_rockchip alone, in its own Mix
 # project, as a board directory checked against the prod release's cairn.rel,
-# and boots that release with it attached. The release is core's, built with
-# no board, as the Rockchip image's is.
+# and boots that release with it attached, then attaches it in a
+# `bin/cairn eval`. The release is core's, built with no board, as the
+# Rockchip image's is.
 #
 # x86 is enough for what is checked: the real board NIF builds and loads
 # here, since it opens librknnrt, MPP and librga only when an engine or a
@@ -24,7 +25,6 @@ rel=${REL:-}
 cargo=${CARGO:-cargo}
 mkdir -p "$work"
 work=$(cd "$work" && pwd)
-if [ -n "$rel" ]; then rel=$(cd "$rel" && pwd); fi
 log=$work/rockchip-board.log
 : >"$log"
 
@@ -38,7 +38,10 @@ fail() {
 # Step by step: `set -e` does not reach into a subshell tested with `||`.
 run() { "$@" >>"$log" 2>&1 || fail "$* (see $log)"; }
 
-if [ -z "$rel" ]; then
+if [ -n "$rel" ]; then
+  [ -f "$rel/releases/start_erl.data" ] || fail "REL=$rel is not a built release"
+  rel=$(cd "$rel" && pwd)
+else
   say "building the prod release with no board"
   (cd "$root" && env -u CAIRN_BOARD MIX_ENV=prod mix release --overwrite) >>"$log" 2>&1 ||
     fail "release build (see $log)"
@@ -129,5 +132,12 @@ expect "the booted drain holds the board's library" \
   'Cairn.Rockchip.Native in :sys.get_state(Cairn.Native.Drain).libraries' 'true'
 stop
 trap - EXIT
+
+# The path tools/board-pipeline/rk-cell.sh takes on the board.
+got=$(CAIRN_BOARD_DIR=$work/board cairn eval \
+  'IO.inspect({Cairn.Board.module(), Cairn.Rockchip.Native.load_error(), Cairn.Rockchip.Native.contract()})' 2>&1) ||
+  fail "eval: $got"
+[ "$got" = "{Cairn.Rockchip.Board, nil, $contract}" ] || fail "eval: got $got"
+say "PASS: bin/cairn eval attaches the board, NIF loaded: $got"
 
 say "all passed; log: $log"

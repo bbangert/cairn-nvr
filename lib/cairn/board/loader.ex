@@ -32,8 +32,10 @@ defmodule Cairn.Board.Loader do
   is loaded and every module's `on_load` runs, not only the board's. An eval
   VM with `CAIRN_BOARD_DIR` set does the same on its first
   `Cairn.Board.module/0`, so tools run board code too. Consulting the
-  manifest and every `.app` creates their atoms. The directory must not be
-  writable by the service's user. Nothing verifies a signature; the contract
+  manifest and every `.app` creates their atoms. Whoever can write the
+  directory runs code as the service, so outside the image keep it
+  unwritable by the service's user; in the image the service runs as root,
+  which can write the release itself as well. Nothing verifies a signature; the contract
   number is a compatibility check, not a security check.
   """
 

@@ -455,15 +455,6 @@ COPY --from=ort-libs /opt/ort /opt/ort
 # labels name: the loader refuses another contract and the board directory
 # task another ERTS.
 FROM runtime-base AS core
-ARG ELIXIR_VERSION
-ARG OTP_VERSION
-ARG CAIRN_CONTRACT
-ARG CAIRN_REVISION
-LABEL org.opencontainers.image.revision=$CAIRN_REVISION \
-  cairn.elixir.version=$ELIXIR_VERSION \
-  cairn.otp.version=$OTP_VERSION \
-  cairn.contract=$CAIRN_CONTRACT
-
 WORKDIR /app
 COPY --from=release-build /app/_build/prod/rel/cairn ./
 COPY --from=native-build /dist/cairn-detect /usr/local/bin/cairn-detect
@@ -476,6 +467,17 @@ COPY models models
 # that coincided with the data dir; here it must reach the /data mount or an
 # installed pack would land on ephemeral container filesystem.
 RUN ln -s /data /app/data
+
+# After the stage's last RUN: a RUN below an ARG re-runs when its value
+# changes, and the revision changes with every commit.
+ARG ELIXIR_VERSION
+ARG OTP_VERSION
+ARG CAIRN_CONTRACT
+ARG CAIRN_REVISION
+LABEL org.opencontainers.image.revision=$CAIRN_REVISION \
+  cairn.elixir.version=$ELIXIR_VERSION \
+  cairn.otp.version=$OTP_VERSION \
+  cairn.contract=$CAIRN_CONTRACT
 
 VOLUME ["/data", "/config"]
 EXPOSE 4000
