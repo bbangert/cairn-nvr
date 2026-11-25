@@ -19,7 +19,7 @@ name: Container
 #    package must be flipped to PUBLIC once after its first push (repo
 #    settings → packages). A generic build also builds the Dockerfile's
 #    `core` stage as cairn-nvr-base-aarch64, the image a board repository's
-#    image is `FROM`, and pushes it when it pushes the add-on image.
+#    image is `FROM`, and pushes it on a version tag only.
 #
 # Actions are pinned to commit SHAs: the publish job holds the registry
 # token, and that holds its steps to the standard of the Dockerfile's
@@ -167,7 +167,9 @@ jobs:
             ${{ steps.target.outputs.image }}:latest
       # The board-free release under the version a board pins as its core
       # ref. Its layers are the build above's, so this step builds nothing. No
-      # `latest`: a board names the core version it was built against.
+      # `latest`: a board names the core version it was built against. A
+      # dispatch never pushes it: a base under a version's name is that tag's
+      # commit and no other.
       - if: env.BOARD == 'generic'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -176,7 +178,7 @@ jobs:
           target: core
           build-args: |
             CAIRN_REVISION=${{ github.sha }}
-          push: ${{ env.PUSH == 'true' }}
+          push: ${{ env.EVENT == 'push' }}
           tags: ${{ steps.target.outputs.base }}:${{ steps.target.outputs.version }}
       - if: env.PUSH != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -191,7 +193,7 @@ jobs:
         run: |
           if [ "$PUSH" = true ]; then
             echo "Pushed \`$IMAGE:$VERSION\` and \`:latest\`." >> "$GITHUB_STEP_SUMMARY"
-            if [ "$BOARD" = generic ]; then
+            if [ "$EVENT" = push ]; then
               echo "Pushed \`$BASE:$VERSION\`." >> "$GITHUB_STEP_SUMMARY"
             fi
           else
