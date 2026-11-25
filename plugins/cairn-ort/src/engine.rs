@@ -321,6 +321,10 @@ pub fn cpu_baseline_ms(config: &InitConfig, passes: usize) -> Result<f64> {
         )));
     }
 
+    // The measurement is on `ort` whatever the name; a name this crate
+    // cannot open is still the caller's config, as `Engine::open` answers it.
+    core_backend(&config.backend)?;
+
     let labels =
         Labels::load(config.labels.as_deref()).map_err(|e| NativeError::ModelLoad(chain(&e)))?;
 
@@ -416,6 +420,24 @@ mod tests {
             let error = cpu_baseline_ms(&config, passes).unwrap_err();
             assert_eq!(error.reason(), "config", "{passes}");
         }
+    }
+
+    #[cfg(feature = "nif")]
+    #[test]
+    fn cpu_baseline_ms_refuses_an_unknown_backend_before_any_model_access() {
+        let config = InitConfig {
+            model: PathBuf::from("does/not/exist"),
+            backend: "tensorrt".into(),
+            model_profile: None,
+            input_size: None,
+            labels: None,
+            allow_label_mismatch: false,
+            embedder_model: None,
+            qnn: QnnOptions::default(),
+        };
+        let error = cpu_baseline_ms(&config, 5).unwrap_err();
+        assert_eq!(error.reason(), "config");
+        assert!(error.message().contains("tensorrt"), "{}", error.message());
     }
 
     mod board_backend {
