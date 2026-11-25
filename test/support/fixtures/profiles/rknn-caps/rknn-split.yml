@@ -1,6 +1,0 @@
-# yolov8's generations with the head cut before decode: proven, so no
-# acknowledgement.
-backend: rknn
-model:
-  rknn: test/support/fixtures/models/stub.rknn
-model_profile: yolov8split

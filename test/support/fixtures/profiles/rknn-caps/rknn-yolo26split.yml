@@ -1,5 +1,0 @@
-# yolo26 cut the same way: proven, where its whole head is not.
-backend: rknn
-model:
-  rknn: test/support/fixtures/models/stub.rknn
-model_profile: yolo26split
