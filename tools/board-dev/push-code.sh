@@ -7,8 +7,10 @@
 #
 # What rides: every app's ebin from the assembled release (deps included —
 # pushing "just cairn" would miss a dep bump silently), cairn's priv —
-# priv/profiles, priv/repo AND priv/static — and a board app's (its
-# profiles), plus runtime.exs, sys.config and the boot artifacts below.
+# priv/profiles, priv/repo AND priv/static — and a compiled-in board app's
+# (its profiles), plus runtime.exs, sys.config and the boot artifacts below.
+# The Rockchip image's board is a board directory instead, which this never
+# reaches: there a CAIRN_BOARD=rockchip push is refused as a new dep.
 # What cannot ride: NIFs/canary (arch-native), ERTS, apt packages,
 # Dockerfile-level anything.
 #

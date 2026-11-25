@@ -33,9 +33,10 @@ it. Details in `docs/architecture.md`.
   are drawn over the feed as LiveView renders them.
 - **Detection**: in the VM — `plugins/cairn-detect` (hardware decode,
   ONNX Runtime, optional QNN on Qualcomm NPUs) linked into the node's NIFs. A board
-  release adds its own elements: the Rockchip one (`CAIRN_BOARD=rockchip`,
-  `boards/cairn_rockchip`) decodes through MPP and detects on the RK3566
-  NPU through RKNN, experimental until it has soaked. New
+  adds its own elements: the Rockchip one (`boards/cairn_rockchip`, which the
+  `CAIRN_BOARD=rockchip` image attaches as a board directory) decodes through
+  MPP and detects on the RK3566 NPU through RKNN, experimental until it has
+  soaked. New
   models are a hardware-profile edit, not code. The retired external
   plugin protocol is archived at
   [`docs/archive/plugin-contract.md`](docs/archive/plugin-contract.md).

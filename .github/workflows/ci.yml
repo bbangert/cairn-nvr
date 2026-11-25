@@ -440,28 +440,79 @@ jobs:
       - run: mix test
         working-directory: libs/cairn_stage
 
-  rockchip-board:
-    name: Rockchip board library (mix test)
+  release-toolchain:
+    name: Release toolchain image
     runs-on: ubuntu-latest
-    # Builds and tests on its own, without the base and without its NIF.
+    # The hexpm image the Dockerfile builds the release in, named from its
+    # ARGs, so rockchip-board runs in it without a second copy of the
+    # versions.
+    outputs:
+      image: ${{ steps.image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: erlef/setup-beam@v1
-        id: beam
-        with:
-          version-file: mise.toml
-          version-type: strict
+      - id: image
+        run: |
+          arg() { sed -n "s/^ARG $1=//p" Dockerfile; }
+          echo "image=hexpm/elixir:$(arg ELIXIR_VERSION)-erlang-$(arg OTP_VERSION)-debian-$(arg DEBIAN_TAG)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache deps and build
+  rockchip-board:
+    name: Rockchip board (mix test, board directory booted)
+    needs: release-toolchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # tools/ci/rockchip-board-test.sh: the board built alone, NIF included,
+    # as a board directory against the prod release's cairn.rel, and booted
+    # on that release; then the board's own suite, built without the base,
+    # after the script so that its NIF tests find the library it left in
+    # priv/native. In the image the Dockerfile builds the release and the
+    # board in, not on setup-beam: it is Debian 13, whose FFmpeg 7.1 the NIF
+    # links (the runner's Ubuntu ships 6.1).
+    container: ${{ needs.release-toolchain.outputs.image }}
+    env:
+      # As in the cairn-detect job: the crate's cargo config points at a
+      # dev-container /opt/ffmpeg7.
+      FFMPEG_PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+      RUSTFLAGS: ""
+      CARGO_TERM_COLOR: always
+      LC_ALL: C.UTF-8
+
+    steps:
+      # git before checkout, which otherwise downloads a tarball; the rest as
+      # the release-build stage and the cairn-detect job need them.
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential git pkg-config libssl-dev clang libclang-dev \
+            libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
+            libavutil-dev libpostproc-dev libswresample-dev libswscale-dev \
+            curl ca-certificates
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust and Mix's package managers
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Cache deps, builds, cargo and the onnxruntime download
         uses: actions/cache@v6
         with:
           path: |
+            deps
+            _build
             boards/cairn_rockchip/deps
             boards/cairn_rockchip/_build
-          key: mix-rockchip-board-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('boards/cairn_rockchip/mix.lock') }}
+            boards/cairn_rockchip/native/cairn_rockchip/target
+            ~/.cargo/registry
+            ~/.cache/ort.pyke.io
+          key: rockchip-board-${{ needs.release-toolchain.outputs.image }}-${{ hashFiles('mix.lock', 'boards/cairn_rockchip/mix.lock', 'boards/cairn_rockchip/native/cairn_rockchip/Cargo.lock') }}
           restore-keys: |
-            mix-rockchip-board-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+            rockchip-board-${{ needs.release-toolchain.outputs.image }}-
 
       - run: mix deps.get
         working-directory: boards/cairn_rockchip
@@ -471,6 +522,10 @@ jobs:
 
       - run: mix compile --warnings-as-errors
         working-directory: boards/cairn_rockchip
+
+      - run: mix deps.get
+
+      - run: tools/ci/rockchip-board-test.sh
 
       - run: mix test
         working-directory: boards/cairn_rockchip

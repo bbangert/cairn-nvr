@@ -134,7 +134,7 @@ defmodule Cairn.Rockchip.BoardTest do
     test "rknn is unusable, with the reason, when the board NIF did not load" do
       System.delete_env("CAIRN_RKNN_LIBRARY")
 
-      # CI never builds the library, so this is the branch it reaches.
+      # The branch a checkout without the library built reaches.
       if Native.available?() do
         assert Board.preflight() == %{decoders: %{}, backends: %{}}
       else

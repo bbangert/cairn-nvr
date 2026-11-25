@@ -1,9 +1,12 @@
 name: Container
 
-# The add-on image (tier1-container plan). Three jobs:
+# The add-on image (tier1-container plan). Four jobs:
 #  - smoke: the amd64 build + boot assertions (tools/container/smoke-x86.sh)
 #    on every PR touching anything the image ships — the devcontainer has no
 #    docker, so CI is where the x86 smoke actually runs.
+#  - smoke-rockchip: the same script for the Rockchip image, whose arm64
+#    vendor layer x86 cannot build: the amd64 `core` stage booted with the
+#    Dockerfile's Rockchip board directory attached.
 #  - rockchip-libs: the Dockerfile stage of that name on the same PRs, so a
 #    pinned source that no longer fetches, cross-builds or exports the
 #    symbols the board NIF will bind fails a PR, not the next Rockchip image
@@ -72,6 +75,19 @@ jobs:
           name: smoke-log
           path: tools/container/smoke-x86.log
 
+  smoke-rockchip:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - run: tools/container/smoke-x86.sh rockchip
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-log-rockchip
+          path: tools/container/smoke-x86-rockchip.log
+
   rockchip-libs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -97,9 +113,9 @@ jobs:
       EVENT: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # qemu for the arm64 BEAM release and runtime stages; the Rust and
-      # rockchip-libs stages cross-compile on the build host (D-C3) and never
-      # emulate.
+      # qemu for the arm64 release-build, board-build and runtime stages; the
+      # Rust and rockchip-libs stages cross-compile on the build host (D-C3)
+      # and never emulate.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - if: env.PUSH == 'true'
@@ -138,7 +154,9 @@ jobs:
         with:
           context: .
           platforms: linux/arm64
-          build-args: CAIRN_BOARD=${{ env.BOARD }}
+          build-args: |
+            CAIRN_BOARD=${{ env.BOARD }}
+            CAIRN_REVISION=${{ github.sha }}
           push: ${{ env.PUSH == 'true' }}
           outputs: ${{ env.PUSH != 'true' && 'type=docker,dest=/tmp/cairn-image.tar' || '' }}
           tags: |

@@ -9,10 +9,14 @@
 #              the release downloads it at first start, pinned by sha256);
 #              the MPP and librga userspace that `decoder: rkmpp` and the
 #              probe binary's `--rk-probe` load is carried
+# Both are `FROM core`, the release built with no board. The Rockchip board
+# is not compiled into it: `board-build` builds boards/cairn_rockchip alone
+# as a board directory, which the image attaches at boot through
+# CAIRN_BOARD_DIR.
 # Rust artifacts and the Rockchip libraries cross-compile on the build host
-# (D-C3). What compiles under emulation is the release: BEAM code, which is
-# arch-neutral, and the Hex dependencies' own C NIFs. ERTS comes from the
-# arm64 hexpm image.
+# (D-C3). What compiles under emulation is the release and the board
+# directory: BEAM code, which is arch-neutral, and the Hex dependencies' own
+# C NIFs. ERTS comes from the arm64 hexpm image.
 #
 # The QAIRT libraries (generic arm64) ship under Qualcomm's AI Stack License,
 # which permits object-code redistribution incorporated in an application but
@@ -29,11 +33,14 @@ ARG DEBIAN_TAG=trixie-20260713
 # value names no stage, so BuildKit fails trying to pull vendor-<value> as an
 # image.
 ARG CAIRN_BOARD=generic
+# `core`'s labels. The contract is `Cairn.Stage.contract/0`'s, which
+# release-build checks it against; the revision is the workflow's commit.
+ARG CAIRN_CONTRACT=1
+ARG CAIRN_REVISION=
 
 # ---------------------------------------------------------------------------
 # Rust artifacts: the two NIFs and the cairn-detect canary, plus (arm64) the
-# fastrpc userspace and, for CAIRN_BOARD=rockchip, the board's NIF and probe
-# binary.
+# fastrpc userspace.
 # Runs on the build platform, links for the target.
 FROM --platform=$BUILDPLATFORM rust:1.97-trixie AS native-build
 ARG TARGETARCH
@@ -62,22 +69,15 @@ EOS
 
 WORKDIR /src
 COPY plugins plugins
-COPY boards boards
 COPY tools/container/build-rust-aarch64.sh tools/container/
 
-# Declared here, not at the top of the stage: an ARG keys the cache of every
-# RUN after it, and the toolchain layer above is the same for every board.
-ARG CAIRN_BOARD
 RUN <<'EOS'
 set -eux
-# Always present, so release-build's COPY of the board NIF has a source on
-# every board and arch.
-mkdir -p /dist/rockchip-nif
 if [ "$TARGETARCH" = "arm64" ]; then
-  CAIRN_BOARD="$CAIRN_BOARD" tools/container/build-rust-aarch64.sh /dist
+  tools/container/build-rust-aarch64.sh /dist
 else
   # Native build for the smoke image. Same ort-load-dynamic linkage as the
-  # board build so both arches dlopen the pinned base ORT; the per-crate
+  # arm64 build so both arches dlopen the pinned base ORT; the per-crate
   # cargo configs point at a dev-container /opt/ffmpeg7 that doesn't exist
   # here, so steer rusty_ffmpeg at the distro tree and drop the rpath.
   export FFMPEG_PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
@@ -117,6 +117,31 @@ make install DESTDIR=/tmp/fastrpc-out
 mkdir -p /dist/fastrpc
 cp -a /tmp/fastrpc-out/usr/lib/libcdsprpc.so* /dist/fastrpc/
 cp LICENSE.txt /dist/fastrpc/LICENSE.fastrpc
+EOS
+
+# ---------------------------------------------------------------------------
+# The Rockchip board's NIF and probe binary, on native-build's toolchain. A
+# stage of its own so that a board edit leaves the core image's layers
+# alone. On arm64 the script's core builds find native-build's targets
+# fresh; the board crate compiles the core crates it links again, into its
+# own target directory.
+FROM native-build AS board-native
+ARG TARGETARCH
+COPY boards/cairn_rockchip/native boards/cairn_rockchip/native
+RUN <<'EOS'
+set -eux
+if [ "$TARGETARCH" = "arm64" ]; then
+  CAIRN_BOARD=rockchip tools/container/build-rust-aarch64.sh /dist
+else
+  # For the smoke's x86 board directory, built as native-build builds amd64.
+  export FFMPEG_PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
+  export RUSTFLAGS=""
+  (cd boards/cairn_rockchip/native/cairn_rockchip && cargo build --release --features ort-load-dynamic)
+  out=boards/cairn_rockchip/native/cairn_rockchip/target/release
+  mkdir -p /dist/rockchip /dist/rockchip-nif
+  cp "$out/cairn-rockchip-probe" /dist/rockchip/
+  cp "$out/libcairn_rockchip.so" /dist/rockchip-nif/
+fi
 EOS
 
 # ---------------------------------------------------------------------------
@@ -374,30 +399,13 @@ ENV MIX_ENV=prod
 
 RUN mix local.hex --force && mix local.rebar --force
 
-# mix.exs and config/config.exs both read it: the board picks the board
-# library dependency and `config/boards/<board>.exs`.
-ARG CAIRN_BOARD
-ENV CAIRN_BOARD=${CAIRN_BOARD}
-
+# Path dependencies (`libs/`) resolve at deps.get, so they come in with
+# mix.exs. No `boards/`: this release carries no board, and CAIRN_BOARD is
+# not declared in this stage, so mix.exs and config/config.exs read generic.
 COPY mix.exs mix.lock ./
-# Path dependencies (`libs/`, `boards/`) resolve at deps.get, so they come in
-# with mix.exs; a generic build carries the board library and uses none. Only
-# the board library's mix.exs here, and its lib/, priv/native and
-# priv/profiles before deps.compile — never boards/ whole, whose Rust crate
-# under native/ native-build already built, and whose every edit would
-# otherwise invalidate the dependency layers.
 COPY libs libs
-COPY boards/cairn_rockchip/mix.exs boards/cairn_rockchip/
 RUN mix deps.get --only prod
 COPY config config
-COPY boards/cairn_rockchip/lib boards/cairn_rockchip/lib
-# Before the board library compiles: mix links a dependency's priv/ into the
-# build only if it exists then, and `Cairn.Rockchip.Native` loads from
-# `:code.priv_dir(:cairn_rockchip)`. Empty for a generic build.
-COPY --from=native-build /dist/rockchip-nif/ boards/cairn_rockchip/priv/native/
-# The board's profiles (`Cairn.Rockchip.Board.profiles_dir/0`), present for
-# a generic build too, which never reads them.
-COPY boards/cairn_rockchip/priv/profiles boards/cairn_rockchip/priv/profiles/
 RUN mix deps.compile
 COPY priv priv
 COPY lib lib
@@ -408,16 +416,13 @@ RUN mix compile
 RUN mix assets.setup && mix assets.deploy
 COPY --from=native-build /dist/libcairn_native.so /dist/libcairn_ort.so priv/native/
 RUN mix release
-# Where `Cairn.Rockchip.Native` loads it from: a NIF missing here would show
-# only on the board, as rknn refused at preflight. Likewise the profile, whose
-# absence shows only as an unknown-profile config error.
-RUN if [ "$CAIRN_BOARD" = rockchip ]; then \
-    test -f _build/prod/rel/cairn/lib/cairn_rockchip-*/priv/native/libcairn_rockchip.so \
-      && test -f _build/prod/rel/cairn/lib/cairn_rockchip-*/priv/profiles/rk3566-tier1.yml; \
-  fi
+# The label a board build reads must be the number the release checks
+# boards against.
+ARG CAIRN_CONTRACT
+RUN grep -qxF "  def contract, do: $CAIRN_CONTRACT" libs/cairn_stage/lib/cairn/stage.ex
 
 # ---------------------------------------------------------------------------
-# What every board's runtime shares; the vendor-* stages below add the board.
+# What every image's runtime shares; `core` adds the release.
 FROM debian:${DEBIAN_TAG}-slim AS runtime-base
 
 # Distro FFmpeg 7.1 — the same major.minor the NIFs' rsmpeg feature binds and
@@ -444,7 +449,46 @@ ENV ORT_DYLIB_PATH=/opt/ort/libonnxruntime.so.1
 COPY --from=ort-libs /opt/ort /opt/ort
 
 # ---------------------------------------------------------------------------
-FROM runtime-base AS vendor-generic
+# The base every board image is `FROM`: the release with no board. A board
+# image adds its vendor userspace and its board directory and sets
+# CAIRN_BOARD_DIR. A board built elsewhere must be built on the toolchain the
+# labels name: the loader refuses another contract and the board directory
+# task another ERTS.
+FROM runtime-base AS core
+WORKDIR /app
+COPY --from=release-build /app/_build/prod/rel/cairn ./
+COPY --from=native-build /dist/cairn-detect /usr/local/bin/cairn-detect
+# The Apache ladder rungs (D-C2: yolo26/AGPL never ships here). Profile model
+# paths resolve against the node's working directory, so models/ lives in
+# /app. The pack rungs stay skip-with-warning until a cairn-models pack is
+# installed under /data.
+COPY models models
+# Pack rungs name `data/models/…`, resolved against this workdir — host-side
+# that coincided with the data dir; here it must reach the /data mount or an
+# installed pack would land on ephemeral container filesystem.
+RUN ln -s /data /app/data
+
+# After the stage's last RUN: a RUN below an ARG re-runs when its value
+# changes, and the revision changes with every commit.
+ARG ELIXIR_VERSION
+ARG OTP_VERSION
+ARG CAIRN_CONTRACT
+ARG CAIRN_REVISION
+LABEL org.opencontainers.image.revision=$CAIRN_REVISION \
+  cairn.elixir.version=$ELIXIR_VERSION \
+  cairn.otp.version=$OTP_VERSION \
+  cairn.contract=$CAIRN_CONTRACT
+
+VOLUME ["/data", "/config"]
+EXPOSE 4000
+
+# No USER: on the generic board the QNN-touching process must run as root to
+# pass the fastrpc nodes' root:root 0600 DAC — the host never chmods them (no
+# udev on Nerves), and vagus add-on containers run as root by design.
+CMD ["bin/cairn", "start"]
+
+# ---------------------------------------------------------------------------
+FROM core AS vendor-generic
 
 # Node-level QNN facts (runtime.exs → Cairn.Native.Config): the EP plugin
 # location in THIS image and the QCS6490 identity (soc 35, HTP v68 — platform
@@ -461,9 +505,45 @@ RUN echo /opt/ort > /etc/ld.so.conf.d/cairn.conf \
   && ldconfig
 
 # ---------------------------------------------------------------------------
+# The Rockchip board directory: boards/cairn_rockchip compiled alone, in its
+# own Mix project, on release-build's image (the task refuses an ERTS other
+# than the release's), then written by `mix cairn_stage.board` against the
+# core release's .rel, which also refuses a release that ships the board.
+FROM hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-debian-${DEBIAN_TAG} AS board-build
+
+WORKDIR /src/boards/cairn_rockchip
+ENV MIX_ENV=prod
+RUN mix local.hex --force && mix local.rebar --force
+
+# Where the project's `../../libs/cairn_stage` path dependency points.
+COPY libs/cairn_stage /src/libs/cairn_stage
+COPY boards/cairn_rockchip/mix.exs boards/cairn_rockchip/mix.lock ./
+RUN mix deps.get --only prod && mix deps.compile
+COPY boards/cairn_rockchip/lib lib
+COPY boards/cairn_rockchip/priv/profiles priv/profiles
+# Into the `priv` the task ships and `Cairn.Rockchip.Native` loads from.
+COPY --from=board-native /dist/rockchip-nif/ priv/native/
+RUN mix compile --warnings-as-errors
+COPY --from=release-build /app/_build/prod/rel/cairn/releases /core/releases
+# A NIF or profile missing from the directory would show only on the board,
+# as rknn refused at preflight or an unknown-profile config error.
+RUN <<'EOS'
+set -eux
+vsn=$(cut -d' ' -f2 /core/releases/start_erl.data)
+mix cairn_stage.board --core-rel "/core/releases/$vsn/cairn.rel" --out /board
+grep -qxF "{board, 'Elixir.Cairn.Rockchip.Board'}." /board/board.manifest
+test -f /board/lib/cairn_rockchip-*/priv/native/libcairn_rockchip.so
+test -f /board/lib/cairn_rockchip-*/priv/profiles/rk3566-tier1.yml
+EOS
+
+# The directory alone, which `--output type=local` exports for the x86 smoke.
+FROM scratch AS board-dir
+COPY --from=board-build /board /
+
+# ---------------------------------------------------------------------------
 # No CAIRN_QNN_* and no /opt/qnn: this board has no HTP, and runtime.exs
 # merges no node qnn facts when the variables are unset.
-FROM runtime-base AS vendor-rockchip
+FROM core AS vendor-rockchip
 ARG TARGETARCH
 
 RUN [ "$TARGETARCH" = "arm64" ] \
@@ -485,14 +565,15 @@ done
 EOS
 
 COPY --from=rockchip-libs /dist/models/ /app/models/
-COPY --from=native-build /dist/rockchip/ /usr/local/bin/
-# The host runs the probe as rknn's canary and CPU baseline and loads the NIF
-# at boot, both only on the board, so an unresolved library is caught here on
-# the target platform instead. The NIF is checked from native-build's copy,
-# the file the release-build stage puts in the release.
-RUN --mount=type=bind,from=native-build,source=/dist/rockchip-nif,target=/tmp/rockchip-nif <<'EOS'
+COPY --from=board-native /dist/rockchip/ /usr/local/bin/
+COPY --from=board-dir / /opt/cairn/board
+ENV CAIRN_BOARD_DIR=/opt/cairn/board
+# The host runs the probe as rknn's canary and CPU baseline and the loader
+# loads the NIF at boot, both only on the board, so an unresolved library is
+# caught here on the target platform instead.
+RUN <<'EOS'
 set -eux
-for bin in /usr/local/bin/cairn-rockchip-probe /tmp/rockchip-nif/libcairn_rockchip.so; do
+for bin in /usr/local/bin/cairn-rockchip-probe /opt/cairn/board/lib/cairn_rockchip-*/priv/native/libcairn_rockchip.so; do
   ldd "$bin"
   if ldd "$bin" | grep -q 'not found'; then exit 1; fi
 done
@@ -500,24 +581,3 @@ EOS
 
 # ---------------------------------------------------------------------------
 FROM vendor-${CAIRN_BOARD} AS runtime
-
-WORKDIR /app
-COPY --from=release-build /app/_build/prod/rel/cairn ./
-COPY --from=native-build /dist/cairn-detect /usr/local/bin/cairn-detect
-# The Apache ladder rungs (D-C2: yolo26/AGPL never ships here). Profile model
-# paths resolve against the node's working directory, so models/ lives in
-# /app. The pack rungs stay skip-with-warning until a cairn-models pack is
-# installed under /data.
-COPY models models
-# Pack rungs name `data/models/…`, resolved against this workdir — host-side
-# that coincided with the data dir; here it must reach the /data mount or an
-# installed pack would land on ephemeral container filesystem.
-RUN ln -s /data /app/data
-
-VOLUME ["/data", "/config"]
-EXPOSE 4000
-
-# No USER: on the generic board the QNN-touching process must run as root to
-# pass the fastrpc nodes' root:root 0600 DAC — the host never chmods them (no
-# udev on Nerves), and vagus add-on containers run as root by design.
-CMD ["bin/cairn", "start"]
