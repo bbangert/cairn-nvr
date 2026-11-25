@@ -1,14 +1,13 @@
-# NPU backend workflows: QNN (QCS6490) and RKNN (rk3566/rk3576)
+# NPU backend workflows: QNN (QCS6490)
 
-The research record behind the boards' backend-capability tables
-(`backends/0` in `Cairn.Board.Generic` and `Cairn.Rockchip.Board`) and the
-Rust descriptors they mirror (`ORT` and `QNN` in the stage library, `RKNN` in
-the Rockchip board's crate).
+The research record behind the generic board's backend-capability table
+(`backends/0` in `Cairn.Board.Generic`) and the Rust descriptors it mirrors
+(`ORT` and `QNN` in the stage library). A board in its own repository keeps
+its own record: RKNN, MPP and RGA on rk3566/rk3576 are cairn-rockchip's
+[docs/npu-rknn.md](https://github.com/bbangert/cairn-rockchip/blob/main/docs/npu-rknn.md).
 
 It began as second-cycle research (2026-08-05, 11 sources), and what a board
-has since measured replaced the research in place and says so. The RKNN
-section is measured on a Home Assistant Green (RK3566), 2026-11-15 to
-2026-11-18; the raw logs behind it are kept outside this repository. Figures
+has since measured replaced the research in place and says so. Figures
 still marked as claims are third parties' and are in no profile.
 
 ## The other axis: kernel/stack flavor, and which decoder it leaves reachable
@@ -22,27 +21,13 @@ not transfer between them (D-M6, confirmed by spike 0.4).
 |---|---|---|---|---|
 | QCS6490 | mainline | Venus, V4L2 stateful M2M | `h264_v4l2m2m` | `v4l2` — **measured**, spike 0.3 |
 | RK3576 | mainline 7.0+ | `rkvdec` VDPU383, V4L2 **stateless** (request API) | not by `h264_v4l2m2m`; unsettled | none: no profile, not measured |
-| RK3566 | vendor BSP 6.1 | MPP, `/dev/mpp_service` | only in the `ffmpeg-rockchip` fork (`h264_rkmpp`) | `rkmpp`, the Rockchip board's own MPP binding, not ffmpeg |
+| RK3566 | vendor BSP 6.1 | MPP, `/dev/mpp_service` | only in the `ffmpeg-rockchip` fork (`h264_rkmpp`) | `rkmpp`, cairn-rockchip's own MPP binding, not ffmpeg |
 
-The NPU half forks less than the decode half does: RK3566 and RK3576 share one
-runtime (`librknnrt`), one converter (rknn-toolkit2, only `--target` differs)
-and one artifact format — so a second Rockchip SoC should fork on decode
-driver, kernel flavor and model budget, and reuse the RKNN backend. That is
-an expectation: the backend has run on RK3566 only. (RK3566's 1 TOPS NPU is
-RKNPU2-family, *not* the older rknpu1/`librknn_api` line — an earlier plan
-label said otherwise.)
-
-Two consequences worth carrying. A board profile that names a decoder gets it
-or refuses (see `docs/profile-authoring.md`), and both shipped board profiles
-name theirs: `v4l2` on QCS6490, `rkmpp` on RK3566, which that board's `auto`
-never picks. And on RK3566 the surrounding work was plumbing rather than
-silicon.
-The add-on's six device nodes all open (`/dev/mpp_service`, `/dev/rga`,
-`/dev/dri/card1` and `renderD129` — the NPU is a DRM device on this kernel,
-not `/dev/rknpu` — and two dma-heaps), but MPP also needs the device tree:
-with `/sys/firmware` masked, as a container has it by default, MPP matches no
-SoC and every decoder open fails, while RKNN opens in the same container and
-hides the cause. The add-on sets `devicetree: true` for it.
+A board profile that names a decoder gets it or refuses (see
+`docs/profile-authoring.md`); the QCS6490 ladder names `v4l2`. What the
+Rockchip rows cost beyond the decoder — the shared RKNN runtime, the device
+nodes, MPP's need for the device tree — is in cairn-rockchip's
+[docs/npu-rknn.md](https://github.com/bbangert/cairn-rockchip/blob/main/docs/npu-rknn.md).
 
 ## QNN EP on QCS6490 (via ort)
 
@@ -69,82 +54,26 @@ hides the cause. The add-on sets `devicetree: true` for it.
   until measured** — either way the QCS6490 comfortably exceeds the 15-30
   fps profile band.
 
-## RKNN on rk3566 / rk3576
-
-- Compilation is host-side Python only: rknn-toolkit2 (x86) converts
-  ONNX→.rknn, INT8 (calibration dataset required) or FP16; INT4 on rk3576
-  only. No dynamic shapes. YOLOv5-v11 officially covered by the model zoo (v8/v11
-  as exports with the head cut before its box decode — the nine-tensor
-  layout `tools/rknn-export`'s split export emits). **Trialed with
-  rknn-toolkit2 and librknnrt 2.3.2:** in INT8 on the RK3566, yolox_s,
-  yolox_tiny and both split heads (`yolov8split`, `yolo26split`) run and
-  detect. In INT8 in the toolkit's simulator, the stock Ultralytics whole
-  heads and the end-to-end head detect nothing (one output scale zeroes the
-  scores) and rfdetr's scores are unusable. In FP16 on the board, the
-  end-to-end head's boxes are wrong and rfdetr crashes the runtime (no
-  GridSample op); Cairn's backend opens INT8 artifacts only —
-  `tools/rknn-export/README.md`.
-- Runtime from Rust: the board crate opens librknnrt itself with `dlopen`
-  (`rknn/sys.rs`, written against the 2.3.2 API); rknpu2-rs is not used. No
-  async and no batching — one inference at a time per context. Contexts of
-  one model do overlap (measured, below); Cairn's engine holds one. No
-  perf-mode API equivalent to QNN's, and none was needed: every budget was
-  taken under the governors as found (`schedutil`, `rknpu_ondemand`).
-  `rknn_set_core_mask` is not bound: nothing would set it.
-- Frames in and out are copies. Input goes through `rknn_inputs_set`.
-  Importing the scaler's dma-buf instead (`rknn_set_io_mem`) gave
-  bit-identical outputs over 200 frames and needed no sync, but saved about
-  1 ms a sample, some 2 %, so the shipped chain does not use it. Output comes
-  back as floats from `rknn_outputs_get`: a native output buffer read back at
-  cosine 0.05 under every layout tried (`tools/rknn-export/README.md`).
-- Per-board reality:
-  - rk3566 (~1 TOPS): on the HA Green, in the pipeline with one context,
-    INT8 yolox_tiny@416 holds nine cameras at 2 fps (16.57 passes/s carried,
-    46.8 ms a pass) and yolox_s@640 four (7.36, 120.0 ms) —
-    `rk3566-tier1`'s budgets are those camera counts at the loader's
-    1.875/s floor rate, 16.875 and 7.5. A third to just over half
-    of each pass is CPU time in the calling thread; one context leaves the
-    NPU 40-51 % busy at saturation, and a second context of the same model
-    adds 57 % (tiny@416) or 34 % (s@640):
-    `docs/evidence/rk3566-capacity-20261118.md`.
-  - rk3576 (6 TOPS, INT4-capable): not measured. No profile ships for it.
-- **Preprocessing: no Rust crate for RGA** (Rockchip's 2D accelerator for
-  resize/color-convert, librga C API, dma_fd zero-copy), so the board crate
-  binds librga by hand (`rga.rs`); `rkmpp` scales there. On the Green
-  (librga 1.10.5, RGA2) a 1080p picture scales to 416² or 640² in 4.4-4.9 ms. librga
-  converts with BT.601 and takes full or limited range from the destination
-  buffer's format, not from the stream, so the binding picks it per picture
-  from `mpp_frame_get_color_range`; the first build did not, and expanded
-  full-range video as if it were limited.
-
 ## Known-broken combinations → profile validation rules
 
 1. QNN backend + model export containing a fused NMS op → reject at
    profile validation (require NMS-free head or host-side-NMS decode).
-2. RKNN backend + a family whose conversion was not measured to detect
-   (stock whole heads, the end-to-end head, rfdetr) → reject unless the
-   profile declares `experimental: true`, and warn with the reason when it
-   does.
-3. RKNN backend + an artifact whose input is not NHWC INT8 (an FP16 build)
-   → refused by the backend when it opens the model. Config load cannot see
-   inside the file.
 
-That RKNN runs one inference at a time per context is not a rule: no profile
-field can ask for async or batching, so it is a sizing fact
-(`docs/profile-authoring.md`).
+A board's own backends bring their own rules; cairn-rockchip's RKNN ones are
+in its [docs/npu-rknn.md](https://github.com/bbangert/cairn-rockchip/blob/main/docs/npu-rknn.md#known-broken-combinations--profile-validation-rules).
 
 ## Impact on the backend-trait seam
 
-The `Detector::open`/`detect` seam survived both. QNN is an ort EP (same
-crate, new registration path + EP options on the session builder). RKNN is a
-second backend behind the seam, in `boards/cairn_rockchip`'s crate. What the
-research asked of the seam, as built:
+The `Detector::open`/`detect` seam survived both QNN and a board's own
+backend. QNN is an ort EP (same crate, new registration path + EP options on
+the session builder). A board's backend is a second backend behind the seam,
+registered from the board's crate (cairn-rockchip's RKNN is one; see
+`docs/architecture.md` § Adding a board). What the research asked of the
+seam, as built:
 
-- **Per-backend session options.** Neither backend's are profile keys. QNN's
+- **Per-backend session options.** None are profile keys. QNN's
   (`soc_model`, `htp_arch`, performance mode, VTCM) are facts about the node,
-  read from its environment (`config/runtime.exs`). RKNN takes none through
-  the seam: its one setting, the runtime's path, is a NIF argument or
-  `CAIRN_RKNN_LIBRARY`.
+  read from its environment (`config/runtime.exs`).
 - **A capability report profile validation consumes.**
   Each backend's `Descriptor`, mirrored by each board's `backends/0`: the
   artifact (its extension in Rust, the `model:` key in Elixir), fused NMS,
@@ -152,7 +81,7 @@ research asked of the seam, as built:
   FP32 twin, whether the backend is experimental, and its conversion
   verdicts.
 - **The artifact format.** A profile's `model:` is keyed per backend
-  (`onnx:`, `qnn:`, `rknn:`).
+  (`onnx:`, `qnn:`, and a board's own, such as cairn-rockchip's `rknn:`).
 
 ## QNN wiring as landed (phase 2, 2026-08-07)
 
@@ -194,8 +123,8 @@ criterion live there and in
   emits every 100 runs. The in-VM host runs the same check unattended:
   `Cairn.Native.Host` measures the CPU pass once per engine load, in a
   subprocess (`--cpu-baseline` on the same model, or on the profile's FP32
-  ONNX twin where the CPU cannot run the artifact — `rknn`), and
-  `Cairn.Native.Health` reads the live pass latency against it. A backend
+  ONNX twin where the CPU cannot run the artifact — cairn-rockchip's
+  `rknn`), and `Cairn.Native.Health` reads the live pass latency against it. A backend
   it cannot measure is left unjudged rather than guessed at. Both sides of
   that ratio rise with load: the latency `Health` reads includes the wait
   for the shared model lock, and a baseline taken while streams are starting
@@ -260,11 +189,5 @@ about *scores*, which is exactly where both defect classes live.
 
 - https://onnxruntime.ai/docs/execution-providers/QNN-ExecutionProvider.html
 - https://github.com/onnxruntime/onnxruntime-qnn
-- https://github.com/airockchip/rknn_model_zoo
-- https://github.com/boundarybitlabs/rknpu2-rs
 - https://docs.ultralytics.com/integrations/qnn
-- https://docs.ultralytics.com/integrations/rockchip-rknn
 - https://mysupport.qualcomm.com/supportforums/s/question/0D5dK000007AWh8SAG/ (QCS6490 yolov5 QNN benchmark)
-- https://github.com/airockchip/librga
-- https://bliiot.com/info-detail/rk3576-deep-dive-6-tops-npu-meets-unbeatable-cost-performance-in-aiot
-- Frigate discussions (rk3566 real-world inference times)

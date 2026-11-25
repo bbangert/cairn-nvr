@@ -716,8 +716,8 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  # The two rules `docs/npu-backends.md` §"Known-broken combinations"
-  # turns into validation. Both need a backend *and* a family to read: a
+  # The two rules `docs/profile-authoring.md` §"The capability table, and
+  # what it refuses" lists. Both need a backend *and* a family to read: a
   # profile that names no `model_profile:` leaves the family to the engine's
   # own sniffing, and there is nothing here to check it against — which is
   # itself a reason to name the family on a non-ort backend (the authoring

@@ -32,11 +32,11 @@ it. Details in `docs/architecture.md`.
   toggle — and to HLS where MediaSource is missing. Live detection boxes
   are drawn over the feed as LiveView renders them.
 - **Detection**: in the VM — `plugins/cairn-detect` (hardware decode,
-  ONNX Runtime, optional QNN on Qualcomm NPUs) linked into the node's NIFs. A board
-  adds its own elements: the Rockchip one (`boards/cairn_rockchip`, which the
-  Rockchip image attaches as a board directory) decodes through
-  MPP and detects on the RK3566 NPU through RKNN, experimental until it has
-  soaked. New
+  ONNX Runtime, optional QNN on Qualcomm NPUs) linked into the node's NIFs. A
+  board built in its own repository and attached at boot adds its own
+  elements ([`docs/boards.md`](docs/boards.md)):
+  [cairn-rockchip](https://github.com/bbangert/cairn-rockchip) decodes through
+  MPP and detects on the RK3566 NPU through RKNN. New
   models are a hardware-profile edit, not code. The retired external
   plugin protocol is archived at
   [`docs/archive/plugin-contract.md`](docs/archive/plugin-contract.md).
@@ -48,7 +48,7 @@ it. Details in `docs/architecture.md`.
   per rung) and the tracker stages that go with it. A plugin group names
   its profile and config load expands it into the engine's model config and
   the host's tracking policy, so the two halves cannot disagree. Shipped
-  ones live in `priv/profiles/` and a board's own directory; writing one
+  ones live in `priv/profiles/` and in each board's own; writing one
   needs no code change when the release already has the decoder and backend
   it names — see
   [`docs/profile-authoring.md`](docs/profile-authoring.md).
