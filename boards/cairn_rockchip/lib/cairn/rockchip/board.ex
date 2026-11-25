@@ -89,6 +89,8 @@ defmodule Cairn.Rockchip.Board do
   # No `qnn`: this board has no HTP, so a profile naming it is refused with
   # this board's name. Only librknnrt runs an `.rknn`, so the CPU baseline
   # needs `rknn`'s twin. `rknn` stays experimental until it has soaked.
+  # `rknn`'s fused-NMS and dynamic-shape claims, with their evidence, are the
+  # `RKNN` descriptor in `native/cairn_rockchip/src/rknn.rs`.
   @impl true
   def backends do
     %{

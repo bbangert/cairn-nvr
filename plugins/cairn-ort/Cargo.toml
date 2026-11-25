@@ -22,9 +22,6 @@ crate-type = ["cdylib", "rlib"]
 cairn-detect = { path = "../cairn-detect" }
 rustler = { version = "0.38", features = ["derive"] }
 anyhow = "1.0"
-# For `ValueEnum::from_str` on `BackendKind`: the config the host sends names
-# the same values the operator's `--backend` flag does, parsed by the same code.
-clap = { version = "4.5", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 serde_json = "1.0"

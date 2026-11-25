@@ -206,6 +206,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_backend_no_library_runs_is_config_naming_the_field() {
+        let error = refusal(raw_config("tensorrt"), None);
+        assert_eq!(error.reason(), "config");
+        assert!(
+            error
+                .message()
+                .contains(r#"backend: this library's engine runs rknn, not "tensorrt""#),
+            "{error:?}"
+        );
+    }
+
     /// The only test here that touches the environment, and `rknn`'s own tests
     /// never read it (they load stubs through `RknnBackend::with_library`).
     /// The path `init` is handed wins over the process's variable, which in the

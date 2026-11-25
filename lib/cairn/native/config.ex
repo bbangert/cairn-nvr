@@ -248,9 +248,11 @@ defmodule Cairn.Native.Config do
   defp coerce_field({:optional, _type}, nil), do: {:ok, nil}
   defp coerce_field({:optional, type}, value), do: coerce_field(type, value)
 
-  # The crate parses these with the same clap value parsers the flags use, so an atom
-  # or number spelling (`backend: :qnn`, `input_size: 384`) is the same value.
-  # Nothing else is: a list or map would become a string nobody wrote.
+  # The crate reads these strings as the matching flags do (`backend` by exact
+  # name through `infer::select`, `input_size` through `InputSize::parse`), so an
+  # atom or number spelling (`backend: :qnn`, `input_size: 384`) is the same value
+  # as the string it spells. Nothing else is: a list or map would become a string
+  # nobody wrote.
   defp coerce_field(:string, value) when is_binary(value), do: {:ok, value}
 
   # Not `Option<String>` on the crate's side, so `nil` is a decode error there and

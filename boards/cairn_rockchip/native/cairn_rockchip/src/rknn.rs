@@ -35,10 +35,9 @@ use std::path::Path;
 use std::ptr::{self, NonNull};
 
 use anyhow::{bail, Context as _, Result};
-use cairn_detect::cli::Provider;
 use cairn_detect::infer::{
-    Backend, BackendKind, Declared, InputElement, InputSize, InputTensor, ModelIo, Raw,
-    SessionOptions, TensorLayout, TensorValues, Tensors,
+    Backend, Capabilities, Declared, Descriptor, InputElement, InputSize, InputTensor, ModelIo,
+    Provider, Raw, SessionOptions, TensorLayout, TensorValues, Tensors,
 };
 
 /// The runtime the loader's search path finds when nothing names one: no
@@ -80,10 +79,27 @@ pub(crate) fn runtime() -> OsString {
         .unwrap_or_else(|| OsString::from(DEFAULT_LIBRARY))
 }
 
+/// This backend as `Cairn.Rockchip.Board.backends/0` mirrors it.
+///
+/// Dynamic shapes: rknn-toolkit2 compiles to a fixed input geometry, so there
+/// is nothing to leave dynamic. Fused NMS is the conservative reading:
+/// `docs/npu-backends.md` establishes the ban for QNN only, and no source it
+/// cites puts an NMS op on the RKNN NPU either. Refusing an export we may not
+/// be able to run costs an operator a profile edit; accepting one that
+/// silently does not run costs a deployment.
+static RKNN: Descriptor = Descriptor {
+    name: "rknn",
+    capabilities: Capabilities {
+        supports_fused_nms: false,
+        supports_dynamic_shapes: false,
+        artifact: ".rknn",
+    },
+};
+
 /// `--backend rknn` for [`cairn_detect::cli::run`].
 pub fn provider() -> Provider {
     Provider {
-        kind: BackendKind::Rknn,
+        descriptor: &RKNN,
         open: |model, options| Ok(Box::new(RknnBackend::open(model, options)?)),
     }
 }
@@ -209,12 +225,12 @@ pub enum MemSync {
 }
 
 impl Backend for RknnBackend {
-    fn open(model: &Path, options: &SessionOptions) -> Result<Self> {
-        Self::with_library(sys::Library::load(&runtime())?, model, options)
+    fn open(model: &Path, _: &SessionOptions) -> Result<Self> {
+        Self::with_library(sys::Library::load(&runtime())?, model)
     }
 
-    fn kind(&self) -> BackendKind {
-        BackendKind::Rknn
+    fn descriptor(&self) -> &'static Descriptor {
+        &RKNN
     }
 
     fn io(&self) -> &ModelIo {
@@ -322,12 +338,10 @@ impl RknnBackend {
 
 impl RknnBackend {
     /// [`Backend::open`] over a runtime already loaded, so the runtime's path
-    /// is chosen in one place.
-    pub fn with_library(
-        library: sys::Library,
-        model: &Path,
-        options: &SessionOptions,
-    ) -> Result<Self> {
+    /// is chosen in one place. No [`SessionOptions`]: none of it is this
+    /// runtime's — the artifact folds its quantisation in and the runtime
+    /// dequantizes its own outputs.
+    pub fn with_library(library: sys::Library, model: &Path) -> Result<Self> {
         // An unbounded read of a stream or a growing file would exhaust a
         // board's memory, so the read is capped at the size the open file
         // reports.
@@ -376,25 +390,13 @@ impl RknnBackend {
             _model: bytes,
         };
 
-        if let Some(mask) = options.rknn.core_mask {
-            let mask = c_int::try_from(mask).with_context(|| format!("core mask {mask:#x}"))?;
-            // SAFETY: `ctx` is live; the mask is a plain value.
-            check("rknn_set_core_mask", unsafe {
-                (session.library.set_core_mask)(session.ctx, mask)
-            })?;
-        }
-
         let mut sdk = sys::SdkVersion::zeroed();
         // SAFETY: the SDK-version command fills an `SdkVersion`.
         unsafe { session.query(sys::QUERY_SDK_VERSION, &mut sdk) }?;
         cairn_detect::note!(
-            "rknn: api {} driver {}, core mask {}",
+            "rknn: api {} driver {}",
             c_text(&sdk.api_version),
             c_text(&sdk.drv_version),
-            options
-                .rknn
-                .core_mask
-                .map_or("runtime default".to_string(), |mask| format!("{mask:#x}"))
         );
         let mut num = sys::IoNum::default();
         // SAFETY: the in/out-count command fills an `IoNum`.
@@ -703,6 +705,43 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering::SeqCst};
     use std::sync::{Mutex, MutexGuard};
+
+    /// The descriptor's values, in the form `Cairn.Rockchip.Board.backends/0`
+    /// mirrors; [`RKNN`]'s note says which are established and which are a
+    /// conservative reading. A change here is a change to what a profile may
+    /// declare, not a refactor.
+    #[test]
+    fn the_descriptor_pins_what_a_profile_may_declare() {
+        assert_eq!(RKNN.name, "rknn");
+        assert!(!RKNN.capabilities.supports_fused_nms);
+        assert!(!RKNN.capabilities.supports_dynamic_shapes);
+        assert_eq!(
+            RKNN.capabilities.to_string(),
+            "artifact=.rknn fused-nms=no dynamic-shapes=no"
+        );
+    }
+
+    /// The probe binary's `--backend`, as the canary passes it: `rknn` is this
+    /// provider and the core names stay the core's.
+    #[test]
+    fn the_provider_answers_its_own_name_and_no_other() {
+        use cairn_detect::infer::{select, BackendKind, Selected};
+
+        let providers = [provider()];
+        assert!(matches!(
+            select("rknn", &providers),
+            Ok(Selected::Provided(p)) if std::ptr::eq(p.descriptor, &RKNN)
+        ));
+        assert!(matches!(
+            select("ort", &providers),
+            Ok(Selected::Core(BackendKind::Ort))
+        ));
+        let err = match select("tensorrt", &providers) {
+            Ok(_) => panic!("an unknown name selected a backend"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.ends_with("(rknn, ort, qnn)"), "{err}");
+    }
 
     fn attr(fmt: c_int, type_: c_int, dims: &[u32], name: &[u8]) -> sys::TensorAttr {
         let mut attr = sys::TensorAttr::zeroed();
@@ -1016,10 +1055,6 @@ mod tests {
         0
     }
 
-    unsafe extern "C" fn stub_set_core_mask(_: sys::Context, _: c_int) -> c_int {
-        0
-    }
-
     /// A boxed descriptor whose fd numbers it, so the log tells mems apart.
     fn stub_mem(call_name: &str, size: u32) -> *mut sys::TensorMem {
         let fd = NEXT_FD.fetch_add(1, SeqCst);
@@ -1089,7 +1124,6 @@ mod tests {
             run: stub_run,
             outputs_get: stub_outputs_get,
             outputs_release: stub_outputs_release,
-            set_core_mask: stub_set_core_mask,
             mem: Ok(sys::MemApi {
                 create_mem: stub_create_mem,
                 create_mem_from_fd: stub_create_mem_from_fd,
@@ -1105,7 +1139,7 @@ mod tests {
     }
 
     fn open_path_with(path: &Path, library: sys::Library) -> Result<RknnBackend> {
-        RknnBackend::with_library(library, path, &SessionOptions::default())
+        RknnBackend::with_library(library, path)
     }
 
     fn open_stub(tag: &str) -> Result<RknnBackend> {

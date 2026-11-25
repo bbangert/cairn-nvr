@@ -27,7 +27,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::backend::onnxruntime::OrtBackend;
-use super::backend::{Backend, BackendKind, InputElement, InputTensor, SessionOptions};
+use super::backend::{Backend, BackendKind, InputElement, InputTensor, Selected, SessionOptions};
 use super::encoding::{TensorEncoding, TensorLayout, TensorValues};
 use super::geometry::{InputSize, Projection};
 use super::profile::InputSpec;
@@ -73,12 +73,6 @@ impl Embedder {
             BackendKind::Qnn => bail!(
                 "the embedder does not run on qnn yet (no QDQ embedder \
                  artifact) — drop --embedder-model or use --backend ort"
-            ),
-            // Even in a build whose board library provides rknn for the
-            // detector: this open reaches only this crate's backends.
-            kind @ BackendKind::Rknn => bail!(
-                "the embedder runs on ort only, not {kind} — \
-                 drop --embedder-model or use --backend ort"
             ),
         };
         let io = backend.io();
@@ -159,8 +153,8 @@ impl Embedder {
             "input size={} dim={} backend={} ({})",
             self.input_size,
             self.dim,
-            self.backend.kind(),
-            self.backend.kind().capabilities()
+            self.backend.descriptor().name,
+            self.backend.descriptor().capabilities
         )
     }
 
@@ -205,6 +199,26 @@ impl Embedder {
             return Ok(None);
         }
         Ok(Some(raw.values.iter().map(|v| v / norm).collect()))
+    }
+}
+
+/// The backend an embedder opens on beside a detector on `detector`, or why
+/// there is none. Shared by the binary and the NIF so both refuse from the
+/// resolved name, before any model load, in the same words.
+///
+/// [`Embedder::open`] reaches only this crate's backends, so a provided
+/// detector is refused under any name, `ort` included: core ort beside it
+/// would run half of each pass on a runtime the name did not select.
+pub fn embedder_backend(detector: &Selected<'_>) -> Result<BackendKind> {
+    match detector {
+        Selected::Core(BackendKind::Ort) => Ok(BackendKind::Ort),
+        Selected::Core(BackendKind::Qnn) => {
+            bail!("the embedder does not run on qnn yet (no QDQ embedder artifact)")
+        }
+        Selected::Provided(provider) => bail!(
+            "the embedder does not run on a board library's backend ({})",
+            provider.descriptor.name
+        ),
     }
 }
 
@@ -348,12 +362,12 @@ mod tests {
     use super::*;
     use crate::infer::geometry::ResizePolicy;
 
-    /// The embedder's qnn and rknn refusals must fire before any model access
+    /// The embedder's qnn refusal must fire before any model access
     /// — proven by a path that does not exist — and name the way out, because a
     /// regression that fell through to a session open would silently put the
     /// embedder on whatever EP the fallthrough chose.
     #[test]
-    fn qnn_and_rknn_are_refused_before_any_model_access() {
+    fn qnn_is_refused_before_any_model_access() {
         let err = match Embedder::open(Path::new("does/not/exist"), BackendKind::Qnn) {
             Ok(_) => panic!("embedder opened on qnn"),
             Err(err) => err,
@@ -361,29 +375,21 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("does not run on qnn"), "{msg}");
         assert!(msg.contains("--embedder-model"), "{msg}");
-
-        let err = match Embedder::open(Path::new("does/not/exist"), BackendKind::Rknn) {
-            Ok(_) => panic!("embedder opened on rknn"),
-            Err(err) => err,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("ort only"), "{msg}");
-        assert!(msg.contains("--embedder-model"), "{msg}");
     }
 
     /// An interleaved detector tensor is refused before any crop or run:
     /// the planar read would embed noise without failing.
     #[test]
     fn a_non_nchw_crop_source_is_refused() {
-        use super::super::backend::{ModelIo, Tensors};
+        use super::super::backend::{Descriptor, ModelIo, Tensors};
 
         struct NeverRuns(ModelIo);
         impl Backend for NeverRuns {
             fn open(_: &Path, _: &SessionOptions) -> Result<Self> {
                 unreachable!("built directly")
             }
-            fn kind(&self) -> BackendKind {
-                BackendKind::Ort
+            fn descriptor(&self) -> &'static Descriptor {
+                BackendKind::Ort.descriptor()
             }
             fn io(&self) -> &ModelIo {
                 &self.0

@@ -71,12 +71,13 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       assert %Download{} = children.download
     end
 
-    # The generic board's rows are paired in config_test.exs; this is rknn's.
-    test "the rknn capability booleans match the plugin's source" do
+    # The generic board's rows are paired in config_test.exs; this is rknn's,
+    # whose descriptor is the board crate's.
+    test "the rknn capability booleans match the board crate's source" do
       [[_, fused, dynamic]] =
         Regex.scan(
-          ~r/Self::Rknn => Capabilities \{\s*supports_fused_nms: (\w+),\s*supports_dynamic_shapes: (\w+),/,
-          File.read!("plugins/cairn-detect/src/infer/backend.rs")
+          ~r/name: "rknn",\s*capabilities: Capabilities \{\s*supports_fused_nms: (\w+),\s*supports_dynamic_shapes: (\w+),/,
+          File.read!("boards/cairn_rockchip/native/cairn_rockchip/src/rknn.rs")
         )
 
       caps = Profile.capabilities("rknn")

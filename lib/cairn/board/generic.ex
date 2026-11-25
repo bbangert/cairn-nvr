@@ -18,15 +18,16 @@ defmodule Cairn.Board.Generic do
   @impl true
   def decoders, do: ~w(auto vaapi qsv nvdec v4l2 videotoolbox sw)
 
-  # The host-side mirror of `BackendKind::capabilities`' ort and qnn rows in
-  # `plugins/cairn-detect/src/infer/backend.rs`, whose rows carry the evidence.
+  # The host-side mirror of the `ORT` and `QNN` descriptors in
+  # `plugins/cairn-detect/src/infer/backend.rs`, which carry the evidence
+  # (rknn's is `Cairn.Rockchip.Board`'s, mirroring its own crate's `RKNN`).
   # Claims, not probes: config load answers them with no engine running and,
   # for a profile written ahead of its hardware, no device attached.
   #
   # `artifact` is the `model:` key naming the compiled file, not its format:
-  # Rust reports `ArtifactFormat::Onnx` for qnn (an onnxruntime execution
-  # provider) while the key is `qnn:`, because its QDQ graph is a different
-  # file from the fp32 export.
+  # Rust reports `.onnx` for qnn (an onnxruntime execution provider) while
+  # the key is `qnn:`, because its QDQ graph is a different file from the
+  # fp32 export.
   #
   # `dynamic_shapes` is read by no rule: what it would refuse, an
   # `input_size:` disagreeing with a fixed-geometry artifact, is a fact about a
