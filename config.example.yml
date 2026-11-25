@@ -142,10 +142,10 @@ retention:
 #     profile: generic-ort
 #
 #   npu:
-#     profile: rk3566-tier1
-#     # Required to run a profile whose backend is not `ort`: each release
-#     # offers `ort` plus its own (`qnn` on the generic board, `rknn` on the
-#     # Rockchip one), and both are experimental. Both halves are needed —
+#     profile: qcs6490-tier1
+#     # Required to run a profile whose backend is not `ort`: each board
+#     # offers `ort` plus its own (`qnn` on the generic board), and those are
+#     # experimental. Both halves are needed —
 #     # the profile declares `experimental: true`, this key is your consent.
 #     allow_experimental: true
 

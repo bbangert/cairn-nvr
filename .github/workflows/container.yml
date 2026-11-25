@@ -1,25 +1,18 @@
 name: Container
 
-# The add-on image (tier1-container plan). Four jobs:
+# The add-on image (tier1-container plan). Two jobs:
 #  - smoke: the amd64 build + boot assertions (tools/container/smoke-x86.sh)
 #    on every PR touching anything the image ships — the devcontainer has no
 #    docker, so CI is where the x86 smoke actually runs.
-#  - smoke-rockchip: the same script for the Rockchip image, whose arm64
-#    vendor layer x86 cannot build: the amd64 `core` stage booted with the
-#    Dockerfile's Rockchip board directory attached.
-#  - rockchip-libs: the Dockerfile stage of that name on the same PRs, so a
-#    pinned source that no longer fetches, cross-builds or exports the
-#    symbols the board NIF will bind fails a PR, not the next Rockchip image
-#    build. The vendor layer's ldd check runs only in that full build.
-#  - publish: a linux/arm64 image — generic to ghcr on a version tag, the
-#    board chosen on manual dispatch. A dispatch pushes only when asked:
-#    left alone it builds the full image and uploads it as a `docker load`
-#    tarball, which is how a branch proves it builds and how an unpublished
-#    image reaches a bench board. VAGUS-2 pulls anonymously, so each ghcr
-#    package must be flipped to PUBLIC once after its first push (repo
-#    settings → packages). A generic build also builds the Dockerfile's
-#    `core` stage as cairn-nvr-base-aarch64, the image a board repository's
-#    image is `FROM`, and pushes it on a version tag only.
+#  - publish: the linux/arm64 image to ghcr on a version tag or a manual
+#    dispatch. A dispatch pushes only when asked: left alone it builds the
+#    full image and uploads it as a `docker load` tarball, which is how a
+#    branch proves it builds and how an unpublished image reaches a bench
+#    board. VAGUS-2 pulls anonymously, so each ghcr package must be flipped
+#    to PUBLIC once after its first push (repo settings → packages). The job
+#    also builds the Dockerfile's `core` stage as cairn-nvr-base-aarch64, the
+#    image a board repository's image is `FROM`, and pushes it on a version
+#    tag only.
 #
 # Actions are pinned to commit SHAs: the publish job holds the registry
 # token, and that holds its steps to the standard of the Dockerfile's
@@ -32,7 +25,6 @@ on:
       - Dockerfile
       - .dockerignore
       - plugins/**
-      - boards/**
       - tools/container/**
       - models/**
       - lib/**
@@ -47,11 +39,6 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
-      board:
-        description: CAIRN_BOARD to build
-        type: choice
-        options: [generic, rockchip]
-        default: generic
       push:
         description: Push the image to ghcr
         type: boolean
@@ -77,29 +64,6 @@ jobs:
           name: smoke-log
           path: tools/container/smoke-x86.log
 
-  smoke-rockchip:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - run: tools/container/smoke-x86.sh rockchip
-      - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: smoke-log-rockchip
-          path: tools/container/smoke-x86-rockchip.log
-
-  rockchip-libs:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      # No qemu: the stage runs on the build platform and cross-compiles.
-      - run: >-
-          docker buildx build --platform linux/arm64 --target rockchip-libs .
-
   publish:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -107,17 +71,12 @@ jobs:
       contents: read
       packages: write
     env:
-      # A v* tag publishes generic only: the Rockchip add-on is not released
-      # until its profile has passed its soak, so it is published by dispatch
-      # only.
-      BOARD: ${{ github.event_name == 'workflow_dispatch' && inputs.board || 'generic' }}
       PUSH: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
       EVENT: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # qemu for the arm64 release-build, board-build and runtime stages; the
-      # Rust and rockchip-libs stages cross-compile on the build host (D-C3)
-      # and never emulate.
+      # qemu for the arm64 release-build and runtime stages; the Rust stage
+      # cross-compiles on the build host (D-C3) and never emulates.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - if: env.PUSH == 'true'
@@ -131,11 +90,7 @@ jobs:
       # refused here rather than deployed stale.
       - id: target
         run: |
-          case "$BOARD" in
-            generic) addon=cairn image=cairn-nvr-aarch64 ;;
-            rockchip) addon=cairn-rockchip image=cairn-nvr-rockchip-aarch64 ;;
-            *) echo "unknown board $BOARD" >&2; exit 1 ;;
-          esac
+          addon=cairn image=cairn-nvr-aarch64
           config_version=$(sed -n 's/^version: "\(.*\)"/\1/p' "deploy/vagus-addon/$addon/config.yaml")
           if [ -z "$config_version" ]; then
             echo "no version in deploy/vagus-addon/$addon/config.yaml" >&2
@@ -158,7 +113,6 @@ jobs:
           context: .
           platforms: linux/arm64
           build-args: |
-            CAIRN_BOARD=${{ env.BOARD }}
             CAIRN_REVISION=${{ github.sha }}
           push: ${{ env.PUSH == 'true' }}
           outputs: ${{ env.PUSH != 'true' && 'type=docker,dest=/tmp/cairn-image.tar' || '' }}
@@ -170,8 +124,7 @@ jobs:
       # `latest`: a board names the core version it was built against. A
       # dispatch never pushes it: a base under a version's name is that tag's
       # commit and no other.
-      - if: env.BOARD == 'generic'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/arm64
@@ -183,7 +136,7 @@ jobs:
       - if: env.PUSH != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cairn-image-${{ env.BOARD }}
+          name: cairn-image
           path: /tmp/cairn-image.tar
           retention-days: 3
       - env:
@@ -197,5 +150,5 @@ jobs:
               echo "Pushed \`$BASE:$VERSION\`." >> "$GITHUB_STEP_SUMMARY"
             fi
           else
-            echo "Built \`$IMAGE:$VERSION\` — not pushed; download the \`cairn-image-$BOARD\` artifact." >> "$GITHUB_STEP_SUMMARY"
+            echo "Built \`$IMAGE:$VERSION\` — not pushed; download the \`cairn-image\` artifact." >> "$GITHUB_STEP_SUMMARY"
           fi

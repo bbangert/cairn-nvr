@@ -74,3 +74,21 @@ config.yml
 
 # Qualcomm AI Hub credentials (Ben, 2026-08-21) — never commit
 qualcomm.env
+
+# The Rockchip board and its export tooling live in bbangert/cairn-rockchip;
+# these keep what they built in a core checkout ignored once their own
+# .gitignore files are gone: build output, and the export workspace (a
+# licensed toolkit, and weights and exports not ours to redistribute).
+/boards/cairn_rockchip/_build/
+/boards/cairn_rockchip/deps/
+/boards/cairn_rockchip/priv/native/
+/boards/cairn_rockchip/native/cairn_rockchip/target/
+/tools/rknn-export/work/
+/tools/rknn-export/venv/
+/tools/rknn-export/**/__pycache__/
+/tools/rknn-export/**/.pytest_cache/
+/tools/rknn-export/**/*.onnx
+/tools/rknn-export/**/*.rknn
+/tools/rknn-export/**/*.pt
+/tools/rknn-export/**/*.npy
+/tools/rknn-export/**/*.npz

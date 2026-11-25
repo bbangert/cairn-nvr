@@ -19,8 +19,8 @@ defmodule Cairn.Board.Generic do
   def decoders, do: ~w(auto vaapi qsv nvdec v4l2 videotoolbox sw)
 
   # The host-side mirror of the `ORT` and `QNN` descriptors in
-  # `plugins/cairn-detect/src/infer/backend.rs`, which carry the evidence
-  # (rknn's is `Cairn.Rockchip.Board`'s, mirroring its own crate's `RKNN`).
+  # `plugins/cairn-detect/src/infer/backend.rs`, which carry the evidence (a
+  # board's own backends are its board module's, mirroring its crate).
   # Claims, not probes: config load answers them with no engine running and,
   # for a profile written ahead of its hardware, no device attached.
   #

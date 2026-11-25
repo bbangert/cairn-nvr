@@ -7,9 +7,9 @@ publish = false
 
 # `cdylib` is the NIF library the BEAM loads as `CairnOrt`. The `rlib` has two
 # consumers: cairn-native's dev-dependency, whose clip harness drives both
-# halves of the split boundary through one end-to-end test, and the Rockchip
-# board crate, which hosts this engine over its own backend under its own NIF
-# module (`default-features = false`).
+# halves of the split boundary through one end-to-end test, and a board's
+# crate, which hosts this engine over its own backend under its own NIF module
+# (`default-features = false`).
 [lib]
 crate-type = ["cdylib", "rlib"]
 

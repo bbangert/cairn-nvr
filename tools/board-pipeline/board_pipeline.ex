@@ -485,8 +485,8 @@ defmodule Cairn.BoardPipeline do
   and how many streams a board carries at `sample_fps`.
 
   A source file required into a VM that has cairn's modules but has started
-  none of its applications: a release's `bin/cairn eval` (`rk-cell.sh`) or
-  the elixirc slice `run-local.sh` builds. The seams that keep the rest of the
+  none of its applications: a release's `bin/cairn eval` or the elixirc
+  slice `run-local.sh` builds. The seams that keep the rest of the
   app out:
 
     * `Host.start_link(config: ...)` — a non-nil `:config` opt means
@@ -502,8 +502,8 @@ defmodule Cairn.BoardPipeline do
       element's pad, so the host-side tracker closure stays out.
 
   A run that measured ends with one `board-pipeline: engine …` line per host
-  and one `board-pipeline: result …` line, `key=value` pairs for
-  `rk-ladder.sh` to cut.
+  and one `board-pipeline: result …` line, `key=value` pairs for a ladder
+  script to cut.
   """
 
   alias Cairn.BoardPipeline.{Board, Collector, Pipe}
@@ -604,7 +604,7 @@ defmodule Cairn.BoardPipeline do
   end
 
   # The decode and engine libraries the board resolves for this run, each once:
-  # `rkmpp` and `rknn` name the same Rockchip module.
+  # a board may resolve its decoder and its backend to one module.
   defp nif_modules(opts) do
     board = Cairn.Board.module()
     base = Cairn.Board.base()
@@ -745,7 +745,7 @@ defmodule Cairn.BoardPipeline do
 
     obs = Enum.map(cameras, fn {id, _} -> get_in(summary.cams, [id, :observations]) || 0 end)
 
-    # No `result` line for a run that observed nothing: `rk-ladder.sh` would
+    # No `result` line for a run that observed nothing: a ladder script would
     # take it for a cell that ran.
     if Enum.sum(obs) == 0,
       do: {:error, :no_observations},
@@ -924,17 +924,9 @@ defmodule Cairn.BoardPipeline do
     {:error, {:engines, engines}}
   end
 
-  # A missing library must not read as a clean run. An unset
-  # CAIRN_RKNN_LIBRARY is the loader's search path, which on a release image
-  # is never where librknnrt sits: the base downloads it.
+  # A missing library must not read as a clean run.
   defp check_available(opts) do
-    rknn_library = System.get_env("CAIRN_RKNN_LIBRARY")
-
     case Enum.reject(nif_modules(opts), &(exported?(&1, :available?, 0) and &1.available?())) do
-      _unavailable when opts.backend == "rknn" and rknn_library in [nil, ""] ->
-        IO.puts("board-pipeline: refusing to run — backend rknn needs CAIRN_RKNN_LIBRARY set")
-        {:error, :rknn_library_unset}
-
       [] ->
         :ok
 

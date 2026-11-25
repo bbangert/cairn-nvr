@@ -13,7 +13,7 @@ defmodule Cairn.ConfigTest do
       do: %{backends: %{"qnn" => "no /dev/fastrpc"}, decoders: %{"vaapi" => "no /dev/dri"}}
   end
 
-  # The Rockchip board's NIF-failure reason, on a backend the generic menu has.
+  # A board NIF's failure reason, on a backend the generic menu has.
   defmodule NifBoard do
     def name, do: "nif"
     def profiles_dir, do: "test/support/fixtures/profiles/board"
@@ -3088,8 +3088,8 @@ defmodule Cairn.ConfigTest do
     # itself the tripwire — it means the Rust shape moved and the mirror needs
     # re-pairing by hand. `artifact` is deliberately not compared: the two sides
     # disagree for qnn by design (format vs `model:` key — see the comment on
-    # `Cairn.Board.Generic.backends/0`). rknn's descriptor is in the Rockchip
-    # board's crate, and `rockchip_release_test.exs` pairs it.
+    # `Cairn.Board.Generic.backends/0`). A board's own backends are its
+    # crate's, paired by that board's suite.
     test "the capability booleans match the plugin's source, mechanically" do
       # The test module's fakes are descriptors too.
       [rust | _] =
@@ -3135,11 +3135,11 @@ defmodule Cairn.ConfigTest do
     # catalog row is NMS-free or host-side — so the reject side cannot be built
     # from a real profile, and the rule is exercised against the row a future
     # catalog addition would have. Coverage composes: rule 2's tests with a
-    # board attached whose backend has `conversions` (fixture_board_test.exs,
-    # rockchip_release_test.exs) run the public parse path through the same
-    # `check_capabilities/5`, so the wiring is proven there and only the
-    # branches need direct calls — giving the two rules separate entry points
-    # breaks that composition and needs a public-path test for each.
+    # board attached whose backend has `conversions` (fixture_board_test.exs)
+    # run the public parse path through the same `check_capabilities/5`, so
+    # the wiring is proven there and only the branches need direct calls —
+    # giving the two rules separate entry points breaks that composition and
+    # needs a public-path test for each.
     @fused {"fusednet", "fusednet", %{families: [], nms: :fused}}
 
     defp caps(backend), do: {backend, Profile.capabilities(backend)}
@@ -3529,11 +3529,7 @@ defmodule Cairn.ConfigTest do
     # that the note exists, not that it is true — while pack-ness comes
     # from the parsed rungs, paired by order.
     test "every shipped ladder budget carries provenance; non-pack provisional ⇒ DRAFT" do
-      shipped =
-        Path.wildcard("priv/profiles/**/*.yml") ++
-          Path.wildcard("boards/*/priv/profiles/*.yml")
-
-      assert "boards/cairn_rockchip/priv/profiles/rk3566-tier1.yml" in shipped
+      shipped = Path.wildcard("priv/profiles/**/*.yml")
 
       for path <- shipped,
           raw = File.read!(path),

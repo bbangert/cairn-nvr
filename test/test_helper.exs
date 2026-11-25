@@ -27,9 +27,8 @@ Cairn.Repo.delete_all(Cairn.Tracks.Track)
 # boot test builds one in $WORK/board). Run it with:
 # CAIRN_FIXTURE_BOARD_DIR=<dir> mix test --only fixture_board
 #
-# :rockchip_board needs boards/cairn_rockchip's board directory, which
-# tools/ci/rockchip-board-test.sh builds in $WORK/board. Run it with:
-# CAIRN_ROCKCHIP_BOARD_DIR=<dir> mix test --only rockchip_board
+# :rockchip_board is the Rockchip board's attached suite, which its own
+# repository (bbangert/cairn-rockchip) runs, never this one.
 ExUnit.start(
   exclude: [:integration, :native_parity, :e2e_membrane, :fixture_board, :rockchip_board]
 )

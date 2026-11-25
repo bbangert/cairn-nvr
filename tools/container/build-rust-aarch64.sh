@@ -5,19 +5,10 @@
 #   plugins/cairn-ort     -> libcairn_ort.so      (inference NIF)
 #   plugins/cairn-detect  -> cairn-detect         (canary / parity binary)
 #
-# and, when CAIRN_BOARD=rockchip, the board library's NIF and probe binary:
-#
-#   boards/cairn_rockchip -> rockchip-nif/libcairn_rockchip.so  (RKNN engine NIF)
-#                         -> rockchip/cairn-rockchip-probe       (its canary)
-#
-# in separate directories, because the image copies rockchip/ wholesale onto
-# PATH and rockchip-nif/ into the priv/native of the board-build stage, which
-# writes the board directory.
-#
 # Cross, never qemu (D-C3), for everything arch-native this repository builds
-# (these NIFs and binaries, fastrpc, the Rockchip vendor libraries). BEAM
-# bytecode is arch-neutral; ERTS comes with the arm64 release build, where
-# the Hex dependencies' own C NIFs compile under emulation. Runs on any amd64 Debian trixie with:
+# (these three and fastrpc). BEAM bytecode is arch-neutral; ERTS comes with
+# the arm64 release build, where the Hex dependencies' own C NIFs compile
+# under emulation. Runs on any amd64 Debian trixie with:
 #
 #   dpkg --add-architecture arm64 && apt-get update
 #   apt-get install gcc-aarch64-linux-gnu pkg-config clang \
@@ -65,16 +56,6 @@ cp plugins/cairn-detect/target/$TARGET/release/cairn-detect \
   plugins/cairn-ort/target/$TARGET/release/libcairn_ort.so \
   "$DIST/"
 artifacts=(cairn-detect libcairn_native.so libcairn_ort.so)
-
-if [ "${CAIRN_BOARD:-}" = rockchip ]; then
-  (cd boards/cairn_rockchip/native/cairn_rockchip &&
-    cargo build --release --target "$TARGET" --features ort-load-dynamic)
-  board_out=boards/cairn_rockchip/native/cairn_rockchip/target/$TARGET/release
-  mkdir -p "$DIST/rockchip" "$DIST/rockchip-nif"
-  cp "$board_out/cairn-rockchip-probe" "$DIST/rockchip/"
-  cp "$board_out/libcairn_rockchip.so" "$DIST/rockchip-nif/"
-  artifacts+=(rockchip/cairn-rockchip-probe rockchip-nif/libcairn_rockchip.so)
-fi
 
 for f in "${artifacts[@]}"; do
   file "$DIST/$f" | grep -q aarch64 || {

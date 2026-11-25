@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Compile and run Cairn.BoardPipeline on this (x86) machine, against the
 # repo's own dev-built deps and NIF .so files: the generic board, onnxruntime
-# on the CPU and the software decoder. The Green runs the same source inside
-# its release instead (rk-cell.sh).
+# on the CPU and the software decoder. A board runs the same source inside
+# its release instead, through `bin/cairn eval`.
 #
 # The clip is BOARD_PIPELINE_CLIP, a board-soak packed AU file
 # (<<pts90::signed-64, size::unsigned-32, au::binary>>). Regenerate one from
