@@ -617,6 +617,37 @@ defmodule Cairn.Native.HealthTest do
       assert Host.status(host).stalled == [id]
     end
 
+    test "a probe that times out does not forget a diagnosed hang", %{id: id} do
+      opts = health(stall_ms: 300, probe_timeout_ms: 50)
+      {host, busy, pusher, _call} = hung_beside_traffic(id, opts)
+      assert Host.check_health(host) == :idle
+      Process.sleep(350)
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+      rebuild(host, id, pusher)
+
+      # the Host inside a native call of its own for one cycle: no reply, so no closes
+      caller = self()
+
+      control(%{
+        open_stream: fn _engine, _camera_id, _params ->
+          send(caller, {:opening, self()})
+          receive(do: (:release -> {:ok, {:stream, :late}}))
+        end
+      })
+
+      spawn(fn -> Host.open_stream(host, id <> "_late", %{}) end)
+      assert_receive {:opening, blocked}
+      on_exit(fn -> send(blocked, :release) end)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) == ""
+      send(blocked, :release)
+
+      # the close is still younger than the bound when the Host answers again
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) == ""
+      assert Host.status(host).stalled == [id]
+    end
+
     test "an outstanding close says what it is evidence of", %{id: id} do
       {host, busy, pusher, _call} = hung_beside_traffic(id)
       rebuild(host, id, pusher)

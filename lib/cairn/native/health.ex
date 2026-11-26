@@ -306,7 +306,12 @@ defmodule Cairn.Native.Health do
       traffic: retired + errors,
       calls: calls,
       closes: closes,
-      stalled: (calls ++ closes) |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.sort(),
+      stalled:
+        (calls ++ closes)
+        |> Enum.map(&elem(&1, 0))
+        |> Kernel.++(unseen(probe, state))
+        |> Enum.uniq()
+        |> Enum.sort(),
       now: now,
       elapsed_ms: max(div(now - state.checked_at, 1000), 1)
     }
@@ -315,6 +320,11 @@ defmodule Cairn.Native.Health do
   # A probe that timed out carries none, and is `:wedged` by itself.
   defp closing({:ok, %{closing: closing}}), do: closing
   defp closing(_no_answer), do: []
+
+  # Without a reply the closes cannot be seen, which is not the same as landed: the
+  # cameras already called stalled stay so until a probe says otherwise.
+  defp unseen({:ok, _reply}, _state), do: []
+  defp unseen(_no_answer, state), do: state.stalled
 
   defp answer(state, verdict) do
     Enum.each(state.waiting, &GenServer.reply(&1, verdict))
