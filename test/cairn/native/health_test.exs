@@ -626,14 +626,42 @@ defmodule Cairn.Native.HealthTest do
       assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
 
       kill(pusher)
-      push(host, busy, 10)
-      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) == ""
+
+      # the row is reaped by the first of these; the open is what the second has
+      log =
+        capture_log(fn ->
+          for _window <- 1..2 do
+            push(host, busy, 10)
+            assert Host.check_health(host) == :wedged
+          end
+        end)
+
+      assert log == ""
       assert Host.status(host).stalled == [id]
 
       :ok = Host.close_stream(host, id)
       assert_receive {:close_stream, {:stream, ^id}}
       push(host, busy, 10)
       assert capture_log(fn -> assert Host.check_health(host) == :wedged end) == ""
+    end
+
+    test "a pass retired on a camera whose caller died ends its hang", %{id: id} do
+      {host, busy, pusher, call} = hung_beside_traffic(id, health(stall_ms: 300))
+      assert Host.check_health(host) == :idle
+      Process.sleep(350)
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+
+      kill(pusher)
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) == ""
+
+      # never closed, and the same open carries passes again, as after the call
+      # came back
+      hang([], call)
+      push(host, id, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :healthy end) =~ "recovered"
+      assert Host.status(host).stalled == []
     end
 
     test "a probe that times out does not forget a diagnosed hang", %{id: id} do

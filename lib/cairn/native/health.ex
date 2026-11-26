@@ -86,6 +86,7 @@ defmodule Cairn.Native.Health do
     :baseline_ms,
     waiting: [],
     stalled: [],
+    unclosed: [],
     window: %{},
     completed: 0,
     health: :unknown,
@@ -258,6 +259,7 @@ defmodule Cairn.Native.Health do
       window: %{},
       health: verdict,
       stalled: window.stalled,
+      unclosed: window.unclosed,
       stream_health: per_stream,
       stream_fps: stream_fps(state.window, window.elapsed_ms),
       p50_ms: window_p50(state)
@@ -302,16 +304,18 @@ defmodule Cairn.Native.Health do
       |> Enum.filter(fn {camera_id, at} -> at <= cutoff or camera_id in state.stalled end)
       |> Enum.sort()
 
+    unclosed = unclosed(dead, probe, state)
+
     %{
       retired: retired,
       traffic: retired + errors,
       calls: calls,
       closes: closes,
+      unclosed: unclosed,
       stalled:
-        (calls ++ closes)
+        (calls ++ closes ++ unclosed)
         |> Enum.map(&elem(&1, 0))
         |> Kernel.++(unseen(probe, state))
-        |> Kernel.++(unclosed(dead, probe, state))
         |> Enum.uniq()
         |> Enum.sort(),
       now: now,
@@ -329,18 +333,27 @@ defmodule Cairn.Native.Health do
   defp unseen(_no_answer, state), do: state.stalled
 
   # A diagnosed caller that died inside its call leaves no row, and its stream's
-  # close reaches the Host a moment later. A cycle landing between the two finds
-  # that open still on the probe reply and keeps the camera stalled; the row is
-  # reaped in the same cycle, so this holds for that one cycle and the close is the
-  # evidence from the next.
-  defp unclosed(dead, {:ok, %{open: open}}, state) do
-    for {_pid, camera_id, token, _started_at} <- dead,
-        camera_id in state.stalled,
-        {camera_id, token} in open,
-        do: camera_id
-  end
+  # close reaches the Host a moment later. In between, that open — camera and
+  # token — is still on the probe reply, and is remembered as stalled for as long
+  # as it is; once the Host has been asked to close it, the close is the evidence.
+  # A probe that did not answer cannot say, and forgets none. A pass retired on the
+  # camera since ends it too: the stream's lock was let go.
+  defp unclosed(dead, probe, state) do
+    diagnosed =
+      for {_pid, camera_id, token, _started_at} <- dead,
+          camera_id in state.stalled,
+          do: {camera_id, token}
 
-  defp unclosed(_dead, _no_answer, _state), do: []
+    held =
+      Enum.reject(Enum.uniq(diagnosed ++ state.unclosed), fn {camera_id, _token} ->
+        match?(%{count: count} when count > 0, state.window[camera_id])
+      end)
+
+    case probe do
+      {:ok, %{open: open}} -> Enum.filter(held, &(&1 in open))
+      _no_answer -> held
+    end
+  end
 
   defp answer(state, verdict) do
     Enum.each(state.waiting, &GenServer.reply(&1, verdict))
