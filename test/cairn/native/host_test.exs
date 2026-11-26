@@ -29,6 +29,7 @@ defmodule Cairn.Native.HostTest do
   defp start_host(opts \\ []) do
     name = :"host_#{System.unique_integer([:positive])}"
     {health, opts} = Keyword.pop(opts, :health, [])
+    {spawn_opt, opts} = Keyword.pop(opts, :spawn_opt)
 
     defaults = [
       name: name,
@@ -38,7 +39,16 @@ defmodule Cairn.Native.HostTest do
       config: %{model: "m.onnx", backend: "qnn"}
     ]
 
-    start_supervised!({Host, Keyword.merge(defaults, opts)}, id: name)
+    opts = Keyword.merge(defaults, opts)
+
+    if spawn_opt,
+      do:
+        start_supervised!(%{
+          id: name,
+          start: {GenServer, :start_link, [Host, opts, [name: name, spawn_opt: spawn_opt]]}
+        }),
+      else: start_supervised!({Host, opts}, id: name)
+
     # Its own child, as in the supervisor: the host answers `status/2` with the
     # verdict, and never reaches one itself.
     start_supervised!({Health, Keyword.put(health, :host, name)}, id: Health.name(name))
@@ -509,6 +519,55 @@ defmodule Cairn.Native.HostTest do
 
       assert Host.status(host).streams == [id]
       assert Host.status(host).engine == :ready
+    end
+  end
+
+  describe "a replaced engine" do
+    # A refc binary stands in for the engine resource: created in the host by
+    # `init/1`, so `Process.info(host, :binary)` lists it for exactly as long as
+    # the host's heap still references it. The heaps are sized so that no
+    # collection happens on its own during a test — the quiet host the sweep is
+    # for, and the only way a missing sweep fails here deterministically.
+    @engine_bytes %{"m.onnx" => 1_001, "other.onnx" => 1_002}
+    @quiet [min_heap_size: 4_000_000, min_bin_vheap_size: 4_000_000]
+
+    setup do
+      control(%{
+        init: fn config -> {:ok, {:engine, :binary.copy(<<0>>, @engine_bytes[config.model])}} end
+      })
+
+      :ok
+    end
+
+    defp holds_engine?(host, model) do
+      {:binary, binaries} = Process.info(Process.whereis(host), :binary)
+      Enum.any?(binaries, fn {_id, bytes, _refc} -> bytes == @engine_bytes[model] end)
+    end
+
+    test "a reload lets the old one go", %{id: id} do
+      host = start_host(spawn_opt: @quiet)
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert holds_engine?(host, "m.onnx")
+
+      assert {:ok, _status} = Host.configure(host, %{model: "other.onnx", backend: "qnn"})
+      # the continue runs before the host reads its next message
+      Host.status(host)
+
+      refute holds_engine?(host, "m.onnx")
+      assert holds_engine?(host, "other.onnx")
+    end
+
+    test "an engine-fatal error lets it go", %{id: id} do
+      control(%{push_frame: {:error, {:model_poisoned, "the shared model lock is poisoned"}}})
+      host = start_host(spawn_opt: @quiet)
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert holds_engine?(host, "m.onnx")
+
+      assert {:error, {:model_poisoned, _}} = NativeStub.host_push(host, id)
+      # also the sync: the continue runs before the host reads this call
+      assert {:model_poisoned, _message} = Host.status(host).engine
+
+      refute holds_engine?(host, "m.onnx")
     end
   end
 

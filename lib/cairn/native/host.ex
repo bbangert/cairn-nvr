@@ -319,11 +319,19 @@ defmodule Cairn.Native.Host do
     {:noreply, open_engine(state, configured_model(state))}
   end
 
+  def handle_continue(:release_engine, state) do
+    :erlang.garbage_collect()
+    {:noreply, state}
+  end
+
   @impl true
   def handle_call({:open_stream, camera_id, params}, from, state) do
     case NativeConfig.stream_params(params) do
-      {:ok, params} -> {:noreply, open_or_park(state, camera_id, params, from)}
-      {:error, message} -> {:reply, {:error, {:config, message}}, state}
+      {:ok, params} ->
+        release_replaced({:noreply, open_or_park(state, camera_id, params, from)}, state)
+
+      {:error, message} ->
+        {:reply, {:error, {:config, message}}, state}
     end
   end
 
@@ -347,13 +355,14 @@ defmodule Cairn.Native.Host do
     {:reply, :ok, drop_stream(state, camera_id)}
   end
 
-  def handle_call({:configure, config}, _from, state) do
-    state = reload_engine(state, config)
+  def handle_call({:configure, config}, _from, old) do
+    state = reload_engine(old, config)
 
     case state.engine_state do
       :ready -> {:reply, {:ok, status_map(state)}, state}
       other -> {:reply, {:error, other}, state}
     end
+    |> release_replaced(old)
   end
 
   def handle_call(:status, _from, state), do: {:reply, status_map(state), state}
@@ -383,7 +392,7 @@ defmodule Cairn.Native.Host do
 
   @impl true
   def handle_cast({:reconfigure, config}, state) do
-    {:noreply, swap_model(state, configured_model(state, config))}
+    release_replaced({:noreply, swap_model(state, configured_model(state, config))}, state)
   end
 
   def handle_cast({:decoder_refusal, camera_id, message}, state) do
@@ -392,7 +401,7 @@ defmodule Cairn.Native.Host do
 
   @impl true
   def handle_info({:inference, camera_id, token, {:error, reason, message}}, state) do
-    {:noreply, note_error(state, camera_id, token, reason, message)}
+    release_replaced({:noreply, note_error(state, camera_id, token, reason, message)}, state)
   end
 
   # The baseline measurement landing. Matching the stored ref is the staleness
@@ -433,8 +442,8 @@ defmodule Cairn.Native.Host do
         {:noreply, state}
 
       {camera_id, closing} ->
-        state = %{state | closing: Map.delete(state.closing, camera_id)}
-        {:noreply, resume(state, camera_id, closing.parked)}
+        landed = %{state | closing: Map.delete(state.closing, camera_id)}
+        release_replaced({:noreply, resume(landed, camera_id, closing.parked)}, state)
     end
   end
 
@@ -475,6 +484,28 @@ defmodule Cairn.Native.Host do
   end
 
   # -- engine lifecycle -------------------------------------------------------
+
+  # The engine has no close: its model and accelerator contexts go when this
+  # process's last reference to the resource is collected, and a quiet host can
+  # go a long time between full sweeps — measured on a board, each replaced
+  # engine held ~30 MB plus its NPU contexts until one. The sweep is a continue
+  # because the callback that dropped the engine still holds the old state.
+  # It frees only this process's references: a stream's resource holds the
+  # engine too, so a close task still waiting, or a caller's leftover copy of
+  # an ETS row, keeps it until that process collects.
+  defp release_replaced({:reply, reply, state}, old) do
+    if replaced?(state, old),
+      do: {:reply, reply, state, {:continue, :release_engine}},
+      else: {:reply, reply, state}
+  end
+
+  defp release_replaced({:noreply, state}, old) do
+    if replaced?(state, old),
+      do: {:noreply, state, {:continue, :release_engine}},
+      else: {:noreply, state}
+  end
+
+  defp replaced?(state, old), do: old.engine != nil and state.engine !== old.engine
 
   # In precedence order: a `:config` opt, the application env, then the profile
   # of whatever membrane camera the loaded config has. Only the third moves on a

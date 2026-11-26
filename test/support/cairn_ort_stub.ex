@@ -22,7 +22,12 @@ defmodule Cairn.CairnOrtStub do
   @impl true
   def init(config) do
     notify({:init, config})
-    control(:init, {:ok, {:engine, config.model}})
+
+    case control(:init, nil) do
+      fun when is_function(fun, 1) -> fun.(config)
+      nil -> {:ok, {:engine, config.model}}
+      result -> result
+    end
   end
 
   # The default agrees with `NativeStub.decoded_frame/1`'s geometry: a 4x4
