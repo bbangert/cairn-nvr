@@ -567,6 +567,71 @@ mod tests {
         }
     }
 
+    /// Two detectors on one window report as one engine: their runs add up
+    /// to one total and the window resets at their combined boundary.
+    #[test]
+    fn detectors_sharing_a_window_report_their_runs_together() {
+        use super::super::geometry::ResizePolicy;
+
+        let labels = Labels::load(None).unwrap();
+        let open = || {
+            let backend = FakeBackend {
+                io: ModelIo {
+                    input_name: "images".to_string(),
+                    declared_input_size: Some(InputSize { w: 96, h: 64 }),
+                    declared_input_batch: Some(1),
+                    outputs: vec![Declared {
+                        name: "output".to_string(),
+                        dims: Some(vec![1, 126, 85]),
+                    }],
+                    input_element: InputElement::F32,
+                    u8_outputs: Vec::new(),
+                    input_layout: TensorLayout::Nchw,
+                },
+                output: vec![0.0; 126 * 85],
+                seen: Seen::default(),
+            };
+            let opened = Detector::with_backend(
+                Box::new(backend),
+                Path::new("m.fake"),
+                None,
+                None,
+                &labels,
+                false,
+                None,
+            );
+            match opened {
+                Ok(detector) => detector,
+                Err(err) => panic!("{err:#}"),
+            }
+        };
+        let (mut first, mut second) = (open(), open());
+        second.share_latency_with(&first);
+
+        let spec = first.input_spec();
+        let projection = ResizePolicy::Stretch.project(spec.size, spec.size);
+        let floors = ScoreFloors::parse("{}").unwrap();
+        let run = |detector: &mut Detector, times: usize| {
+            for _ in 0..times {
+                let tensor = TensorValues::F32(vec![0.0; spec.size.tensor_len()]);
+                detector
+                    .detect(tensor, projection, &labels, &floors)
+                    .unwrap();
+            }
+        };
+        let seen = |detector: &Detector| {
+            let window = detector.latency.lock().unwrap();
+            (window.window.len(), window.total_runs)
+        };
+
+        run(&mut first, 60);
+        run(&mut second, 39);
+        assert_eq!(seen(&first), (99, 99));
+        run(&mut second, 1);
+        assert_eq!(seen(&first), (0, 100));
+        assert_eq!(seen(&second), (0, 100));
+    }
+
     /// A pixel-byte backend's spec carries the encoding's identity qparams,
     /// with no sidecar; an encoding that has none is refused at open, naming
     /// the profile.
