@@ -35,7 +35,8 @@ defmodule Cairn.Pipeline.Inference do
   `push_frame(server, stream_id, payload, meta, time_base)` and
   `close_stream(server, stream_id)` in `CairnOrt`'s error vocabulary. In this
   application that is `Cairn.Native.Host`, which multiplexes one shared
-  engine (one model, one HTP graph) across every camera; a standalone user
+  engine (one model, in as many contexts as its backend opens: one HTP graph
+  on QNN) across every camera; a standalone user
   can wrap `CairnOrt` in a GenServer of the same shape. The stream is opened
   under one epoch — `stream_params.stream_epoch`, fixed at open, since
   `push_frame/5` carries none — so the element cannot open before the first
