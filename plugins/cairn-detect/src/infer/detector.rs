@@ -1,6 +1,7 @@
 //! The open model, and the per-frame path from a packed tensor to detections.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -39,7 +40,11 @@ pub struct Detector {
     /// `--allow-label-mismatch`, carried because a deferred layout only
     /// settles `nc` on the first real output — see [`check_label_count`].
     allow_label_mismatch: bool,
-    latency: LatencyWindow,
+    /// Shared by every detector `cairn-ort`'s engine holds on one model
+    /// ([`Detector::share_latency_with`]): the line is the engine's per-run
+    /// cost, and one window per slot would print K lines each over a share of
+    /// the runs. Its lock is a leaf: nothing is taken under it.
+    latency: Arc<Mutex<LatencyWindow>>,
 }
 
 /// Rolling window over raw inference latency, reported to stderr once per
@@ -196,8 +201,18 @@ impl Detector {
             input_size_source,
             output,
             allow_label_mismatch,
-            latency: LatencyWindow::new(),
+            latency: Arc::new(Mutex::new(LatencyWindow::new())),
         })
+    }
+
+    /// Report this detector's runs in `first`'s latency window, not its own.
+    pub fn share_latency_with(&mut self, first: &Detector) {
+        self.latency = Arc::clone(&first.latency);
+    }
+
+    /// [`Backend::sibling`] of the backend this detector runs on.
+    pub fn sibling_backend(&mut self) -> Result<Option<Box<dyn Backend>>> {
+        self.backend.sibling()
     }
 
     pub fn input_name(&self) -> &str {
@@ -268,7 +283,11 @@ impl Detector {
         let name = self.backend.descriptor().name;
         let started = Instant::now();
         let tensors = self.backend.run(input)?;
-        self.latency.record(started.elapsed(), name);
+        let elapsed = started.elapsed();
+        self.latency
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(elapsed, name);
         // Extract every role this profile reads, by the name settled at
         // startup, so a multi-tensor family never depends on output ordering.
         let raw: Outputs<Raw> = match &self.outputs {

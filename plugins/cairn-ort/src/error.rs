@@ -5,7 +5,7 @@
 //! Two blast radii, separated by the reason alone. `config`, `open_stream`,
 //! `decode`, `infer`, `closed`, `poisoned` and `panicked` cost the stream they
 //! were raised on, so the host closes it and opens another. `model_load` and
-//! `model_poisoned` say the shared session is unusable for as long as the engine
+//! `model_poisoned` say the engine's model is unusable for as long as the engine
 //! lives, so the host escalates — a fresh `init/1` behind its canary, or an
 //! operator alert — rather than restart-looping one camera against a model that
 //! cannot serve it.
@@ -34,17 +34,19 @@ pub enum NativeError {
     Infer(String),
     /// `push_au` on a stream `close_stream` already emptied.
     Closed,
-    /// A previous call panicked holding *this stream's* lock and not the
-    /// model's, so its decoder, gate and seeds may be half-updated.
+    /// A previous call panicked holding *this stream's* lock and no model
+    /// slot, so its decoder, gate and seeds may be half-updated.
     Poisoned,
-    /// A previous call panicked inside a model pass, so the shared session is
-    /// unusable for every stream on the engine, permanently. The two poisonings
-    /// call for opposite host actions — reopen one stream, versus stop trusting
-    /// this engine — and only the model lock tells them apart, since `push_au`
-    /// nests stream -> model and a pass that panics poisons both. So a poisoned
-    /// model outranks a poisoned stream on every stream *including the one the
-    /// panic happened on*, which is the case a stream reading only its own lock
-    /// gets backwards (`StreamRef::poisoned_by`).
+    /// A previous call panicked inside a model pass, in any of the engine's
+    /// slots, so the engine is unusable for every stream on it, permanently —
+    /// the other slots included, which are refused rather than run on. The two
+    /// poisonings call for opposite host actions — reopen one stream, versus
+    /// stop trusting this engine — and only the engine's poisoned mark tells
+    /// them apart, since `push_frame` nests stream -> slot and a pass that
+    /// panics poisons both. So a poisoned engine outranks a poisoned stream on
+    /// every stream *including the one the panic happened on*, which is the
+    /// case a stream reading only its own lock gets backwards
+    /// (`StreamRef::poisoned_by`).
     ModelPoisoned,
     /// A panic caught at the NIF boundary ([`crate::guarded`]).
     Panicked(String),
@@ -80,7 +82,7 @@ impl NativeError {
             Self::Closed => "the stream is closed",
             Self::Poisoned => "a previous call panicked while holding this stream's state",
             Self::ModelPoisoned => {
-                "a previous call panicked inside a model pass; this engine's session is unusable"
+                "a previous call panicked inside a model pass; this engine's model is unusable"
             }
         }
     }

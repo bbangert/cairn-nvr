@@ -5,7 +5,7 @@
 //! One blast radius on this side: every reason costs the decoder it was
 //! raised on, and the caller's remedy is reopening. The engine-wide reasons
 //! (`model_load`, `model_poisoned`, `infer`) belong to the inference library
-//! (`cairn-ort`), which owns the shared session — a decode stream never
+//! (`cairn-ort`), which owns the model — a decode stream never
 //! touches a model.
 
 use rustler::types::atom::Atom;

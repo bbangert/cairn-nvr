@@ -9,8 +9,8 @@
 //! is decided where the model is.
 //!
 //! Calls block the caller on a dirty scheduler for one model pass; the crate
-//! doc has measured times. The one shared session is the only admission
-//! control and there is none here: past what it can pass, surplus becomes
+//! doc has measured times. The engine's model slots are the only admission
+//! control and there is none here: past what they can pass, surplus becomes
 //! `push_frame` latency for the host to refuse.
 
 use std::sync::Arc;
@@ -130,9 +130,9 @@ impl Stream {
             .decide(self.motion, frame.motion, self.epoch.as_deref(), now);
         let (objects, inferred, infer_us) = match decision {
             Decision::Detect => {
-                // Started before the call, not after the model lock is taken:
-                // under saturation the wait on the engine's model mutex is
-                // exactly what a caller reading this as latency needs to see.
+                // Started before the call, not after a model slot is taken:
+                // under saturation the wait for a free slot is exactly what a
+                // caller reading this as latency needs to see.
                 let started = Instant::now();
                 let dets = self.engine.detect(input, &self.floors)?;
                 let infer_us = started.elapsed().as_micros() as i64;

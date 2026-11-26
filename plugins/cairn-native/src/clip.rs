@@ -636,8 +636,8 @@ fn a_frame_for_a_different_spec_is_refused_not_projected() {
 }
 
 /// Armed inside the model pass and reached through `push_frame`, so the unwind
-/// goes through the stream lock *and* the model lock — the only shape the frame
-/// path can make, and one a model lock poisoned on its own cannot imitate.
+/// goes through the stream lock *and* a model slot — the only shape the frame
+/// path can make, and one a slot poisoned on its own cannot imitate.
 #[test]
 fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own() {
     let Some(artifacts) = artifacts() else {
@@ -661,7 +661,7 @@ fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own()
     );
     assert!(
         engine.model_is_poisoned(),
-        "the panic did not reach the model lock"
+        "the panic did not poison the engine"
     );
 
     for (name, rig) in [
@@ -782,7 +782,8 @@ fn a_collected_poisoned_stream_hands_its_camera_id_back() {
     drop(reopened);
 }
 
-/// Two streams on one engine contend only on the model pass, so both must finish.
+/// Two streams on one engine contend only for its model slot (the core backends
+/// open one), so both must finish.
 #[test]
 fn two_streams_make_progress_at_once() {
     let Some(artifacts) = artifacts() else {

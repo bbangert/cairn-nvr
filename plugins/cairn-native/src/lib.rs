@@ -37,7 +37,7 @@ use error::{NativeError, Result};
 /// now: a hardware decoder holds GPU surfaces a departed camera should not
 /// keep until the next GC.
 ///
-/// No engine anywhere near this — a decode stream never takes a model lock,
+/// No engine anywhere near this — a decode stream never takes a model slot,
 /// so its poisoned lock only ever names its own fault.
 struct DecoderRef {
     state: Mutex<Option<DecodeStream>>,

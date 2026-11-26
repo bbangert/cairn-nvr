@@ -942,13 +942,7 @@ mod tests {
             "board",
         ])
         .unwrap();
-        let msg = fail(
-            &args,
-            &[Provider {
-                descriptor: &BOARD,
-                open: mislabelled,
-            }],
-        );
+        let msg = fail(&args, &[Provider::new(&BOARD, mislabelled)]);
         assert!(msg.contains("--backend board opened backend ort"), "{msg}");
 
         // Identity, not the name: a copy under the registered name is refused.
@@ -962,13 +956,7 @@ mod tests {
         fn copied(_: &Path, _: &SessionOptions) -> Result<Box<dyn Backend>> {
             Ok(Box::new(Fake(&BOARD_COPY, io(None))))
         }
-        let msg = fail(
-            &args,
-            &[Provider {
-                descriptor: &BOARD,
-                open: copied,
-            }],
-        );
+        let msg = fail(&args, &[Provider::new(&BOARD, copied)]);
         assert!(
             msg.contains("--backend board opened backend board under a descriptor"),
             "{msg}"
@@ -978,10 +966,7 @@ mod tests {
         let args = parse(&["--camera-id", "front", "--udp-port", "17000"]).unwrap();
         let msg = fail(
             &args,
-            &[Provider {
-                descriptor: BackendKind::Ort.descriptor(),
-                open: ort_provider,
-            }],
+            &[Provider::new(BackendKind::Ort.descriptor(), ort_provider)],
         );
         assert!(msg.contains("has no outputs"), "{msg}");
 
@@ -1007,10 +992,9 @@ mod tests {
     /// under that name is refused like any other, by the name it resolved to.
     #[test]
     fn the_embedder_backend_is_core_ort_or_refused() {
-        let provider = Provider {
-            descriptor: BackendKind::Ort.descriptor(),
-            open: |_, _| unreachable!("refused before any open"),
-        };
+        let provider = Provider::new(BackendKind::Ort.descriptor(), |_, _| {
+            unreachable!("refused before any open")
+        });
         let providers = [provider];
         let embedder_on = |name: &str, providers: &[Provider]| {
             infer::embedder_backend(&infer::select(name, providers).unwrap())
