@@ -273,12 +273,14 @@ defmodule Cairn.Native.Host do
   its own, so that a Host inside a native call blocks nothing but this probe.
 
   `closing` is every native close still outstanding, with when it started on
-  `push_frame/5`'s inflight clock.
+  `push_frame/5`'s inflight clock; `open` is every stream not yet asked to close,
+  with its open's token as the inflight rows carry it.
   """
   @spec probe(atom()) :: %{
           engine: term(),
           cpu_baseline_ms: float() | nil,
-          closing: [{String.t(), integer()}]
+          closing: [{String.t(), integer()}],
+          open: [{String.t(), integer()}]
         }
   def probe(server), do: GenServer.call(server, :probe, :infinity)
 
@@ -362,14 +364,21 @@ defmodule Cairn.Native.Host do
   # processes restart independently — every cycle re-reads it. The outstanding
   # closes ride along because they outlive the caller of a hung `push_frame/5`:
   # the pipeline's stall rebuild kills that caller, and its stream's close then
-  # waits on the same call.
+  # waits on the same call. The open streams ride along for the gap between the
+  # two: a caller dead inside a call whose stream nobody has closed yet.
   def handle_call(:probe, _from, state) do
     closing =
       Enum.map(state.closing, fn {camera_id, closing} -> {camera_id, closing.started_at} end)
 
+    open = Enum.map(state.streams, fn {camera_id, stream} -> {camera_id, stream.token} end)
+
     {:reply,
-     %{engine: state.engine_state, cpu_baseline_ms: state.cpu_baseline_ms, closing: closing},
-     state}
+     %{
+       engine: state.engine_state,
+       cpu_baseline_ms: state.cpu_baseline_ms,
+       closing: closing,
+       open: open
+     }, state}
   end
 
   @impl true

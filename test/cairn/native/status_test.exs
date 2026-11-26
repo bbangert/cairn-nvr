@@ -251,6 +251,15 @@ defmodule Cairn.Native.StatusTest do
       end
     end
 
+    test "hung cameras too long to name are counted, and the instruction survives" do
+      ids = ["driveway_north_wide", "garage_side_door", "back_garden_gate"]
+      status = status_map(health: :wedged, stalled: ids, streams: ["cam" | ids])
+
+      detail = Status.payload(status, "cam")["detail"]
+      assert detail =~ "a call into the engine for 3 cameras has not returned"
+      assert detail =~ "the board needs an operator."
+    end
+
     test "a wedge says a restart will not clear it, and saturation says load" do
       wedged = Status.payload(status_map(health: :wedged), "cam")
       saturated = Status.payload(status_map(health: :saturated), "cam")

@@ -617,6 +617,25 @@ defmodule Cairn.Native.HealthTest do
       assert Host.status(host).stalled == [id]
     end
 
+    test "a check between the caller's death and its stream's close is no recovery",
+         %{id: id} do
+      {host, busy, pusher, _call} = hung_beside_traffic(id, health(stall_ms: 300))
+      assert Host.check_health(host) == :idle
+      Process.sleep(350)
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+
+      kill(pusher)
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) == ""
+      assert Host.status(host).stalled == [id]
+
+      :ok = Host.close_stream(host, id)
+      assert_receive {:close_stream, {:stream, ^id}}
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) == ""
+    end
+
     test "a probe that times out does not forget a diagnosed hang", %{id: id} do
       opts = health(stall_ms: 300, probe_timeout_ms: 50)
       {host, busy, pusher, _call} = hung_beside_traffic(id, opts)

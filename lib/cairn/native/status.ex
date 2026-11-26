@@ -250,9 +250,7 @@ defmodule Cairn.Native.Status do
          "the accelerator has stopped retiring work and detection is silent. " <> @wedged_detail}
 
       stalled ->
-        {"wedged",
-         "a call into the engine for #{Enum.join(stalled, ", ")} has not returned; other " <>
-           "cameras may still be detecting. " <> @wedged_detail}
+        {"wedged", stalled_detail(Enum.join(stalled, ", "), length(stalled))}
     end
   end
 
@@ -291,6 +289,20 @@ defmodule Cairn.Native.Status do
   # class, which is what a surface groups and filters on.
   defp term(atom) when is_atom(atom), do: Atom.to_string(atom)
   defp term({class, _message}), do: Atom.to_string(class)
+  # The ids give way before the instruction does: `truncate/1` cuts from the end,
+  # which is where the operator is told what to do.
+  defp stalled_detail(cameras, count) do
+    detail =
+      "a call into the engine for #{cameras} has not returned; other cameras may still be " <>
+        "detecting. " <> @wedged_detail
+
+    cond do
+      byte_size(detail) <= @max_detail_bytes -> detail
+      count == 1 -> stalled_detail("one camera", 0)
+      count > 1 -> stalled_detail("#{count} cameras", 0)
+      true -> detail
+    end
+  end
 
   # The bound is in bytes, as the protocol's is; trimming back to the last whole
   # grapheme is what keeps a cut mid-codepoint — a canary message ending in one —

@@ -284,10 +284,11 @@ defmodule Cairn.Native.Health do
 
     cutoff = now - stall_ms(state) * 1000
 
+    {live, dead} = inflight(state)
+
     # Not window counts: a hung call is outstanding in every window it is stuck in.
     calls =
-      state
-      |> inflight()
+      live
       |> stalled(state.checked_at, cutoff)
       |> Enum.map(fn {_pid, camera_id, _token, started_at} -> {camera_id, started_at} end)
       |> Enum.sort()
@@ -310,6 +311,7 @@ defmodule Cairn.Native.Health do
         (calls ++ closes)
         |> Enum.map(&elem(&1, 0))
         |> Kernel.++(unseen(probe, state))
+        |> Kernel.++(unclosed(dead, probe, state))
         |> Enum.uniq()
         |> Enum.sort(),
       now: now,
@@ -325,6 +327,20 @@ defmodule Cairn.Native.Health do
   # cameras already called stalled stay so until a probe says otherwise.
   defp unseen({:ok, _reply}, _state), do: []
   defp unseen(_no_answer, state), do: state.stalled
+
+  # A diagnosed caller that died inside its call leaves no row, and its stream's
+  # close reaches the Host a moment later. A cycle landing between the two finds
+  # that open still on the probe reply and keeps the camera stalled; the row is
+  # reaped in the same cycle, so this holds for that one cycle and the close is the
+  # evidence from the next.
+  defp unclosed(dead, {:ok, %{open: open}}, state) do
+    for {_pid, camera_id, token, _started_at} <- dead,
+        camera_id in state.stalled,
+        {camera_id, token} in open,
+        do: camera_id
+  end
+
+  defp unclosed(_dead, _no_answer, _state), do: []
 
   defp answer(state, verdict) do
     Enum.each(state.waiting, &GenServer.reply(&1, verdict))
@@ -461,7 +477,8 @@ defmodule Cairn.Native.Health do
   # process from pinning every later window at `:wedged`. Every caller is on
   # this node, so `Process.alive?/1` answers.
   defp inflight(state) do
-    {live, dead} =
+    {_live, dead} =
+      rows =
       state.inflight
       |> :ets.tab2list()
       |> Enum.split_with(fn {pid, _camera_id, _token, _started_at} -> Process.alive?(pid) end)
@@ -474,11 +491,11 @@ defmodule Cairn.Native.Health do
       :ets.delete(state.inflight, pid)
     end)
 
-    live
+    rows
   rescue
     # The table is the Host's and dies with it. A window that lands in that restart
     # has no outstanding calls to read, which is also the truth.
-    ArgumentError -> []
+    ArgumentError -> {[], []}
   end
 
   # A call that went in *during* the window is unfinished, not slow, which keeps a
