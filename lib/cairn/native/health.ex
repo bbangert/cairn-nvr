@@ -292,8 +292,14 @@ defmodule Cairn.Native.Health do
       |> Enum.map(fn {_pid, camera_id, _token, started_at} -> {camera_id, started_at} end)
       |> Enum.sort()
 
+    # A close younger than the bound still counts for a camera the last cycle
+    # called stalled: its caller was killed since, and the close took over as the
+    # evidence of the same call.
     closes =
-      probe |> closing() |> Enum.filter(fn {_camera_id, at} -> at <= cutoff end) |> Enum.sort()
+      probe
+      |> closing()
+      |> Enum.filter(fn {camera_id, at} -> at <= cutoff or camera_id in state.stalled end)
+      |> Enum.sort()
 
     %{
       retired: retired,

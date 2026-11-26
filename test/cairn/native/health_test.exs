@@ -602,6 +602,21 @@ defmodule Cairn.Native.HealthTest do
       assert Host.status(host).closing == [id]
     end
 
+    test "a close younger than the bound keeps a diagnosed hang a wedge", %{id: id} do
+      {host, busy, pusher, _call} = hung_beside_traffic(id, health(stall_ms: 300))
+      assert Host.check_health(host) == :idle
+      Process.sleep(350)
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+
+      # the close starts now, and is nowhere near the bound at the next check
+      rebuild(host, id, pusher)
+      push(host, busy, 10)
+
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) == ""
+      assert Host.status(host).stalled == [id]
+    end
+
     test "an outstanding close says what it is evidence of", %{id: id} do
       {host, busy, pusher, _call} = hung_beside_traffic(id)
       rebuild(host, id, pusher)
