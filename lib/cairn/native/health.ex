@@ -17,21 +17,30 @@ defmodule Cairn.Native.Health do
       nothing cheap in the NIF to call — every entry point is a model load, a
       decoder open/close or inference itself — and ORT/QNN offers no per-call
       deadline of its own, where HailoRT hands ex_nvr a 10 s one free.
-    * **the inflight table**, written by `push_frame/5`'s caller and read here
-      directly. The hot path never reaches the Host, so the probe cannot see it
-      wedge — and a wedged one is *silent*: the sink stops re-demanding, and
-      there is no traffic, no error, no crash. A row older than the window whose
-      caller is still alive is the only signal there is.
+    * **the outstanding calls**: the inflight table, written by `push_frame/5`'s
+      caller and read here directly, and the Host's native closes, carried on the
+      probe reply. The hot path never reaches the Host, so the probe cannot see
+      it wedge — and a wedged call is *silent*: its stream has no traffic, no
+      error, no crash, while the engine's other model slots may go on retiring
+      everyone else's. A live caller inside the NIF past the stall bound is the
+      evidence until the pipeline's own stall watchdog rebuilds the camera and
+      kills it; the stream's close then waits on the same call, and stays
+      outstanding for as long as the call does.
     * **the D-P5 ratio**, per stream, for the accelerator that answers — at CPU
       speed.
 
   ## Healthy, saturated, wedged, idle
 
-  The NIF has no admission control, so once cameras × `sample_fps` passes what one
-  session sustains the surplus is queueing time inside a `push_frame/5` and "healthy
-  but slow" is a real state the ratio check must not call a wedge. Throughput is
-  what separates them: a saturated healthy accelerator still retires work at
-  accelerator rate, and a wedged one cannot beat the CPU it fell back to.
+  The NIF has no admission control, so once cameras × `sample_fps` passes what the
+  engine's model slots sustain the surplus is queueing time inside a `push_frame/5`
+  and "healthy but slow" is a real state the ratio check must not call a wedge.
+  Throughput is what separates them: a saturated healthy accelerator still retires
+  work at accelerator rate, and a wedged one cannot beat the CPU it fell back to.
+
+  The ratio is read per pass even where a backend holds several contexts, though
+  each pass is then slower than one running alone (×1.4–1.7 at two contexts on
+  RK3566). The floor separates an accelerator from its CPU fallback, about 75 ms
+  against 690 there, so the slowdown stays well inside it.
 
   Both are measured on completed model passes alone — a call the motion gate
   skipped never reached the accelerator, and neither did a failed pass.
@@ -76,6 +85,7 @@ defmodule Cairn.Native.Health do
     :p50_ms,
     :baseline_ms,
     waiting: [],
+    stalled: [],
     window: %{},
     completed: 0,
     health: :unknown,
@@ -110,7 +120,12 @@ defmodule Cairn.Native.Health do
     end
   end
 
-  @doc "The last cycle's verdict, readable without this process being involved."
+  @doc """
+  The last cycle's verdict, readable without this process being involved.
+
+  `stalled` names the cameras whose call into the engine has not returned within
+  the stall bound, sorted, and is `[]` otherwise.
+  """
   @spec snapshot(atom()) :: map()
   def snapshot(host \\ Host) do
     case :ets.lookup(name(host), :snapshot) do
@@ -129,7 +144,8 @@ defmodule Cairn.Native.Health do
       stream_fps: %{},
       p50_ms: nil,
       cpu_baseline_ms: nil,
-      inferences: 0
+      inferences: 0,
+      stalled: []
     }
 
   # -- server -----------------------------------------------------------------
@@ -230,17 +246,18 @@ defmodule Cairn.Native.Health do
     Process.cancel_timer(state.cycle.timer)
     state = calibrate(state, probe)
     now = System.monotonic_time(:microsecond)
-    window = window(state, now)
+    window = window(state, now, probe)
     per_stream = Map.new(state.window, fn {id, entry} -> {id, classify(state, entry)} end)
     verdict = verdict(probe, state, window, per_stream)
 
     state
-    |> escalate(verdict, probe, per_stream)
+    |> escalate(verdict, probe, window, per_stream)
     |> Map.merge(%{
       cycle: nil,
       checked_at: now,
       window: %{},
       health: verdict,
+      stalled: window.stalled,
       stream_health: per_stream,
       stream_fps: stream_fps(state.window, window.elapsed_ms),
       p50_ms: window_p50(state)
@@ -259,21 +276,39 @@ defmodule Cairn.Native.Health do
   # `traffic` (passes and failures alike) is whether anything is happening at all;
   # `retired` (completed passes) is whether the accelerator is executing — an error
   # proves the first and never the second.
-  defp window(state, now) do
+  defp window(state, now, probe) do
     {retired, errors} =
       Enum.reduce(state.window, {0, 0}, fn {_id, e}, {retired, errors} ->
         {retired + e.count, errors + e.errors}
       end)
 
+    cutoff = now - stall_ms(state) * 1000
+
+    # Not window counts: a hung call is outstanding in every window it is stuck in.
+    calls =
+      state
+      |> inflight()
+      |> stalled(state.checked_at, cutoff)
+      |> Enum.map(fn {_pid, camera_id, _token, started_at} -> {camera_id, started_at} end)
+      |> Enum.sort()
+
+    closes =
+      probe |> closing() |> Enum.filter(fn {_camera_id, at} -> at <= cutoff end) |> Enum.sort()
+
     %{
       retired: retired,
       traffic: retired + errors,
-      # not a window count: a caller blocked inside the NIF is still registered in
-      # every window it is stuck in
-      stalled: length(stalled(inflight(state), state.checked_at)),
+      calls: calls,
+      closes: closes,
+      stalled: (calls ++ closes) |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.sort(),
+      now: now,
       elapsed_ms: max(div(now - state.checked_at, 1000), 1)
     }
   end
+
+  # A probe that timed out carries none, and is `:wedged` by itself.
+  defp closing({:ok, %{closing: closing}}), do: closing
+  defp closing(_no_answer), do: []
 
   defp answer(state, verdict) do
     Enum.each(state.waiting, &GenServer.reply(&1, verdict))
@@ -294,7 +329,8 @@ defmodule Cairn.Native.Health do
          cpu_baseline_ms: baseline(state),
          # model passes, not `push_frame/5` calls: at 5 fps sampled off a 20 fps
          # camera the two differ by the frame rate
-         inferences: state.completed
+         inferences: state.completed,
+         stalled: state.stalled
        }}
     )
 
@@ -335,14 +371,24 @@ defmodule Cairn.Native.Health do
 
   defp verdict({:ok, _status}, _state, _window, _streams), do: :unknown
 
-  #   * no pass came back -> :idle, unless a call has been in flight since before
-  #     this window, whose own age is evidence of a live caller blocked inside the
-  #     NIF (`stalled/2`) -> :wedged instead.
+  #   * a call into the engine that has not returned within the stall bound — a
+  #     live caller (`stalled/3`) or the close its stream's rebuild left
+  #     outstanding behind it — -> :wedged, whatever the other streams did: with K
+  #     model slots, one hung pass leaves the other K−1 retiring work at
+  #     accelerator rate, and every rule below would call that healthy. It holds
+  #     where `baseline/1` is nil too, where the cond below says :not_applicable:
+  #     a call that does not return is a hung engine on any backend.
+  #   * otherwise no traffic -> :idle.
   #   * a stream with traffic nobody can judge yet -> :unknown, because the
   #     expensive direction is the false page.
   #   * every stream with traffic failing or slow -> the accelerator, unless retired
   #     throughput is still at accelerator rate -> :saturated instead.
-  defp judge(_state, %{traffic: 0, stalled: stalled}, _streams) when stalled > 0, do: :wedged
+  #
+  # A caller merely waiting for a free slot under saturation is inside the NIF too,
+  # but that wait is bounded by the callers ahead of it — seconds at worst, never a
+  # whole window; one still in past the bound is waiting on a pass, or a slot, that
+  # has not come back.
+  defp judge(_state, %{stalled: [_ | _]}, _streams), do: :wedged
   defp judge(_state, %{traffic: 0}, _streams), do: :idle
 
   defp judge(state, window, streams) do
@@ -383,7 +429,7 @@ defmodule Cairn.Native.Health do
   end
 
   # Throughput carries the D-P5 ratio when latency cannot: under saturation the p50 is
-  # queueing time, but the session still retires work at accelerator rate and a
+  # queueing time, but the engine still retires work at accelerator rate and a
   # wedged one cannot.
   #
   # Retired passes only, never `window.traffic`: a failed pass comes back at whatever
@@ -396,7 +442,7 @@ defmodule Cairn.Native.Health do
   end
 
   # Dropping the rows of callers that died mid-call is what keeps one killed camera
-  # process from pinning every later idle window at `:wedged`. Every caller is on
+  # process from pinning every later window at `:wedged`. Every caller is on
   # this node, so `Process.alive?/1` answers.
   defp inflight(state) do
     {live, dead} =
@@ -421,17 +467,20 @@ defmodule Cairn.Native.Health do
 
   # A call that went in *during* the window is unfinished, not slow, which keeps a
   # window that merely ended mid-call from reading as a hang; a real hang is still
-  # there for the next one. Both clocks are microseconds because at millisecond
-  # resolution a call entered in the tick the window opened in never becomes stalled.
-  defp stalled(inflight, window_start) do
+  # there for the next one. That alone is not enough, because an on-demand
+  # `check/2` just after a poll opens a window of any length, so the call must also
+  # have been in for the stall bound (`cutoff`). Both clocks are microseconds
+  # because at millisecond resolution a call entered in the tick the window opened
+  # in never becomes stalled.
+  defp stalled(inflight, window_start, cutoff) do
     Enum.filter(inflight, fn {_pid, _camera_id, _token, started_at} ->
-      started_at < window_start
+      started_at < window_start and started_at <= cutoff
     end)
   end
 
-  defp escalate(%{health: :wedged} = state, :wedged, _probe, _streams), do: state
+  defp escalate(%{health: :wedged} = state, :wedged, _probe, _window, _streams), do: state
 
-  defp escalate(state, :wedged, :timeout, _streams) do
+  defp escalate(state, :wedged, :timeout, _window, _streams) do
     Logger.error(
       "cairn-native: NPU health check FAILED — #{inspect(state.host)} did not answer a " <>
         "#{opt(state, :probe_timeout_ms, @probe_timeout_ms)} ms probe, so it is inside a native " <>
@@ -441,7 +490,20 @@ defmodule Cairn.Native.Health do
     state
   end
 
-  defp escalate(state, :wedged, _probe, streams) do
+  defp escalate(state, :wedged, _probe, %{stalled: [_ | _]} = window, _streams) do
+    others =
+      if window.retired > 0,
+        do: "while other streams still retired #{window.retired} passes in this window. ",
+        else: "and the engine retired nothing in this window. "
+
+    Logger.error(
+      "cairn-native: NPU health check FAILED — " <> hung(window) <> ", " <> others <> @no_restart
+    )
+
+    state
+  end
+
+  defp escalate(state, :wedged, _probe, _window, streams) do
     Logger.error(
       "cairn-native: NPU health check FAILED — every stream with traffic is failing, or is " <>
         "under the #{min_ratio(state)}× D-P5 floor against a #{baseline(state)} ms CPU " <>
@@ -452,12 +514,41 @@ defmodule Cairn.Native.Health do
     state
   end
 
-  defp escalate(%{health: :wedged} = state, verdict, _probe, _streams) do
+  defp escalate(%{health: :wedged} = state, verdict, _probe, _window, _streams) do
     Logger.warning("cairn-native: NPU health recovered to #{verdict}")
     state
   end
 
-  defp escalate(state, _verdict, _probe, _streams), do: state
+  defp escalate(state, _verdict, _probe, _window, _streams), do: state
+
+  # A camera with a live caller is named for the call alone: its close, if any, is
+  # waiting on that same call.
+  defp hung(%{calls: calls, closes: closes, now: now}) do
+    called = Enum.map(calls, &elem(&1, 0))
+    closes = Enum.reject(closes, fn {camera_id, _at} -> camera_id in called end)
+
+    [
+      calls != [] &&
+        "the push_frame/5 #{plural(calls, "call", "calls")} for #{names(calls)} " <>
+          "#{plural(calls, "has", "have")} been inside the NIF for #{age_s(calls, now)} s",
+      closes != [] &&
+        "the native close of #{names(closes)} has not landed in #{age_s(closes, now)} s, " <>
+          "so a call into the engine on #{plural(closes, "that stream", "those streams")} " <>
+          "has not returned"
+    ]
+    |> Enum.filter(& &1)
+    |> Enum.join("; ")
+  end
+
+  defp names(entries), do: entries |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.join(", ")
+
+  defp plural([_one], one, _many), do: one
+  defp plural(_entries, _one, many), do: many
+
+  # the oldest of them
+  defp age_s(entries, now) do
+    div(now - (entries |> Enum.map(&elem(&1, 1)) |> Enum.min()), 1_000_000)
+  end
 
   # Completed model passes per second, per camera — what `Cairn.Native.Status`
   # publishes as `fps`, measured over the window that has just closed rather
@@ -483,6 +574,11 @@ defmodule Cairn.Native.Health do
   # otherwise it is whatever the Host's last probe reply reported.
   defp baseline(state), do: opt(state, :cpu_baseline_ms, state.baseline_ms)
   defp min_ratio(state), do: opt(state, :min_ratio, @min_ratio)
+
+  # How long a call may stay inside the NIF, or a close stay outstanding, before
+  # either is a hang: one poll interval, which no wait for a free slot comes near.
+  # Its own opt so a suite can shorten it without shortening the poll.
+  defp stall_ms(state), do: opt(state, :stall_ms, opt(state, :interval_ms, @interval_ms))
 
   defp opt(state, key, default), do: Keyword.get(state.opts, key, default)
 end

@@ -25,6 +25,28 @@ defmodule Cairn.Native.HealthTest do
     :persistent_term.put(@control, Map.merge(:persistent_term.get(@control, %{}), attrs))
   end
 
+  # Unlinked, so a test can kill it the way a pipeline rebuild kills a camera, and
+  # killed at exit so that no call a test left hanging outlives it.
+  defp spawn_pusher(host, id) do
+    pusher = spawn(fn -> NativeStub.host_push(host, id) end)
+    on_exit(fn -> Process.exit(pusher, :kill) end)
+    pusher
+  end
+
+  defp kill(pid) do
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition never held")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
+  end
+
   # The monitor is a sibling of the host, not a child: the two are started
   # separately here because that is how the supervisor starts them.
   defp start_host(opts) do
@@ -47,7 +69,15 @@ defmodule Cairn.Native.HealthTest do
 
   describe "health check" do
     defp health(extra \\ []) do
-      [health: Keyword.merge([cpu_baseline_ms: 45.0, min_ratio: 3.0, min_samples: 3], extra)]
+      # `stall_ms: 0` leaves a hang to the window rule alone: the bound has a test of
+      # its own
+      [
+        health:
+          Keyword.merge(
+            [cpu_baseline_ms: 45.0, min_ratio: 3.0, min_samples: 3, stall_ms: 0],
+            extra
+          )
+      ]
     end
 
     defp push(host, id, count) do
@@ -168,7 +198,7 @@ defmodule Cairn.Native.HealthTest do
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
       {:ok, _epoch} = Host.open_stream(host, gated, %{})
-      spawn(fn -> NativeStub.host_push(host, id) end)
+      spawn_pusher(host, id)
       assert_receive :entered, 1_000
 
       assert Host.check_health(host) == :idle
@@ -355,7 +385,7 @@ defmodule Cairn.Native.HealthTest do
 
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
-      spawn(fn -> NativeStub.host_push(host, id) end)
+      spawn_pusher(host, id)
       assert_receive :entered, 1_000
 
       # the window the call was submitted in cannot tell a hang from a window
@@ -363,6 +393,262 @@ defmodule Cairn.Native.HealthTest do
       # the call still outstanding, can
       assert Host.check_health(host) == :idle
       assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+    end
+
+    # What a hung `push_frame/5` is inside the NIF: it holds its stream's lock, so
+    # both the call and a close of that stream return only when `call` is
+    # released, and killing the caller releases neither — the native call runs on
+    # without it.
+    defp native_call do
+      call = spawn(fn -> receive(do: (:release -> :ok)) end)
+      on_exit(fn -> Process.exit(call, :kill) end)
+      call
+    end
+
+    defp until_returned(call) do
+      ref = Process.monitor(call)
+      receive(do: ({:DOWN, ^ref, :process, _pid, _reason} -> :ok))
+    end
+
+    # The cameras in `hung` hang on `call`; every other stream gets the stub's
+    # instant pass, which is what the engine's remaining model slots look like.
+    defp hang(hung, call) do
+      caller = self()
+
+      control(%{
+        push_frame: fn {:stream, id}, _payload, _meta, _time_base ->
+          if id in hung do
+            send(caller, {:entered, id})
+            until_returned(call)
+          end
+
+          {:ok, {[NativeStub.frame()], []}}
+        end,
+        close_stream: fn {:stream, id} ->
+          if id in hung, do: until_returned(call)
+          {:ok, true}
+        end
+      })
+    end
+
+    defp hung_beside_traffic(id, opts \\ health()) do
+      busy = id <> "_busy"
+      call = native_call()
+      hang([id], call)
+      host = start_host(opts)
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      {:ok, _epoch} = Host.open_stream(host, busy, %{})
+      pusher = spawn_pusher(host, id)
+      assert_receive {:entered, ^id}, 1_000
+      {host, busy, pusher, call}
+    end
+
+    # What `Cairn.PipelineOwner`'s stall rebuild does to a camera whose detect
+    # branch went quiet: its processes die, the caller among them, and the
+    # element's resource guard closes its stream.
+    defp rebuild(host, id, pusher) do
+      kill(pusher)
+      :ok = Host.close_stream(host, id)
+      assert_receive {:close_stream, {:stream, ^id}}
+    end
+
+    test "a hung call is a wedge while other streams still retire work", %{id: id} do
+      {host, busy, _pusher, _call} = hung_beside_traffic(id)
+      # the window the call went in during cannot call it a hang yet
+      assert Host.check_health(host) == :idle
+
+      push(host, busy, 10)
+
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+      assert Host.status(host).stream_health == %{busy => :ok}
+      assert Host.status(host).stalled == [id]
+    end
+
+    test "a call that went in during the window is not a hang", %{id: id} do
+      busy = id <> "_busy"
+      hang([id], native_call())
+      host = start_host(health())
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      {:ok, _epoch} = Host.open_stream(host, busy, %{})
+
+      Host.check_health(host)
+      spawn_pusher(host, id)
+      assert_receive {:entered, ^id}, 1_000
+      push(host, busy, 10)
+
+      assert capture_log(fn -> assert Host.check_health(host) == :healthy end) == ""
+    end
+
+    test "a call in flight across two back-to-back checks is not a hang until the bound",
+         %{id: id} do
+      {host, busy, _pusher, _call} = hung_beside_traffic(id, health(stall_ms: 500))
+      assert Host.check_health(host) == :idle
+
+      # An on-demand check right after another opens a window of a few
+      # milliseconds; the call predates it, and is no older than that.
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :healthy end) == ""
+
+      Process.sleep(600)
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+    end
+
+    test "a stalled row whose caller died does not outvote other traffic", %{id: id} do
+      {host, busy, pusher, _call} = hung_beside_traffic(id)
+      assert Host.check_health(host) == :idle
+
+      kill(pusher)
+      push(host, busy, 10)
+
+      assert capture_log(fn -> assert Host.check_health(host) == :healthy end) == ""
+    end
+
+    test "a hung call's alert names the camera, not the D-P5 floor", %{id: id} do
+      {host, busy, _pusher, _call} = hung_beside_traffic(id)
+      assert Host.check_health(host) == :idle
+      push(host, busy, 10)
+
+      log = capture_log(fn -> assert Host.check_health(host) == :wedged end)
+      assert log =~ "push_frame/5 call for #{id} has been inside the NIF for"
+      assert log =~ "other streams still retired 10 passes"
+      assert log =~ "will not restart itself"
+      refute log =~ "every stream with traffic"
+      refute log =~ busy
+    end
+
+    test "a hung call with no other traffic says the engine retired nothing", %{id: id} do
+      hang([id], native_call())
+      host = start_host(health())
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      spawn_pusher(host, id)
+      assert_receive {:entered, ^id}, 1_000
+      assert Host.check_health(host) == :idle
+
+      log = capture_log(fn -> assert Host.check_health(host) == :wedged end)
+      assert log =~ "push_frame/5 call for #{id} has been inside the NIF"
+      assert log =~ "and the engine retired nothing in this window"
+    end
+
+    test "a hung call alerts once, however many windows it stays hung", %{id: id} do
+      {host, busy, _pusher, _call} = hung_beside_traffic(id)
+      assert Host.check_health(host) == :idle
+
+      log =
+        capture_log(fn ->
+          for _window <- 1..3 do
+            push(host, busy, 10)
+            assert Host.check_health(host) == :wedged
+          end
+        end)
+
+      assert length(String.split(log, "FAILED")) == 2
+      refute log =~ "recovered"
+    end
+
+    test "two hung calls are one alert naming both cameras", %{id: id} do
+      a = id <> "_a"
+      b = id <> "_b"
+      busy = id <> "_busy"
+      hang([a, b], native_call())
+      host = start_host(health())
+      Enum.each([a, b, busy], &({:ok, _epoch} = Host.open_stream(host, &1, %{})))
+      spawn_pusher(host, b)
+      spawn_pusher(host, a)
+      assert_receive {:entered, ^a}, 1_000
+      assert_receive {:entered, ^b}, 1_000
+      assert Host.check_health(host) == :idle
+
+      push(host, busy, 10)
+      log = capture_log(fn -> assert Host.check_health(host) == :wedged end)
+      assert log =~ "push_frame/5 calls for #{a}, #{b} have been inside the NIF"
+      assert length(String.split(log, "FAILED")) == 2
+      assert Host.status(host).stalled == [a, b]
+    end
+
+    # The baseline is nil, so the ratio rules would say :not_applicable — but a
+    # call that does not return is a hung engine on any backend.
+    test "a hung call is a wedge on a CPU backend too", %{id: id} do
+      opts = [config: %{model: "m.onnx", backend: "ort"}, health: [min_samples: 3, stall_ms: 0]]
+      {host, busy, _pusher, _call} = hung_beside_traffic(id, opts)
+      assert Host.check_health(host) == :idle
+
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+      assert Host.status(host).cpu_baseline_ms == nil
+    end
+
+    test "a hung call stays a wedge after the stall rebuild kills its caller", %{id: id} do
+      {host, busy, pusher, _call} = hung_beside_traffic(id)
+      assert Host.check_health(host) == :idle
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+
+      # The caller is gone and its row reaped, but the close waits on the same
+      # call: the hang has not ended, and neither a new alert nor a recovery is
+      # true.
+      rebuild(host, id, pusher)
+
+      log =
+        capture_log(fn ->
+          for _window <- 1..2 do
+            push(host, busy, 10)
+            assert Host.check_health(host) == :wedged
+          end
+        end)
+
+      assert log == ""
+      assert Host.status(host).stalled == [id]
+      assert Host.status(host).closing == [id]
+    end
+
+    test "an outstanding close says what it is evidence of", %{id: id} do
+      {host, busy, pusher, _call} = hung_beside_traffic(id)
+      rebuild(host, id, pusher)
+      push(host, busy, 10)
+
+      log = capture_log(fn -> assert Host.check_health(host) == :wedged end)
+      assert log =~ "the native close of #{id} has not landed in"
+      assert log =~ "so a call into the engine on that stream has not returned"
+      assert log =~ "other streams still retired 10 passes"
+      refute log =~ "push_frame/5 call"
+    end
+
+    test "a camera whose call and close are both outstanding is named once", %{id: id} do
+      {host, _busy, _pusher, _call} = hung_beside_traffic(id, health(stall_ms: 300))
+      # closed with its caller still alive and inside the call
+      :ok = Host.close_stream(host, id)
+      assert_receive {:close_stream, {:stream, ^id}}
+      assert Host.check_health(host) == :idle
+
+      # both past the bound in the same window
+      Process.sleep(350)
+
+      log = capture_log(fn -> assert Host.check_health(host) == :wedged end)
+      assert log =~ "push_frame/5 call for #{id}"
+      refute log =~ "native close"
+    end
+
+    test "the hung call returning lands its close and recovers once", %{id: id} do
+      {host, busy, pusher, call} = hung_beside_traffic(id)
+      assert Host.check_health(host) == :idle
+      push(host, busy, 10)
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+      rebuild(host, id, pusher)
+
+      send(call, :release)
+      eventually(fn -> Host.status(host).closing == [] end)
+
+      log =
+        capture_log(fn ->
+          for _window <- 1..2 do
+            push(host, busy, 10)
+            assert Host.check_health(host) == :healthy
+          end
+        end)
+
+      assert length(String.split(log, "recovered")) == 2
+      assert Host.status(host).stalled == []
     end
 
     test "a caller killed mid-call is not a wedge, and does not become one", %{id: id} do
@@ -377,7 +663,7 @@ defmodule Cairn.Native.HealthTest do
 
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
-      pusher = spawn(fn -> NativeStub.host_push(host, id) end)
+      pusher = spawn_pusher(host, id)
       assert_receive :entered, 1_000
 
       # the shape the wedge above is read off — submitted, never completed —
@@ -509,6 +795,7 @@ defmodule Cairn.Native.HealthTest do
       host = start_host(health(probe_timeout_ms: 50))
       spawn(fn -> Host.open_stream(host, id, %{}) end)
       assert_receive {:opening, blocked}
+      on_exit(fn -> send(blocked, :release) end)
       # the host's own process, inside the NIF: every call to it now queues behind
       # this one, which is where the health check used to be
       assert blocked == Process.whereis(host)
@@ -550,7 +837,7 @@ defmodule Cairn.Native.HealthTest do
         end
       })
 
-      spawn(fn -> NativeStub.host_push(host, id) end)
+      spawn_pusher(host, id)
       assert_receive :entered, 1_000
 
       # A wedged push is as silent as that: no error, no crash, no counter moving,

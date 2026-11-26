@@ -84,7 +84,7 @@ ort-load-dynamic = ["cairn-detect/ort-load-dynamic", "cairn-ort/ort-load-dynamic
 - **Build with `--features ort-load-dynamic`.** The base image's ONNX Runtime is loaded at startup from `ORT_DYLIB_PATH`; without the feature the crate links a runtime of its own, downloaded at build time.
 - **FFmpeg 7.1 development files at build time.** `cairn-detect` binds FFmpeg 7.1 through `rsmpeg`. Core's own `.cargo/config.toml` files, which point its builds at one, are not read when its crates are dependencies, so the board's build supplies the headers and `pkg-config` path itself.
 
-A board that brings a backend registers it from its crate as a `Descriptor` and a `Provider`; see [architecture.md § Adding a board](architecture.md#adding-a-board).
+A board that brings a backend registers it from its crate as a `Descriptor` and a `Provider` built with `Provider::new` (the struct is `#[non_exhaustive]`, so a literal does not compile), with `with_contexts` if the engine should hold more than one context of the model; see [architecture.md § Adding a board](architecture.md#adding-a-board).
 
 ## Writing the board directory
 

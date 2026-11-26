@@ -127,7 +127,7 @@ criterion live there and in
   `rknn`), and `Cairn.Native.Health` reads the live pass latency against it. A backend
   it cannot measure is left unjudged rather than guessed at. Both sides of
   that ratio rise with load: the latency `Health` reads includes the wait
-  for the shared model lock, and a baseline taken while streams are starting
+  for a free slot of the engine's model, and a baseline taken while streams are starting
   reads slower than one taken on an idle board.
 - **Measured, phase-2 proof runs (2026-08-07, board .87, yolox_nano
   full-QDQ 416, real RTP feed + software decode)**: CPU EP p50 44.5 ms;

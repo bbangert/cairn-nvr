@@ -339,7 +339,9 @@ defmodule Cairn.Native.HostTest do
 
     test "a close that blocks in the crate leaves the host answering", %{id: id} do
       control(%{close_stream: blocking_close(self())})
-      host = start_host(health: [interval_ms: 25])
+      # a stall bound past the test's end: an outstanding close older than it is
+      # read as a hung call, which is not what this test is about
+      host = start_host(health: [interval_ms: 25, stall_ms: 60_000])
 
       {:ok, _epoch} = Host.open_stream(host, id, %{})
       assert Host.close_stream(host, id) == :ok

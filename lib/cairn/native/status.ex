@@ -240,9 +240,20 @@ defmodule Cairn.Native.Status do
       "recording is unaffected"
   end
 
-  defp accelerator(%{health: :wedged}) do
-    {"wedged",
-     "the accelerator has stopped retiring work and detection is silent. " <> @wedged_detail}
+  # Every camera's tile shows this, so a hang one camera's call is in names that
+  # camera rather than calling the whole node silent: with more than one model
+  # slot the others may still be retiring passes. `Map.get` as in `headline/2`.
+  defp accelerator(%{health: :wedged} = status) do
+    case Map.get(status, :stalled, []) do
+      [] ->
+        {"wedged",
+         "the accelerator has stopped retiring work and detection is silent. " <> @wedged_detail}
+
+      stalled ->
+        {"wedged",
+         "a call into the engine for #{Enum.join(stalled, ", ")} has not returned; other " <>
+           "cameras may still be detecting. " <> @wedged_detail}
+    end
   end
 
   defp accelerator(%{health: :saturated}), do: {"saturated", @saturated_detail}

@@ -194,7 +194,7 @@ defmodule Cairn.Native.Host do
   the model.
 
   Blocks the caller for the model pass — and, under saturation, for as long as
-  the streams ahead of it hold the model session too. `meta` is
+  the streams ahead of it hold every slot of the model too. `meta` is
   `t:CairnOrt.frame_meta/0`.
 
   The frames come back in the crate's own spelling; `Cairn.Native.Observations`
@@ -271,8 +271,15 @@ defmodule Cairn.Native.Host do
 
   No deadline here: the caller is a throwaway task `Cairn.Native.Health` kills at
   its own, so that a Host inside a native call blocks nothing but this probe.
+
+  `closing` is every native close still outstanding, with when it started on
+  `push_frame/5`'s inflight clock.
   """
-  @spec probe(atom()) :: %{engine: term()}
+  @spec probe(atom()) :: %{
+          engine: term(),
+          cpu_baseline_ms: float() | nil,
+          closing: [{String.t(), integer()}]
+        }
   def probe(server), do: GenServer.call(server, :probe, :infinity)
 
   # -- server -----------------------------------------------------------------
@@ -352,9 +359,17 @@ defmodule Cairn.Native.Host do
   # Answered from the mailbox on purpose: it is the queue the synchronous native
   # calls above are in, so a reply is evidence that they are coming back. The
   # baseline rides along because the monitor cannot judge without it and the two
-  # processes restart independently — every cycle re-reads it.
+  # processes restart independently — every cycle re-reads it. The outstanding
+  # closes ride along because they outlive the caller of a hung `push_frame/5`:
+  # the pipeline's stall rebuild kills that caller, and its stream's close then
+  # waits on the same call.
   def handle_call(:probe, _from, state) do
-    {:reply, %{engine: state.engine_state, cpu_baseline_ms: state.cpu_baseline_ms}, state}
+    closing =
+      Enum.map(state.closing, fn {camera_id, closing} -> {camera_id, closing.started_at} end)
+
+    {:reply,
+     %{engine: state.engine_state, cpu_baseline_ms: state.cpu_baseline_ms, closing: closing},
+     state}
   end
 
   @impl true
@@ -780,8 +795,7 @@ defmodule Cairn.Native.Host do
 
   defp still_closing(camera_id) do
     "#{camera_id}'s native close has not returned, and the crate holds its camera id until " <>
-      "it does — either a push is wedged inside the NIF or a decoder teardown is still in " <>
-      "the driver"
+      "it does — the close waits for a push_frame/5 on that stream that is still inside the NIF"
   end
 
   defp do_open_stream(%{engine_state: :ready} = state, camera_id, params) do
@@ -939,7 +953,9 @@ defmodule Cairn.Native.Host do
 
         case close_natively(state, camera_id, stream) do
           {:ok, ref} ->
-            %{state | closing: Map.put(state.closing, camera_id, %{ref: ref, parked: nil})}
+            # the inflight rows' clock, so the monitor ages both alike
+            closing = %{ref: ref, parked: nil, started_at: System.monotonic_time(:microsecond)}
+            %{state | closing: Map.put(state.closing, camera_id, closing)}
 
           :error ->
             state
@@ -1046,9 +1062,11 @@ defmodule Cairn.Native.Host do
   end
 
   # A row rather than a submitted-minus-completed count: one caller killed mid-call
-  # would inflate such a count forever and pin every later idle window at `:wedged`.
+  # would inflate such a count forever and pin every later window at `:wedged`.
   # A row can be told from a live caller's, and it carries when the call went in,
-  # which is what makes a hang evidence on its own (`Cairn.Native.Health.stalled/2`).
+  # which is what makes a hang evidence on its own while its caller lives
+  # (`Cairn.Native.Health.stalled/3`); the stream's outstanding close carries it
+  # once the caller is gone.
   defp enter(stream, camera_id, started) do
     :ets.insert(stream.inflight, {self(), camera_id, stream.token, started})
     :ok
