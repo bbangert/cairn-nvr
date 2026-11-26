@@ -1,6 +1,7 @@
 //! The open model, and the per-frame path from a packed tensor to detections.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -39,7 +40,11 @@ pub struct Detector {
     /// `--allow-label-mismatch`, carried because a deferred layout only
     /// settles `nc` on the first real output — see [`check_label_count`].
     allow_label_mismatch: bool,
-    latency: LatencyWindow,
+    /// Shared by every detector `cairn-ort`'s engine holds on one model
+    /// ([`Detector::share_latency_with`]): the line is the engine's per-run
+    /// cost, and one window per slot would print K lines each over a share of
+    /// the runs. Its lock is a leaf: nothing is taken under it.
+    latency: Arc<Mutex<LatencyWindow>>,
 }
 
 /// Rolling window over raw inference latency, reported to stderr once per
@@ -196,8 +201,18 @@ impl Detector {
             input_size_source,
             output,
             allow_label_mismatch,
-            latency: LatencyWindow::new(),
+            latency: Arc::new(Mutex::new(LatencyWindow::new())),
         })
+    }
+
+    /// Report this detector's runs in `first`'s latency window, not its own.
+    pub fn share_latency_with(&mut self, first: &Detector) {
+        self.latency = Arc::clone(&first.latency);
+    }
+
+    /// [`Backend::sibling`] of the backend this detector runs on.
+    pub fn sibling_backend(&mut self) -> Result<Option<Box<dyn Backend>>> {
+        self.backend.sibling()
     }
 
     pub fn input_name(&self) -> &str {
@@ -268,7 +283,11 @@ impl Detector {
         let name = self.backend.descriptor().name;
         let started = Instant::now();
         let tensors = self.backend.run(input)?;
-        self.latency.record(started.elapsed(), name);
+        let elapsed = started.elapsed();
+        self.latency
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(elapsed, name);
         // Extract every role this profile reads, by the name settled at
         // startup, so a multi-tensor family never depends on output ordering.
         let raw: Outputs<Raw> = match &self.outputs {
@@ -546,6 +565,71 @@ mod tests {
             assert!(dets.is_empty());
             assert_eq!(*seen.lock().unwrap(), [(shape, layout)]);
         }
+    }
+
+    /// Two detectors on one window report as one engine: their runs add up
+    /// to one total and the window resets at their combined boundary.
+    #[test]
+    fn detectors_sharing_a_window_report_their_runs_together() {
+        use super::super::geometry::ResizePolicy;
+
+        let labels = Labels::load(None).unwrap();
+        let open = || {
+            let backend = FakeBackend {
+                io: ModelIo {
+                    input_name: "images".to_string(),
+                    declared_input_size: Some(InputSize { w: 96, h: 64 }),
+                    declared_input_batch: Some(1),
+                    outputs: vec![Declared {
+                        name: "output".to_string(),
+                        dims: Some(vec![1, 126, 85]),
+                    }],
+                    input_element: InputElement::F32,
+                    u8_outputs: Vec::new(),
+                    input_layout: TensorLayout::Nchw,
+                },
+                output: vec![0.0; 126 * 85],
+                seen: Seen::default(),
+            };
+            let opened = Detector::with_backend(
+                Box::new(backend),
+                Path::new("m.fake"),
+                None,
+                None,
+                &labels,
+                false,
+                None,
+            );
+            match opened {
+                Ok(detector) => detector,
+                Err(err) => panic!("{err:#}"),
+            }
+        };
+        let (mut first, mut second) = (open(), open());
+        second.share_latency_with(&first);
+
+        let spec = first.input_spec();
+        let projection = ResizePolicy::Stretch.project(spec.size, spec.size);
+        let floors = ScoreFloors::parse("{}").unwrap();
+        let run = |detector: &mut Detector, times: usize| {
+            for _ in 0..times {
+                let tensor = TensorValues::F32(vec![0.0; spec.size.tensor_len()]);
+                detector
+                    .detect(tensor, projection, &labels, &floors)
+                    .unwrap();
+            }
+        };
+        let seen = |detector: &Detector| {
+            let window = detector.latency.lock().unwrap();
+            (window.window.len(), window.total_runs)
+        };
+
+        run(&mut first, 60);
+        run(&mut second, 39);
+        assert_eq!(seen(&first), (99, 99));
+        run(&mut second, 1);
+        assert_eq!(seen(&first), (0, 100));
+        assert_eq!(seen(&second), (0, 100));
     }
 
     /// A pixel-byte backend's spec carries the encoding's identity qparams,

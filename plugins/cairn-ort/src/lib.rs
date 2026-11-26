@@ -23,9 +23,9 @@
 //!
 //! Calls block the caller on a dirty scheduler for one model pass: about 12 ms
 //! for yolox_nano on QCS6490's HTP, around 50 ms for yolox_tiny at 416 on a
-//! slower NPU. The one shared session is the only admission control and there
-//! is none here: past what it can pass, surplus becomes `push_frame` latency
-//! for the host to refuse.
+//! slower NPU, plus any wait for a free slot of the engine's model. Those
+//! slots are the only admission control and there is none here: past what
+//! they can pass, surplus becomes `push_frame` latency for the host to refuse.
 
 mod config;
 mod engine;
@@ -119,7 +119,7 @@ impl StreamRef {
     }
 
     /// Which fault a poisoned stream lock is reporting: see
-    /// [`NativeError::ModelPoisoned`] for why the model lock outranks it.
+    /// [`NativeError::ModelPoisoned`] for why a poisoned engine outranks it.
     fn poisoned_by(&self) -> NativeError {
         if self.engine.model_is_poisoned() {
             NativeError::ModelPoisoned
@@ -129,7 +129,7 @@ impl StreamRef {
     }
 
     /// Poison this stream's lock the way a gate or packing panic does: under
-    /// this lock, never taking the model's.
+    /// this lock, never taking a model slot.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn poison_state(&self) {
         let panicked = catch_unwind(AssertUnwindSafe(|| {

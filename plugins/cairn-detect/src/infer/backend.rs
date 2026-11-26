@@ -164,9 +164,36 @@ impl fmt::Display for Capabilities {
 /// named `ort` or `qnn` replaces that backend: the detector opens on the
 /// provider, and an embedder, which opens only on this crate's backends, is
 /// refused beside it ([`embedder_backend`](super::embedder_backend)).
+///
+/// `#[non_exhaustive]` so a field added here is not a compile break for a
+/// board crate outside this repository: it builds one with [`Provider::new`].
+#[non_exhaustive]
 pub struct Provider {
     pub descriptor: &'static Descriptor,
     pub open: fn(&Path, &SessionOptions) -> Result<Box<dyn Backend>>,
+    /// How many copies of the model `cairn-ort`'s engine holds, so that passes
+    /// from different cameras can run at once: each is a full backend, made
+    /// with [`Backend::sibling`] from the first where the backend can, else by
+    /// `open` again. Zero is refused at the engine's open. The binary opens
+    /// one whatever this says: it serves one camera.
+    pub contexts: usize,
+}
+
+impl Provider {
+    pub const fn new(
+        descriptor: &'static Descriptor,
+        open: fn(&Path, &SessionOptions) -> Result<Box<dyn Backend>>,
+    ) -> Self {
+        Self {
+            descriptor,
+            open,
+            contexts: 1,
+        }
+    }
+
+    pub const fn with_contexts(self, contexts: usize) -> Self {
+        Self { contexts, ..self }
+    }
 }
 
 /// What a backend name resolved to.
@@ -373,10 +400,11 @@ impl InputTensor {
 /// exactly that way.
 ///
 /// **`Send`, not `Sync`.** A detector moves between threads: `run_single` in
-/// `cli.rs` hands it to a spawned inference thread, and `cairn-ort` keeps one
-/// behind a mutex that NIF calls take from whichever scheduler thread runs
-/// them. Nothing calls one backend from two threads at once, so it never has
-/// to be `Sync`.
+/// `cli.rs` hands it to a spawned inference thread, and `cairn-ort` keeps each
+/// of its engine's slots behind a mutex that NIF calls take from whichever
+/// scheduler thread runs them. Two slots run at once only on two backends, so
+/// nothing calls one backend from two threads at once and it never has to be
+/// `Sync`.
 pub trait Backend: Send {
     /// Load `model` and settle everything [`ModelIo`] reports.
     ///
@@ -400,6 +428,21 @@ pub trait Backend: Send {
     /// Infer one frame. The returned tensors borrow this backend until they are
     /// dropped, which is what keeps a run from copying every output.
     fn run(&mut self, input: InputTensor) -> Result<Box<dyn Tensors + '_>>;
+
+    /// Another backend on the model this one opened, sharing what the runtime
+    /// lets two contexts share (weights), for one more [`Provider::contexts`]
+    /// slot. `Ok(None)` — the default — means the runtime cannot, and the slot
+    /// is opened from the file again. A method rather than a [`Provider`]
+    /// field so the board's code holds its own type, not a `dyn Backend` it
+    /// would have to downcast.
+    ///
+    /// The sibling must report the same [`ModelIo`]: the engine opens a
+    /// detector on it like any backend and refuses one whose resolved input
+    /// or profile differs from this one's. `cairn-ort` drops every sibling
+    /// before the backend it was made from.
+    fn sibling(&mut self) -> Result<Option<Box<dyn Backend>>> {
+        Ok(None)
+    }
 }
 
 /// One run's output tensors, still owned by the backend that produced them.
@@ -415,10 +458,7 @@ mod tests {
     use super::*;
 
     fn provider(descriptor: &'static Descriptor) -> Provider {
-        Provider {
-            descriptor,
-            open: |_, _| unreachable!("select never opens"),
-        }
+        Provider::new(descriptor, |_, _| unreachable!("select never opens"))
     }
 
     static BOARD: Descriptor = Descriptor {
@@ -434,6 +474,12 @@ mod tests {
         name: "ort",
         capabilities: ORT.capabilities,
     };
+
+    #[test]
+    fn a_provider_holds_one_context_unless_it_asks_for_more() {
+        assert_eq!(provider(&BOARD).contexts, 1);
+        assert_eq!(provider(&BOARD).with_contexts(3).contexts, 3);
+    }
 
     #[test]
     fn select_answers_a_provider_first_then_the_core_names() {
