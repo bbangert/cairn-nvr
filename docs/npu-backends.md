@@ -121,9 +121,10 @@ criterion live there and in
   enforces. The stage library's own surface for that check is the
   `infer latency: backend=… p50=… p95=…` stderr line `Detector::detect`
   emits every 100 runs. The in-VM host runs the same check unattended:
-  `Cairn.Native.Host` measures the CPU pass once per engine load, in a
-  subprocess (`--cpu-baseline` on the same model, or on the profile's FP32
-  ONNX twin where the CPU cannot run the artifact — cairn-rockchip's
+  `Cairn.Native.Host` measures the CPU pass once per engine load (and again
+  when a fetched twin lands), in a subprocess (`--cpu-baseline` on the same
+  model, or on the profile's FP32 ONNX twin where the CPU cannot run the
+  artifact — cairn-rockchip's
   `rknn`), and `Cairn.Native.Health` reads the live pass latency against it. A backend
   it cannot measure is left unjudged rather than guessed at. Both sides of
   that ratio rise with load: the latency `Health` reads includes the wait

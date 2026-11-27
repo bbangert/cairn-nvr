@@ -822,5 +822,75 @@ defmodule Cairn.Native.HostTest do
       refute_received {:cpu_baseline, _config, _passes, _opts}
       assert log =~ "no CPU baseline for m.fake: its CPU twin gone.onnx does not exist"
     end
+
+    test "a backend that needs a twin, with none in place, never measures its own artifact" do
+      Cairn.TwinBoard.attach()
+
+      log =
+        capture_log(fn ->
+          host = start_host(config: %{model: @stub_onnx, backend: "accel"})
+
+          assert_receive {:init, %{model: @stub_onnx}}
+          assert GenServer.call(host, :probe).cpu_baseline_ms == nil
+        end)
+
+      refute_received {:cpu_baseline, _config, _passes, _opts}
+      assert log =~ "no CPU baseline for #{@stub_onnx}: no CPU twin is in place"
+    end
+
+    # A fetched twin landing after the engine opened: the config reload moves
+    # the twin and nothing else.
+    test "a reload moving only the twin re-measures, and reloads nothing", %{id: id} do
+      Cairn.TwinBoard.attach()
+      dir = Path.join(System.tmp_dir!(), "cairn_host_twin_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+      twin = Path.join(dir, "twin.onnx")
+      File.cp!(@stub_onnx, twin)
+
+      profiled = fn twin ->
+        File.write!(Path.join(dir, "accel.yml"), """
+        experimental: true
+        backend: accel
+        model:
+          accel: #{@stub_onnx}
+          onnx: #{twin}
+        model_profile: yolox
+        input_size: 416
+        """)
+
+        {:ok, config, _warnings} =
+          Cairn.Config.from_map(%{
+            "data_dir" => "tmp/host_test",
+            "profile_dirs" => [dir],
+            "plugins" => %{"det" => %{"profile" => "accel", "allow_experimental" => true}},
+            "cameras" => [
+              %{
+                "id" => "cam_a",
+                "rtsp_url" => "rtsp://h/1",
+                "pipeline" => "membrane",
+                "plugin" => "det"
+              }
+            ]
+          })
+
+        config
+      end
+
+      first = profiled.(@stub_onnx)
+      host = start_host(config: nil, config_source: fn -> first end)
+      assert_receive {:init, %{model: @stub_onnx, cpu_twin: @stub_onnx}}
+      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, _opts}
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert_receive {:open_stream, _engine, ^id, _params}
+
+      Host.reconfigure(host, profiled.(twin))
+
+      assert_receive {:cpu_baseline, %{model: ^twin}, 5, _opts}
+      refute_received {:init, _config}
+      refute_received {:close_stream, _stream}
+      assert settled_baseline(host) == 45.0
+      assert Host.status(host).streams == [id]
+    end
   end
 end

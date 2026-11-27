@@ -42,6 +42,7 @@ defmodule Cairn.Native.Host do
 
   require Logger
 
+  alias Cairn.Config.Profile
   alias Cairn.Config.Server, as: ConfigServer
   alias Cairn.Native.Canary
   alias Cairn.Native.Config, as: NativeConfig
@@ -253,7 +254,8 @@ defmodule Cairn.Native.Host do
 
   A no-op unless that model actually changed — an engine reload closes every
   stream and pays for a model load, which a reload that moved something else
-  entirely must not spend. Asynchronous because the caller is
+  entirely must not spend. A change of the CPU twin alone re-measures the
+  baseline and reloads nothing. Asynchronous because the caller is
   `Cairn.Config.Server`, whose own reload must not wait on a model load; the
   work is `configure/3`'s, canary included.
   """
@@ -545,7 +547,19 @@ defmodule Cairn.Native.Host do
   defp swap_model(state, raw) do
     case NativeConfig.normalize(raw) do
       {:ok, config} ->
-        if config == state.config, do: state, else: reload_engine(state, raw)
+        cond do
+          config == state.config ->
+            state
+
+          # The twin is the baseline's alone, so one that lands after the
+          # engine opened — a fetched twin — re-measures and closes nothing.
+          state.engine_state == :ready and
+              %{config | cpu_twin: state.config.cpu_twin} == state.config ->
+            start_baseline(%{state | config: config, cpu_baseline_ms: nil}, config)
+
+          true ->
+            reload_engine(state, raw)
+        end
 
       {:error, message} ->
         # The running engine is kept: nothing about this reload reached it.
@@ -655,13 +669,21 @@ defmodule Cairn.Native.Host do
   # and stays at nil — the monitor's honest :not_applicable.
   #
   # A backend whose artifact the CPU cannot run is measured on its FP32 ONNX
-  # twin (`cpu_twin`, D-G17); the logs keep naming the accelerator's model.
+  # twin (`cpu_twin`, D-G17), never on that artifact; the logs keep naming the
+  # accelerator's model.
   defp start_baseline(state, config) do
     state = stop_baseline(state)
     measured = if config.cpu_twin, do: %{config | model: config.cpu_twin}, else: config
 
     cond do
       not NativeConfig.accelerator?(config) ->
+        state
+
+      # From a profile, a fetched twin not in the store yet (naming none is
+      # refused at load): its arrival reloads the config, and `swap_model/2`
+      # measures it then. A pinned config can name none at all.
+      config.cpu_twin == nil and Profile.cpu_twin?(config.backend) ->
+        no_baseline(config, "no CPU twin is in place (a fetched one is measured once it lands)")
         state
 
       # The engine has already refused or will serve without a baseline

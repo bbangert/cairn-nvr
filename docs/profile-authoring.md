@@ -106,8 +106,9 @@ neither of the generic board's; cairn-rockchip's `rknn` is one) also needs
 `onnx:`: the FP32 export the artifact was converted from, its **CPU twin**.
 The node's health check judges the accelerator against one CPU pass of the
 same model, and that pass is measured on the twin. No `onnx:` on such
-a profile — or on any rung of such a ladder — fails the load; one that names
-a file not on disk loads with a warning and no health ratio.
+a profile — or on any rung of such a ladder that does not fetch its twin
+(below) — fails the load; one that names a file not on disk loads with a
+warning and no health ratio.
 
 ## `tier:` — the ascending capability ladder
 
@@ -186,6 +187,14 @@ profile is refused, saying why (the last fetch's failure, or that it has not
 been tried); with no camera on the group it only warns. In a `profile_dirs:`
 file either key is an error, a file shadowing a shipped one included: place
 the model file by hand and name its path.
+
+Such a rung may fetch its CPU twin the same way, with `twin_sha256:` and
+`twin_url:` (both or neither, the same value rules, never on a pack rung) in
+place of `model.onnx` — naming both is an error. A twin is not needed to
+detect, so one not downloaded yet refuses nothing: the load warns, health
+has no baseline, and the twin is measured when it lands, without reloading
+the model. On a backend that uses no twin the keys are inert, and warned
+about. Either file's download is capped at 128 MiB and five minutes.
 
 The rules, each refused or warned at load:
 
@@ -546,6 +555,11 @@ plugin detect: profile my-board names backend "<backend>", which the <board>
 profile my-board: CPU twin models/gone.onnx does not exist or is not a regular
   file — <backend> will load and detect, but its health cannot be judged
   against the CPU
+profile my-board: CPU twin <file> is not downloaded yet — <backend> will load
+  and detect, but its health cannot be judged against the CPU until it is
+profile my-board: model_ladder rung 1 names a CPU twin to fetch
+  (twin_sha256:/twin_url:), but the qnn backend uses no CPU twin — the file is
+  fetched for nothing; drop both keys
 profile my-board: model_ladder rung 2: experimental: true loads model_profile
   <family>, which is not a proven <backend> conversion: <the same reason>
 ```

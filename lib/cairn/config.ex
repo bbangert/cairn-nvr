@@ -879,8 +879,10 @@ defmodule Cairn.Config do
 
   # A fetched rung's artifact is the store's file once verified. Until then
   # the rung names none, and what the store says is kept, by profile, for a
-  # group that runs it (`check_unfetched/5`): one read per rung, so the
-  # rung's path and its missing record cannot disagree.
+  # group that runs it (`check_unfetched/5`): one read per file, so the
+  # rung's path and its missing record cannot disagree. A fetched twin is
+  # filled in the same way, but its absence refuses nothing: the NPU detects
+  # without it, and `check_twin_file/2` warns.
   defp fetch_rungs(profiles, state) do
     {profiles, unfetched} =
       Enum.map_reduce(profiles, %{}, fn
@@ -891,7 +893,9 @@ defmodule Cairn.Config do
             rungs
             |> Enum.with_index(1)
             |> Enum.map_reduce([], fn {rung, index}, missing ->
-              fetch_rung(rung, index, key, state, missing)
+              rung
+              |> Profile.put_fetched_twin(profile.backend, state)
+              |> fetch_rung(index, key, state, missing)
             end)
 
           unfetched = if missing == [], do: unfetched, else: Map.put(unfetched, name, missing)
@@ -1459,10 +1463,11 @@ defmodule Cairn.Config do
   # D-G17: the health ratio is the accelerator against the CPU, and a backend
   # whose artifact the CPU cannot run is measured on its FP32 ONNX twin. No
   # twin named is an error, like a missing artifact; a named twin that is not
-  # on disk only costs the ratio, so it warns. For a ladder every rung must
-  # name one (tomorrow's fleet edit selects another), pack rungs included —
-  # naming is the profile file's promise, not the disk's, and a pack installs
-  # later — and the file is checked for the rung that runs.
+  # on disk only costs the ratio, so it warns, as does a fetched one not in
+  # the store yet. For a ladder every rung must name one (tomorrow's fleet
+  # edit selects another), pack rungs included — naming is the profile file's
+  # promise, not the disk's, and a pack installs later — and the file is
+  # checked for the rung that runs.
   defp check_cpu_twin(acc, group, %Profile{} = profile) do
     if Profile.cpu_twin?(profile.backend),
       do: check_twin_named(acc, group, profile),
@@ -1474,7 +1479,9 @@ defmodule Cairn.Config do
     acc =
       rungs
       |> Enum.with_index(1)
-      |> Enum.reject(fn {rung, _index} -> Profile.cpu_twin(%{profile | model: rung.model}) end)
+      |> Enum.reject(fn {rung, _index} ->
+        Profile.cpu_twin(%{profile | model: rung.model}) || rung.twin_sha256
+      end)
       |> Enum.reduce(acc, fn {_rung, index}, acc ->
         add_error(acc, no_twin(group, profile, "ladder rung #{index}"))
       end)
@@ -1496,6 +1503,16 @@ defmodule Cairn.Config do
 
   defp check_twin_file(acc, profile) do
     case Profile.cpu_twin(profile) do
+      nil when is_map(profile.resolved_rung) and is_binary(profile.resolved_rung.twin_sha256) ->
+        %{twin_sha256: sha256, twin_url: url} = profile.resolved_rung
+
+        add_warning(
+          acc,
+          "profile #{profile.name}: CPU twin #{Profile.fetch_name(url, sha256)} is not " <>
+            "downloaded yet — #{profile.backend} will load and detect, but its health " <>
+            "cannot be judged against the CPU until it is"
+        )
+
       nil ->
         acc
 

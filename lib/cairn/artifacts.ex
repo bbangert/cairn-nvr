@@ -3,11 +3,12 @@ defmodule Cairn.Artifacts do
   Runtime files a release does not carry, stored as
   `<data_dir>/artifacts/<sha256>` and usable only once their bytes hash to
   that name. The set is fixed at start: the board's
-  (`c:Cairn.Stage.Board.artifacts/1`) and one per ladder rung in the
-  release's own profiles that names a file to fetch
-  (`Cairn.Config.Profile.fetch_entries/1`). A rung's entry carries no
-  `backend:`: a missing model refuses the groups that run its profile, where
-  a missing library would gate its whole backend.
+  (`c:Cairn.Stage.Board.artifacts/1`) and one per file a ladder rung in the
+  release's own profiles names to fetch, its model or its CPU twin
+  (`Cairn.Config.Profile.fetch_entries/1`). A rung's entries carry no
+  `backend:`: a missing model refuses the groups that run its profile and a
+  missing twin costs health its baseline, where a missing library would gate
+  its whole backend.
 
   This process checks what is already on disk — synchronously and without the
   network, so that the config loaded right after it knows what is missing —
