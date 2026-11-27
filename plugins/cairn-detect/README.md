@@ -775,6 +775,11 @@ families are worth calling out:
 `yolox_nano.onnx` from the Megvii 0.1.1rc0 release and
 `onnx-community/rfdetr_nano-ONNX` — and `yolov10` against `yolov10n.onnx`.
 
+`yolov9split` is verified on the MIT v9-t export over COCO val2017's 5,000
+images (2026-11-27): through `examples/coco_dets.rs`, which runs this
+crate's resize, inference and decode on stills, it scores 36.33 AP where a
+Python decode at the same thresholds scores 36.35.
+
 `yolov8split` and `yolo26split` are verified against exports of the real weights, made
 and kept outside the repo (2026-11-16). On ORT, `yolov8split` returns for
 yolov8n and yolo11n exactly the objects their stock exports give under
