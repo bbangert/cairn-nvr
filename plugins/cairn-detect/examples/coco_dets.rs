@@ -18,8 +18,9 @@
 //! Output is one ndjson line per detection: `image_id`, `label`, `score`, and
 //! `bbox` `[x, y, w, h]` in source pixels. These are wire detections, so the
 //! wire's rounding (score to 3 places, normalized bbox to 4) and its
-//! per-frame cap (`infer::MAX_DETS`, 32 when written) are in them: AP from this is the shipping decode's, not
-//! the model's at COCO's usual 100 or 300 detections.
+//! per-frame cap (`infer::MAX_DETS`, 32 when written) are in them: AP from
+//! this is the shipping decode's, not the model's at COCO's usual 100 or 300
+//! detections.
 //!
 //! ```text
 //! cargo run --release --example coco_dets -- --model v9-t-fused.onnx \
