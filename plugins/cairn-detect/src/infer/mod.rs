@@ -16,7 +16,7 @@
 //! A profile is either named on the command line (`--model-profile`) or
 //! sniffed from the model's own I/O. Sniffing is deliberately strict: a shape
 //! that fits *two* built-in profiles is an error naming both, never a silent
-//! pick — the two are decoded completely differently and the wrong one emits
+//! pick — the two are fed or decoded differently and the wrong one emits
 //! plausible garbage rather than failing.
 //!
 //! None of the input half is declared by an ONNX graph. The channel order, the

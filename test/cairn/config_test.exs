@@ -3127,6 +3127,9 @@ defmodule Cairn.ConfigTest do
       # hyphens are spelling, so the split contracts resolve either way
       assert {"yolov8split", %{nms: :host_side}} = Profile.family("yolov8-split")
       assert {"yolo26split", %{nms: :host_side}} = Profile.family("YOLO26-Split")
+      # the MIT YOLOv9's split head is its own contract; bare yolov9 stays yolov8's
+      assert {"yolov9split", %{nms: :host_side}} = Profile.family("yolov9-split")
+      assert {"yolov8", _row} = Profile.family("yolov9")
 
       assert Profile.family("yolov12") == nil
     end
@@ -3221,6 +3224,16 @@ defmodule Cairn.ConfigTest do
 
       assert error =~
                "model_profile yolo11 is not a proven npu conversion: not listed by the board"
+
+      # A contract newer than the board's list is refused the same way, and
+      # acknowledged it warns: never silently run on an unmeasured conversion.
+      assert %{errors: [error]} = converted(false, {"yolov9split", "yolov9split"})
+      assert error =~ "model_profile yolov9split is not a proven npu conversion: not listed"
+
+      assert %{errors: [], warnings: [warning]} =
+               converted(true, {"yolov9split", "yolov9split"})
+
+      assert warning =~ "loads model_profile yolov9split, which is not a proven npu conversion"
     end
 
     test "a board naming no evidence gets no measurements parenthetical" do
@@ -3264,6 +3277,7 @@ defmodule Cairn.ConfigTest do
 
       assert Enum.any?(errors, &(&1 =~ "yolov8 (or yolov9, yolo11, yolov11, yolo26)"))
       assert Enum.any?(errors, &(&1 =~ "yolov8split"))
+      assert Enum.any?(errors, &(&1 =~ "yolov9split"))
       assert Enum.any?(errors, &(&1 =~ "yolo26split"))
     end
 

@@ -1,9 +1,8 @@
 //! Settling which profile a model runs under, and at what input size.
 //!
 //! Sniffing is deliberately strict: a shape that fits *two* built-in profiles
-//! is an error naming both, never a silent pick — the two are decoded
-//! completely differently and the wrong one emits plausible garbage rather
-//! than failing.
+//! is an error naming both, never a silent pick — the two are fed or decoded
+//! differently and the wrong one emits plausible garbage rather than failing.
 
 use std::path::{Path, PathBuf};
 
@@ -169,12 +168,12 @@ pub(super) enum ResolveError {
     },
 
     /// The shape fits more than one built-in profile. Never a silent pick: the
-    /// candidates decode completely differently, and the message lists them
+    /// candidates decode, or preprocess, differently, and the message lists them
     /// twice — prose-joined to read, `|`-joined to paste after
     /// `--model-profile`.
     #[error(
         "model {} has outputs {}, which at input {size} fit more than one profile: {}. \
-         Nothing in the shapes says which, and they decode differently — pass \
+         Nothing in the shapes says which, and they preprocess or decode differently — pass \
          --model-profile <{}> to say.",
         model.display(),
         describe_outputs(declared),
@@ -936,7 +935,9 @@ mod tests {
 
     use ort::value::ValueType;
 
-    use super::super::catalog::{RFDETR, YOLO26_SPLIT, YOLOV10, YOLOV8, YOLOV8_SPLIT, YOLOX};
+    use super::super::catalog::{
+        RFDETR, YOLO26_SPLIT, YOLOV10, YOLOV8, YOLOV8_SPLIT, YOLOV9_SPLIT, YOLOX,
+    };
     use super::super::encoding::TensorEncoding;
     use super::super::geometry::{InputSize, ResizePolicy};
     use super::super::profile::*;
@@ -1018,6 +1019,7 @@ mod tests {
             "yolov8",
             "rfdetr",
             "yolov8split",
+            "yolov9split",
             "yolo26split",
         ] {
             assert!(err.contains(expected), "{err}");
@@ -1043,11 +1045,18 @@ mod tests {
         assert_eq!(ModelProfile::parse("rf-detr").unwrap(), RFDETR);
         assert_eq!(ModelProfile::parse("yolov8-split").unwrap(), YOLOV8_SPLIT);
         assert_eq!(ModelProfile::parse("YOLO26-Split").unwrap(), YOLO26_SPLIT);
+        // the MIT YOLOv9's split head is its own contract; bare `yolov9` stays
+        // the Ultralytics whole-head family
+        assert_eq!(ModelProfile::parse("yolov9split").unwrap(), YOLOV9_SPLIT);
+        assert_eq!(ModelProfile::parse("yolov9-split").unwrap(), YOLOV9_SPLIT);
+        assert_eq!(ModelProfile::parse("yolov9").unwrap(), YOLOV8);
         // a family resolves to the contract's canonical identity, so the
         // startup line and every error say `yolov8`, not the family name
         assert_eq!(ModelProfile::parse("yolo11").unwrap().to_string(), "yolov8");
-        // ...and one profile per distinct decode keeps sniffing unambiguous
-        assert_eq!(PROFILES.len(), 6);
+        // ...and one profile per distinct contract keeps an ordinary head's
+        // sniff unambiguous (the split-DFL pair is the deliberate exception;
+        // see `an_unnamed_split_dfl_model_is_ambiguous_between_v8_and_v9`)
+        assert_eq!(PROFILES.len(), 7);
         assert_eq!(sniff(&declared(&[1, 84, 8400]), SQUARE).len(), 1);
         assert_eq!(sniff(&declared(&[1, 300, 6]), SQUARE).len(), 1);
     }
@@ -1099,6 +1108,15 @@ mod tests {
             assert_eq!(profile.output.score, ScoreComposition::Class);
             assert_eq!(profile.output.nms, Some(DEFAULT_NMS));
         }
+        // the MIT YOLOv9 differs from yolov8split in its resize alone
+        assert_eq!(
+            YOLOV9_SPLIT.input,
+            InputSpec {
+                resize: ResizePolicy::Letterbox { pad: 114 },
+                ..YOLOV8_SPLIT.input
+            }
+        );
+        assert_eq!(YOLOV9_SPLIT.output, YOLOV8_SPLIT.output);
         // it is the only family here that reads a boxes-and-logits pair
         for profile in PROFILES {
             let two = matches!(
@@ -2442,7 +2460,7 @@ mod tests {
         };
         assert_eq!(
             names(&declared_split(64, 80, SQUARE), SQUARE),
-            ["yolov8split"]
+            ["yolov8split", "yolov9split"]
         );
         assert_eq!(
             names(&declared_split(4, 80, SQUARE), SQUARE),
@@ -2476,6 +2494,24 @@ mod tests {
             "{sniffed:?}"
         );
         assert!(names(&declared_detr(300, 91), InputSize::square(384)) == ["rfdetr"]);
+    }
+
+    #[test]
+    fn an_unnamed_split_dfl_model_is_ambiguous_between_v8_and_v9() {
+        // Same tensors, different resize: nothing in the shapes picks one.
+        let split = declared_split(64, 80, SQUARE);
+        let err = resolve_profile(None, &split, SQUARE, Path::new("m.onnx")).unwrap_err();
+        let ResolveError::AmbiguousProfile { candidates, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(candidates, &["yolov8split", "yolov9split"]);
+
+        let (profile, names, output) =
+            resolve_profile(Some(YOLOV9_SPLIT), &split, SQUARE, Path::new("m.onnx")).unwrap();
+        assert_eq!(profile.name, "yolov9split");
+        assert_eq!(profile.input.resize, ResizePolicy::Letterbox { pad: 114 });
+        assert_eq!(output.unwrap().layout, DFL);
+        assert_eq!(names.each().len(), 6);
     }
 
     #[test]
@@ -2674,7 +2710,7 @@ mod tests {
             "model m.onnx leaves its output shape dynamic, so there is nothing to sniff a profile \
              from — and the encoding and resize policy have to be settled before the first frame \
              is converted. Pass --model-profile <yolox, yolov10, yolov8 (or yolov9, yolo11, yolov11, \
-             yolo26), rfdetr, yolov8split, yolo26split>."
+             yolo26), rfdetr, yolov8split, yolov9split, yolo26split>."
         );
     }
 
@@ -2692,7 +2728,9 @@ mod tests {
              [1, 4 + nc, A] with A far longer than 4 + nc (yolov8), [1, Q, 4] boxes with \
              [1, Q, nc] logits (rfdetr), box0..box2 [1, 4 * reg_max (reg_max at least 2), H, W] \
              with cls0..cls2 [1, nc, H, W], each level's H and W being input 640x640 over its \
-             stride (8/16/32) (yolov8split), box0..box2 [1, 4, H, W] with cls0..cls2 \
+             stride (8/16/32) (yolov8split), box0..box2 [1, 4 * reg_max (reg_max at least 2), \
+             H, W] with cls0..cls2 [1, nc, H, W], each level's H and W being input 640x640 over \
+             its stride (8/16/32) (yolov9split), box0..box2 [1, 4, H, W] with cls0..cls2 \
              [1, nc, H, W], each level's H and W being input 640x640 over its stride (8/16/32) \
              (yolo26split)"
         );
@@ -2711,7 +2749,7 @@ mod tests {
             .to_string(),
             "model m.onnx has outputs \"output\" [1, 5040, 6], which at input 640x384 fit more \
              than one profile: yolox and yolov10. Nothing in the shapes says which, and they \
-             decode differently — pass --model-profile <yolox|yolov10> to say."
+             preprocess or decode differently — pass --model-profile <yolox|yolov10> to say."
         );
         // Two declared outputs, because `describe_outputs` joins them with
         // ", " and every other message rendered anywhere in this file carries
@@ -2738,7 +2776,8 @@ mod tests {
             .to_string(),
             "model m.onnx has outputs \"logits\" [1, 336, 85], \"pred_boxes\" [1, 336, 4], which \
              at input 128x128 fit more than one profile: yolox and rfdetr. Nothing in the shapes \
-             says which, and they decode differently — pass --model-profile <yolox|rfdetr> to say."
+             says which, and they preprocess or decode differently — pass --model-profile \
+             <yolox|rfdetr> to say."
         );
     }
 

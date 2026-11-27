@@ -7,6 +7,11 @@
 //! layouts, and listing each as its own profile would make every ordinary
 //! detect head sniff as several candidates and hard-error on an ambiguity that
 //! does not exist.
+//!
+//! The one exception is [`YOLOV8_SPLIT`] and [`YOLOV9_SPLIT`]: their tensors
+//! are identical but their preprocessing is not, which no shape reveals. That
+//! ambiguity is real, so an unnamed split-DFL model fails to resolve with both
+//! names listed rather than running under a guess.
 
 use anyhow::{anyhow, Result};
 
@@ -149,6 +154,28 @@ pub const YOLOV8_SPLIT: ModelProfile = ModelProfile {
     variant_sizes: None,
 };
 
+/// YOLOv9 from the MIT rewrite (MultimediaTechLab/YOLO), its head cut the
+/// same way.
+///
+/// The tensors are [`YOLOV8_SPLIT`]'s byte for byte; the resize is not. The
+/// model was trained letterboxed, and stretching it costs 1.7–1.8 AP on COCO
+/// val2017 (v9-t 38.21 → 36.50, v9-s 46.56 → 44.80). `Letterbox`'s top-left
+/// placement measured within 0.2 AP of centred. Not the `yolov9` family name,
+/// which is Ultralytics' whole-head export under [`YOLOV8`].
+pub const YOLOV9_SPLIT: ModelProfile = ModelProfile {
+    name: "yolov9split",
+    families: &[],
+    input: InputSpec {
+        size: InputSize::square(640),
+        encoding: TensorEncoding::UnitRgb,
+        resize: ResizePolicy::Letterbox { pad: 114 },
+        input_quant: None,
+        layout: TensorLayout::Nchw,
+    },
+    output: YOLOV8_SPLIT.output,
+    variant_sizes: None,
+};
+
 /// yolo26's one2one head exported with the same cut: `reg_max` is 1, so the
 /// box tensors carry l, t, r, b distances directly and there is no DFL.
 pub const YOLO26_SPLIT: ModelProfile = ModelProfile {
@@ -171,7 +198,15 @@ pub const YOLO26_SPLIT: ModelProfile = ModelProfile {
 
 /// Every profile `--model-profile` accepts and sniffing considers, in the
 /// order an ambiguity error lists them.
-pub const PROFILES: &[ModelProfile] = &[YOLOX, YOLOV10, YOLOV8, RFDETR, YOLOV8_SPLIT, YOLO26_SPLIT];
+pub const PROFILES: &[ModelProfile] = &[
+    YOLOX,
+    YOLOV10,
+    YOLOV8,
+    RFDETR,
+    YOLOV8_SPLIT,
+    YOLOV9_SPLIT,
+    YOLO26_SPLIT,
+];
 
 impl ModelProfile {
     /// `--model-profile` value parser, so a typo's error names the real set.

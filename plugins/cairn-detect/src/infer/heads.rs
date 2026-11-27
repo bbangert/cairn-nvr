@@ -3475,8 +3475,8 @@ mod tests {
         }
     }
 
-    /// The wire box for model-pixel corners under a stretch, which is how a
-    /// split profile reports against any source frame.
+    /// The wire box for model-pixel corners under a stretch, which is how
+    /// these tests project a split head against any source frame.
     fn stretched(size: InputSize, [x1, y1, x2, y2]: [f64; 4]) -> [f64; 4] {
         let (w, h) = (size.w as f64, size.h as f64);
         [x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h]
@@ -3548,7 +3548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_split_head_is_the_same_boxes_against_a_wide_or_a_four_by_three_source() {
+    fn a_stretched_split_head_is_the_same_boxes_against_a_wide_or_a_four_by_three_source() {
         // The model input is the source stretched to a square, so the
         // projection back is a pure per-axis rescale and the source's aspect
         // cancels: the same normalized boxes whatever the frame was.
@@ -3560,6 +3560,19 @@ mod tests {
                 assert_three_levels(&out.decode(&projection), SQUARE);
             }
         }
+    }
+
+    #[test]
+    fn a_letterboxed_split_head_reports_against_the_picture_not_the_padded_input() {
+        // 1920x1080 into 640x640 fills the top 640x360; the 280 rows of pad
+        // below are not frame, so y normalizes by 360 where a stretch would
+        // divide by 640.
+        let mut out = SplitOutput::new(SQUARE, NC, 16);
+        out.put(0, (40, 20), 1, 0.9, [1.0, 2.0, 3.0, 4.0]);
+        let projection = ResizePolicy::Letterbox { pad: 114 }.project(SQUARE, WIDE);
+        // x 40.5 - 1 and 40.5 + 3 at stride 8; y 20.5 - 2 and 20.5 + 4
+        let corners = [316.0 / 640.0, 148.0 / 360.0, 32.0 / 640.0, 48.0 / 360.0];
+        assert_dets_close(&out.decode(&projection), &[("bicycle", 0.9, corners)]);
     }
 
     #[test]
