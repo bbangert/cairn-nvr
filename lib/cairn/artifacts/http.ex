@@ -8,7 +8,8 @@ defmodule Cairn.Artifacts.HTTP do
   hop is checked for https; a GitHub release asset answers 302 to another host.
   Req retries, decompresses and decodes nothing.
 
-  Bounded in bytes: a 200's body to the artifact's `size`, else 64 MiB,
+  Bounded in bytes: a 200's body to the artifact's `size`, else 128 MiB (a
+  rung's entries carry no `size`, and an FP32 twin can pass 80 MB),
   refused on a larger `content-length` and cut off once more has arrived. It
   streams to the file as it arrives. Any other answer's body is dropped at its
   first chunk, so at most one socket read of it is held. The status line and
@@ -23,7 +24,7 @@ defmodule Cairn.Artifacts.HTTP do
   """
 
   @max_hops 3
-  @default_max_bytes 64 * 1024 * 1024
+  @default_max_bytes 128 * 1024 * 1024
   @connect_timeout_ms 15_000
   @attempt_timeout_ms 300_000
   @stall_ms 30_000

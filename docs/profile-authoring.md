@@ -106,8 +106,9 @@ neither of the generic board's; cairn-rockchip's `rknn` is one) also needs
 `onnx:`: the FP32 export the artifact was converted from, its **CPU twin**.
 The node's health check judges the accelerator against one CPU pass of the
 same model, and that pass is measured on the twin. No `onnx:` on such
-a profile — or on any rung of such a ladder — fails the load; one that names
-a file not on disk loads with a warning and no health ratio.
+a profile — or on any rung of such a ladder that does not fetch its twin
+(below) — fails the load; one that names a file not on disk loads with a
+warning and no health ratio.
 
 ## `tier:` — the ascending capability ladder
 
@@ -186,6 +187,24 @@ profile is refused, saying why (the last fetch's failure, or that it has not
 been tried); with no camera on the group it only warns. In a `profile_dirs:`
 file either key is an error, a file shadowing a shipped one included: place
 the model file by hand and name its path.
+
+Such a rung may fetch its CPU twin the same way, with `twin_sha256:` and
+`twin_url:` (both or neither, the same value rules, never on a pack rung,
+never the rung's own `sha256:`) in place of `model.onnx` — naming both is
+an error. A twin is not needed to detect, so one not downloaded yet refuses
+nothing: the load warns, naming the last fetch's failure, and health has no
+baseline. A fetch pass takes twins after every other file, with a config
+reload between, so no twin delays a model going into use. A twin that lands
+behind a loaded engine is measured without reloading the model; behind a
+refused one the engine is reloaded, as for any change. On a backend that
+uses no twin the keys are inert, and warned about.
+
+Either file's download is capped at 128 MiB and one five-minute attempt, of
+which about four minutes are left for the body once the connect allowances
+are paid, and a failed attempt starts over from the first byte. An 80 MB
+twin therefore needs a sustained ~2.7 Mbit/s (~4.5 Mbit/s for a file at the
+cap); on a slower link it fails on every retry, and only copying the file
+to `<data_dir>/artifacts/<sha256>` helps (it is verified at the next start).
 
 The rules, each refused or warned at load:
 
@@ -546,6 +565,12 @@ plugin detect: profile my-board names backend "<backend>", which the <board>
 profile my-board: CPU twin models/gone.onnx does not exist or is not a regular
   file — <backend> will load and detect, but its health cannot be judged
   against the CPU
+profile my-board: CPU twin <file>, not downloaded yet: the last fetch failed:
+  <why> — <backend> will load and detect, but its health cannot be judged
+  against the CPU until it is
+profile my-board: model_ladder rung 1 names a CPU twin to fetch
+  (twin_sha256:/twin_url:), but the qnn backend uses no CPU twin — the file is
+  fetched for nothing; drop both keys
 profile my-board: model_ladder rung 2: experimental: true loads model_profile
   <family>, which is not a proven <backend> conversion: <the same reason>
 ```

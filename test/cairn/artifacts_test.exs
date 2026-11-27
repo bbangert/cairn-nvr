@@ -221,11 +221,12 @@ defmodule Cairn.ArtifactsTest do
       assert Artifacts.state(sha_of("none"), ctx.store) == {:missing, :unlisted}
     end
 
-    test "fetch_entries/1 takes each well-formed fetched rung once, skipping the rest" do
+    test "fetch_entries/1 takes each well-formed file to fetch once, a twin too" do
       dir = Path.join(System.tmp_dir!(), "cairn_fetch_#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf(dir) end)
       sha = String.upcase(@sha256)
+      twin = String.duplicate("EF", 32)
 
       File.write!(Path.join(dir, "a.yml"), """
       model_ladder:
@@ -236,6 +237,10 @@ defmodule Cairn.ArtifactsTest do
         - {sha256: #{sha}, url: "https://h/p.bin", pack: p}
         - {sha256: abc, url: "https://h/y.bin"}
         - {url: "https://h/z.bin"}
+        - {model: {a: m}, twin_sha256: #{twin}, twin_url: "https://h/t.onnx"}
+        - {twin_sha256: #{twin}, twin_url: "https://h/t.onnx", pack: p}
+        - {twin_sha256: #{twin}, twin_url: "http://h/t.onnx"}
+        - {twin_sha256: #{twin}}
       """)
 
       File.write!(Path.join(dir, "b.yml"), "model_ladder: [")
@@ -243,8 +248,50 @@ defmodule Cairn.ArtifactsTest do
       File.write!(Path.join(dir, "d.yml"), "model_ladder: [junk, [#{sha}]]")
 
       assert Profile.fetch_entries([dir]) == [
-               %{name: "x.bin", url: "https://h/m/x.bin?sig=1", sha256: @sha256}
+               %{name: "x.bin", url: "https://h/m/x.bin?sig=1", sha256: @sha256, twin: false},
+               %{
+                 name: "t.onnx",
+                 url: "https://h/t.onnx",
+                 sha256: String.downcase(twin),
+                 twin: true
+               }
              ]
+    end
+
+    # Hash order in the table would otherwise put the twin's minutes first.
+    test "a pass puts a fetched model into use before it tries a twin", ctx do
+      start_store(ctx, [Map.put(named("twin"), :twin, true), named("model")])
+      test = self()
+
+      # Held until released: the twin's attempt cannot start inside the reload.
+      reload = fn ->
+        send(test, {:reloading, self()})
+
+        receive do
+          :release -> {:ok, %{}, []}
+        end
+      end
+
+      start_fetcher(ctx, writes_named(["twin", "model"]), reload: reload)
+
+      assert_receive {:attempt, 1, %{name: "model"}, _unusable}, @wait
+      assert_receive {:reloading, reloader}, @wait
+      refute_received {:attempt, 2, _artifact, _unusable}
+      send(reloader, :release)
+      assert_receive {:attempt, 2, %{name: "twin"}, _unusable}, @wait
+      assert_receive {:reloading, reloader}, @wait
+      send(reloader, :release)
+      refute_attempted(ctx)
+    end
+
+    test "a file that is one profile's twin and another's model is not taken as a twin", ctx do
+      twin = Map.put(named("both"), :twin, true)
+
+      for artifacts <- [[twin, named("both")], [named("both"), twin]] do
+        start_store(ctx, artifacts)
+        assert [%{twin: false}] = Artifacts.missing(ctx.store)
+        stop_supervised!(ctx.store)
+      end
     end
   end
 
@@ -453,7 +500,7 @@ defmodule Cairn.ArtifactsTest do
       end
     end
 
-    test "a redirect is followed, relative to the URL that answered it; 64 MiB by default" do
+    test "a redirect is followed, relative to the URL that answered it; 128 MiB by default" do
       request =
         hops(%{
           "https://a/x" => {:redirect, "https://b/y?sig=1"},
@@ -466,7 +513,7 @@ defmodule Cairn.ArtifactsTest do
       assert_received {:request, "https://b/z", _limits}
 
       assert :ok = HTTP.fetch(%{url: "https://b/z"}, "unused", request)
-      assert_received {:request, "https://b/z", %{max_bytes: 67_108_864}}
+      assert_received {:request, "https://b/z", %{max_bytes: 134_217_728}}
     end
 
     test "every hop must be https, and three redirects are followed but not a fourth" do

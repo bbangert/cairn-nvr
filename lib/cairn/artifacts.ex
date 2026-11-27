@@ -3,11 +3,13 @@ defmodule Cairn.Artifacts do
   Runtime files a release does not carry, stored as
   `<data_dir>/artifacts/<sha256>` and usable only once their bytes hash to
   that name. The set is fixed at start: the board's
-  (`c:Cairn.Stage.Board.artifacts/1`) and one per ladder rung in the
-  release's own profiles that names a file to fetch
-  (`Cairn.Config.Profile.fetch_entries/1`). A rung's entry carries no
-  `backend:`: a missing model refuses the groups that run its profile, where
-  a missing library would gate its whole backend.
+  (`c:Cairn.Stage.Board.artifacts/1`) and one per file a ladder rung in the
+  release's own profiles names to fetch, its model or its CPU twin
+  (`Cairn.Config.Profile.fetch_entries/1`). A rung's entries carry no
+  `backend:`: a missing model refuses the groups that run its profile and a
+  missing twin costs health its baseline, where a missing library would gate
+  its whole backend. A twin's entry says so (`twin: true`), and the fetcher
+  takes it last.
 
   This process checks what is already on disk — synchronously and without the
   network, so that the config loaded right after it knows what is missing —
@@ -43,6 +45,7 @@ defmodule Cairn.Artifacts do
           sha256: String.t(),
           size: pos_integer() | nil,
           backend: String.t() | nil,
+          twin: boolean(),
           path: Path.t(),
           status: status(),
           failure: String.t() | nil
@@ -240,6 +243,8 @@ defmodule Cairn.Artifacts do
   defp recorded(entry, {:failed, failure}), do: %{entry | status: :missing, failure: failure}
 
   # The first entry for a hash is the one kept: two profiles may name one file.
+  # It stays a twin only while every reference is one, since one profile's
+  # twin can be another's model, which must not wait behind the twins.
   defp register(state, %{name: name, url: url, sha256: sha256} = artifact)
        when is_binary(name) and is_binary(url) and is_binary(sha256) do
     sha256 = String.downcase(sha256)
@@ -254,7 +259,10 @@ defmodule Cairn.Artifacts do
         Logger.error("artifacts: #{name}: size must be a positive integer, env a string; ignored")
 
       :ets.member(state.table, sha256) ->
-        :ok
+        if Map.get(artifact, :twin) != true do
+          [{^sha256, entry}] = :ets.lookup(state.table, sha256)
+          :ets.insert(state.table, {sha256, %{entry | twin: false}})
+        end
 
       true ->
         path = Path.join(state.dir, sha256)
@@ -265,6 +273,7 @@ defmodule Cairn.Artifacts do
           sha256: sha256,
           size: size,
           backend: Map.get(artifact, :backend),
+          twin: Map.get(artifact, :twin) == true,
           path: path,
           status: :missing,
           failure: nil
