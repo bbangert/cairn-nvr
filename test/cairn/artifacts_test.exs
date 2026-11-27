@@ -261,14 +261,37 @@ defmodule Cairn.ArtifactsTest do
     # Hash order in the table would otherwise put the twin's minutes first.
     test "a pass puts a fetched model into use before it tries a twin", ctx do
       start_store(ctx, [Map.put(named("twin"), :twin, true), named("model")])
-      start_fetcher(ctx, writes_named(["twin", "model"]))
+      test = self()
+
+      # Held until released: the twin's attempt cannot start inside the reload.
+      reload = fn ->
+        send(test, {:reloading, self()})
+
+        receive do
+          :release -> {:ok, %{}, []}
+        end
+      end
+
+      start_fetcher(ctx, writes_named(["twin", "model"]), reload: reload)
 
       assert_receive {:attempt, 1, %{name: "model"}, _unusable}, @wait
-      assert_receive :reloaded, @wait
+      assert_receive {:reloading, reloader}, @wait
       refute_received {:attempt, 2, _artifact, _unusable}
+      send(reloader, :release)
       assert_receive {:attempt, 2, %{name: "twin"}, _unusable}, @wait
-      assert_receive :reloaded, @wait
+      assert_receive {:reloading, reloader}, @wait
+      send(reloader, :release)
       refute_attempted(ctx)
+    end
+
+    test "a file that is one profile's twin and another's model is not taken as a twin", ctx do
+      twin = Map.put(named("both"), :twin, true)
+
+      for artifacts <- [[twin, named("both")], [named("both"), twin]] do
+        start_store(ctx, artifacts)
+        assert [%{twin: false}] = Artifacts.missing(ctx.store)
+        stop_supervised!(ctx.store)
+      end
     end
   end
 

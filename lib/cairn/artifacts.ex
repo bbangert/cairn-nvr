@@ -243,6 +243,8 @@ defmodule Cairn.Artifacts do
   defp recorded(entry, {:failed, failure}), do: %{entry | status: :missing, failure: failure}
 
   # The first entry for a hash is the one kept: two profiles may name one file.
+  # It stays a twin only while every reference is one, since one profile's
+  # twin can be another's model, which must not wait behind the twins.
   defp register(state, %{name: name, url: url, sha256: sha256} = artifact)
        when is_binary(name) and is_binary(url) and is_binary(sha256) do
     sha256 = String.downcase(sha256)
@@ -257,7 +259,10 @@ defmodule Cairn.Artifacts do
         Logger.error("artifacts: #{name}: size must be a positive integer, env a string; ignored")
 
       :ets.member(state.table, sha256) ->
-        :ok
+        if Map.get(artifact, :twin) != true do
+          [{^sha256, entry}] = :ets.lookup(state.table, sha256)
+          :ets.insert(state.table, {sha256, %{entry | twin: false}})
+        end
 
       true ->
         path = Path.join(state.dir, sha256)
