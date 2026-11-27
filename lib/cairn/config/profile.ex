@@ -129,8 +129,8 @@ defmodule Cairn.Config.Profile do
 
   An unset field is dropped: `Cairn.Native.Config.normalize/1` defaults
   `decoder` and `sample_fps` and leaves `model_profile`, `input_size` and
-  `labels` `nil`. The engine sniffs a family that is not named and loads no
-  labels without a file. An unset `input_size` is the size the model declares,
+  `labels` `nil`. The engine sniffs a family that is not named (and refuses a
+  shape that fits two) and loads no labels without a file. An unset `input_size` is the size the model declares,
   or else the named family's default; a model that declares none is refused when
   no family is named or the named one has no single size (rfdetr). `sample_fps`
   is the one field `fps_band:` never fills in: the band only validates a
@@ -198,6 +198,7 @@ defmodule Cairn.Config.Profile do
       nms: :none
     },
     "yolov8split" => %{families: [], nms: :host_side},
+    "yolov9split" => %{families: [], nms: :host_side},
     "yolo26split" => %{families: [], nms: :host_side}
   }
 

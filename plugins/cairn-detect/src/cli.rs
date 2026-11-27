@@ -167,10 +167,11 @@ struct Args {
     /// Preprocessing and decode steps to run this model under: `yolox`,
     /// `rfdetr` (hyphenated spellings accepted), `yolov10`, `yolov8` (or
     /// `yolov9`, `yolo11`, `yolov11`, `yolo26` — its whole-head exports that
-    /// run are raw-head), or `yolov8split` / `yolo26split` for a head cut
-    /// before its box decode. Sniffed from the model's own input and output
-    /// when omitted; required when a shape fits more than one profile, and for
-    /// rfdetr, whose exports leave their input geometry dynamic.
+    /// run are raw-head), or `yolov8split` / `yolov9split` (the MIT YOLOv9,
+    /// letterboxed) / `yolo26split` for a head cut before its box decode.
+    /// Sniffed from the model's own input and output when omitted; required
+    /// when a shape fits more than one profile (every split-DFL head does),
+    /// and for rfdetr, whose exports leave their input geometry dynamic.
     #[arg(long, value_parser = ModelProfile::parse)]
     model_profile: Option<ModelProfile>,
 

@@ -255,7 +255,7 @@ Two consequences worth an operator's attention:
 | field | menu | where the menu lives |
 |---|---|---|
 | `backend` | `ort`, `qnn` | the node's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors the `ORT` and `QNN` descriptors in `plugins/cairn-detect/src/infer/backend.rs`; an attached board's mirror its own crate's |
-| `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr`, `yolov8split`, `yolo26split` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
+| `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr`, `yolov8split`, `yolov9split`, `yolo26split` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the node's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
@@ -269,7 +269,10 @@ generations export byte-identical tensor layouts, and the error messages say
 which decode contract a family resolves to. `yolov8split` and `yolo26split`
 are rows of their own for the same generations exported with the head cut
 before its box decode (cairn-rockchip's `tools/rknn-export` builds them):
-the tensors differ, so the contract does.
+the tensors differ, so the contract does. `yolov9split` is the MIT rewrite's
+YOLOv9 cut the same way: its tensors are `yolov8split`'s, but it was trained
+letterboxed, and nothing in the tensors says which, so a model of either
+must be named.
 
 `decoder:` and `backend:` are different knobs that both sound like "how do I
 run this fast". `decoder:` is the **video** path — how H.264 frames get
@@ -417,7 +420,8 @@ Two rules come out of it:
 1. **A backend that cannot run the NMS op needs a family that does not need
    one.** Either an NMS-free head (`yolov10`'s end-to-end head, `rfdetr`'s
    queries) or a family cairn suppresses host-side on the CPU (`yolox`,
-   `yolov8`, and the split-head `yolov8split` and `yolo26split`). Every family
+   `yolov8`, and the split-head `yolov8split`, `yolov9split` and
+   `yolo26split`). Every family
    in today's catalog satisfies this, so the rule cannot fire from the menu
    as it stands — it is in the code as data so that a family added later with
    suppression fused into its graph is refused on the NPU backends without
@@ -434,8 +438,10 @@ Two rules come out of it:
 
 Both rules need a family to read. A profile that leaves `model_profile:` unset
 lets the engine sniff the family from the model's own tensor shapes, which is
-fine — but then there is nothing here to check, so name the family explicitly
-on a non-`ort` backend.
+fine where the shapes fit one family — but then there is nothing here to
+check, so name the family explicitly on a non-`ort` backend. A split-DFL
+head fits both `yolov8split` and `yolov9split`, and the engine refuses
+to open it unnamed.
 
 ## Two things the schema cannot express
 
@@ -469,7 +475,8 @@ the running config kept. Message shapes as they are emitted:
 profile my-board: unknown backend "hailo" — the generic board provides ort
   or qnn
 profile my-board: unknown model_profile "yolov12" (rfdetr, yolo26split,
-  yolov10, yolov8 (or yolov9, yolo11, yolov11, yolo26), yolov8split, yolox)
+  yolov10, yolov8 (or yolov9, yolo11, yolov11, yolo26), yolov8split,
+  yolov9split, yolox)
 profile my-board: unknown decoder "cuda" — the generic board provides auto,
   nvdec, qsv, sw, v4l2, vaapi or videotoolbox; decoder: is the video decode
   path, the inference runtime is backend:

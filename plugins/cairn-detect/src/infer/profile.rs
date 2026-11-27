@@ -343,7 +343,7 @@ pub struct ModelProfile {
     /// would make every ordinary detect head sniff as several candidates and
     /// hard-error on an ambiguity that does not exist. Naming them here keeps
     /// `--model-profile yolo11` working while sniffing still sees one profile
-    /// per distinct decode.
+    /// per distinct contract.
     pub families: &'static [&'static str],
     pub input: InputSpec,
     pub output: OutputSpec,

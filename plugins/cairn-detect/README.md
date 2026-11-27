@@ -138,7 +138,7 @@ from one process, see [Multiplexed mode](#multiplexed-mode).
 | `--labels` | no | newline-separated class names, **indexed by class id** — line 1 is class 0. Must match the model: a count that disagrees with the model's class count is a startup error, because positional indexing would emit every detection under another class's name. Ids past the end, and blank lines (unnamed slots), fall back to the numeric id |
 | `--allow-label-mismatch` | no | start anyway when `--labels` and the model disagree about the class count. For a deliberately partial label file; the mislabelling it permits is silent |
 | `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |
-| `--model-profile` | no | `yolox`, `rfdetr`, `yolov10`, `yolov8`, `yolov8split` or `yolo26split` (plus the families each contract also applies to: `yolo26`, `yolov9`, `yolo11`, `yolov11`; hyphenated spellings like `rf-detr` or `yolov8-split` normalize) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
+| `--model-profile` | no | `yolox`, `rfdetr`, `yolov10`, `yolov8`, `yolov8split`, `yolov9split` or `yolo26split` (plus the families each contract also applies to: `yolo26`, `yolov9`, `yolo11`, `yolov11`; hyphenated spellings like `rf-detr` or `yolov8-split` normalize) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile (every split-DFL head fits `yolov8split` and `yolov9split`) or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
 | `--motion-json` | no | JSON object of motion-gate knobs. **Off by default** — see [Motion gate](#motion-gate) |
 | `--track-floor-json` | no | JSON object with one knob, `floor`: emit detections below their class's `min_score` down to it, for the host's low-confidence tracking stage. **Off by default** — see [Track floor](#track-floor) |
@@ -709,14 +709,15 @@ actually settled on, so you never have to assume them.
 
 ### Licensing
 
-Cairn is Apache-2.0. So are two of the five families it can decode; the other
-three are not.
+Cairn is Apache-2.0. So are two of the families it can decode, and one is
+MIT; the rest are not.
 
 | family | weights license | status here |
 |---|---|---|
 | **YOLOX** (Megvii) — nano / tiny / s | **Apache-2.0** | **recommended, documented, default** |
 | **RF-DETR** (Roboflow) — nano / small / medium / base / large | **Apache-2.0** | **recommended, documented** |
-| YOLOv9 | GPL-3.0 (AGPL-3.0 via Ultralytics) | decodes; bring your own weights, not documented here |
+| YOLOv9, the MIT rewrite (MultimediaTechLab/YOLO) | MIT (the repository's licence) | decodes as `yolov9split`; bring your own export, not documented here |
+| YOLOv9 (WongKinYiu, or through Ultralytics) | GPL-3.0 (AGPL-3.0 via Ultralytics) | decodes; bring your own weights, not documented here |
 | YOLOv10, YOLO26, YOLOv8, YOLOv11 | AGPL-3.0 | decodes; bring your own weights, not documented here |
 | the `ultralytics` package (the `yolo export` CLI) | AGPL-3.0 | not used, not installed, not invoked by anything here |
 
@@ -736,12 +737,13 @@ This README will not walk you through obtaining them.
 ### Model profiles
 
 Everything that differs between detector families lives in one **profile**: how
-frames are fed to the model, and how its output is read. Six ship built in,
+frames are fed to the model, and how its output is read. Seven ship built in,
 covering the model families — the Ultralytics generations are *family names
 on one contract*, not
 separate profiles, because their exports are byte-for-byte the same tensor
-contract (the two split profiles are those generations again, exported with
-the head cut before its box decode, which is a different contract):
+contract (`yolov8split` and `yolo26split` are those generations again, exported
+with the head cut before its box decode, which is a different contract;
+`yolov9split` is the MIT YOLOv9 cut the same way):
 
 | profile (and the names it answers to) | default size | input encoding | resize | output layout | score | NMS | weights license |
 |---|---|---|---|---|---|---|---|
@@ -750,6 +752,7 @@ the head cut before its box decode, which is a different contract):
 | **`yolov10`** | 640 | `0..1` **RGB** | stretch | `[1, N, 6]` end-to-end | class | none (the model did it) | AGPL-3.0 |
 | **`yolov8`** (`yolov9`, `yolo11`, `yolov11`, `yolo26`) — what Frigate commonly ships | 640 | `0..1` **RGB** | stretch | `[1, 4 + nc, A]` raw-classes | class | IoU 0.45, top 300 | AGPL-3.0 (GPL-3.0 for YOLOv9) |
 | **`yolov8split`** — yolov8 and yolo11 exported with the head cut before the box decode | 640 | `0..1` **RGB** | stretch | split-dfl: `box0..2` `[1, 4·reg_max, H, W]` (64 for v8/v11) + `cls0..2` `[1, nc, H, W]` (**six tensors read**) | class | IoU 0.45, top 300 | AGPL-3.0 |
+| **`yolov9split`** — the MIT rewrite's YOLOv9 (MultimediaTechLab/YOLO) cut the same way | 640 | `0..1` **RGB** | **letterbox**, pad 114 | split-dfl, as `yolov8split` (`reg_max` 16) | class | IoU 0.45, top 300 | MIT (the repository's licence) |
 | **`yolo26split`** — yolo26's head cut the same way, `reg_max` 1 | 640 | `0..1` **RGB** | stretch | split-ltrb: `box0..2` `[1, 4, H, W]` + `cls0..2` `[1, nc, H, W]` (**six tensors read**) | class | IoU 0.45, top 300 | AGPL-3.0 |
 
 A family name resolves to its contract's canonical identity, so
@@ -772,14 +775,14 @@ families are worth calling out:
 `yolox_nano.onnx` from the Megvii 0.1.1rc0 release and
 `onnx-community/rfdetr_nano-ONNX` — and `yolov10` against `yolov10n.onnx`.
 
-The split profiles are verified against exports of the real weights, made
+`yolov8split` and `yolo26split` are verified against exports of the real weights, made
 and kept outside the repo (2026-11-16). On ORT, `yolov8split` returns for
 yolov8n and yolo11n exactly the objects their stock exports give under
 `yolov8`, and `yolo26split` returns for yolo26n those of its end-to-end
 export under `yolov10`, less a few overlapping same-label duplicates that
 graph emits and this profile's NMS removes. On the one NPU these INT8 rungs
 have been measured on (a board repository's export), those of yolov8n/s,
-yolo11n and yolo26n/s resolve by sniff and put boxes
+yolo11n and yolo26n/s put boxes
 where FP32 on ORT does (median IoU 0.96–0.98); their scores run lower,
 by about 0.1 on the yolo26 rungs, so a score threshold tuned on FP32 does
 not carry over.
@@ -900,8 +903,8 @@ A shape that fits two profiles is refused with both names:
 ```
 fatal: model m.onnx has outputs "output0" [1, 5040, 6], which at input 640x384
        fit more than one profile: yolox and yolov10. Nothing in the shapes says
-       which, and they decode differently — pass --model-profile <yolox|yolov10>
-       to say.
+       which, and they preprocess or decode differently — pass --model-profile
+       <yolox|yolov10> to say.
 ```
 
 That is the real collision: a **1-class YOLOX** head is `[1, A, 6]`, and `6` is
@@ -920,9 +923,14 @@ pair is a perfectly good `rfdetr`:
 ```
 fatal: model m.onnx has outputs "logits" [1, 336, 85], "pred_boxes" [1, 336, 4],
        which at input 128x128 fit more than one profile: yolox and rfdetr.
-       Nothing in the shapes says which, and they decode differently — pass
-       --model-profile <yolox|rfdetr> to say.
+       Nothing in the shapes says which, and they preprocess or decode
+       differently — pass --model-profile <yolox|rfdetr> to say.
 ```
+
+Every split-DFL head is ambiguous by construction: `yolov8split` and
+`yolov9split` read the same tensors, but the MIT YOLOv9 was trained
+letterboxed and the Ultralytics generations stretched, and the tensors cannot
+say which. Such a model always needs `--model-profile`.
 
 Shapes that are *not* ambiguous, and why:
 
@@ -1001,15 +1009,17 @@ packing path rather than three.
 Neither is the resize policy — **the profile says which**, because a model was
 trained one way and only that way.
 
-  * **stretch** (`rfdetr`, `yolov10`, `yolov8`, and the split heads) scales
+  * **stretch** (`rfdetr`, `yolov10`, `yolov8`, `yolov8split`, `yolo26split`) scales
     each axis independently to fill `H × W`. For RF-DETR this is its own
     transform: a square `A.Resize(height=s, width=s)` with `do_pad: false`.
-  * **letterbox** (`yolox`) scales by `min(W/w_src, H/h_src)`, places the
+  * **letterbox** (`yolox`, `yolov9split`) scales by `min(W/w_src, H/h_src)`, places the
     picture at the **top-left corner** and fills the rest with the pad value
     (114). That is what YOLOX's own `preproc` does —
     `padded_img[: int(h*r), : int(w*r)] = resized` over a canvas of 114 — and
     matching it exactly is the point, so the un-projection matches the
-    reference's `boxes /= ratio`.
+    reference's `boxes /= ratio`. For the MIT YOLOv9 on COCO val2017,
+    top-left placement scored within 0.2 AP of centred, where stretching cost
+    it 1.7–1.8 AP.
 
 > **Changed:** every model used to be stretched, on the reasoning that bboxes
 > come out normalized so only ratios matter. That reasoning is sound about
@@ -1387,7 +1397,7 @@ where `NormBox` cannot be named at all.
 - The resize policy comes from the model's profile, because a model was
   trained one way and only that way: stretch for the Ultralytics families,
   aspect-preserving letterbox with 114 padding at the top-left for YOLOX,
-  matching its own `preproc`. Every decode path is handed an explicit
+  matching its own `preproc`, and for the MIT YOLOv9. Every decode path is handed an explicit
   projection built alongside the scaler, so a letterboxed run cannot report
   boxes against the input rectangle instead of the frame.
 - NMS runs for every head except the end-to-end and DETR ones, which need
