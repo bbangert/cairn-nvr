@@ -248,9 +248,27 @@ defmodule Cairn.ArtifactsTest do
       File.write!(Path.join(dir, "d.yml"), "model_ladder: [junk, [#{sha}]]")
 
       assert Profile.fetch_entries([dir]) == [
-               %{name: "x.bin", url: "https://h/m/x.bin?sig=1", sha256: @sha256},
-               %{name: "t.onnx", url: "https://h/t.onnx", sha256: String.downcase(twin)}
+               %{name: "x.bin", url: "https://h/m/x.bin?sig=1", sha256: @sha256, twin: false},
+               %{
+                 name: "t.onnx",
+                 url: "https://h/t.onnx",
+                 sha256: String.downcase(twin),
+                 twin: true
+               }
              ]
+    end
+
+    # Hash order in the table would otherwise put the twin's minutes first.
+    test "a pass puts a fetched model into use before it tries a twin", ctx do
+      start_store(ctx, [Map.put(named("twin"), :twin, true), named("model")])
+      start_fetcher(ctx, writes_named(["twin", "model"]))
+
+      assert_receive {:attempt, 1, %{name: "model"}, _unusable}, @wait
+      assert_receive :reloaded, @wait
+      refute_received {:attempt, 2, _artifact, _unusable}
+      assert_receive {:attempt, 2, %{name: "twin"}, _unusable}, @wait
+      assert_receive :reloaded, @wait
+      refute_attempted(ctx)
     end
   end
 

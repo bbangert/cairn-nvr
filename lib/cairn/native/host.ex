@@ -56,7 +56,8 @@ defmodule Cairn.Native.Host do
 
   # The CPU baseline: enough passes for a median, and a bound on the whole
   # measurement — a second model load plus those passes, paid wherever the engine
-  # opens, which is boot and a model reload that has already closed every stream.
+  # opens, which is boot and a model reload that has already closed every stream,
+  # and when a reload moves only the twin, with every stream live.
   # Past the bound the node runs without a D-P5 ratio.
   @baseline_passes 5
   @baseline_timeout_ms 60_000
@@ -242,7 +243,8 @@ defmodule Cairn.Native.Host do
   close still stuck in the crate costs that one camera its reopen. Blocks for a
   model load. This is the only recovery from an engine-fatal error: the other
   way in, `reconfigure/2`, does nothing for a config whose model has not moved,
-  and a dead engine's has not.
+  and a dead engine's has not. (Behind an engine that is not `:ready`, a move of
+  the CPU twin alone reloads it, as any move does.)
   """
   @spec configure(atom(), map() | keyword(), timeout()) :: {:ok, map()} | {:error, term()}
   def configure(server \\ __MODULE__, config, timeout \\ 300_000) do
@@ -254,8 +256,9 @@ defmodule Cairn.Native.Host do
 
   A no-op unless that model actually changed — an engine reload closes every
   stream and pays for a model load, which a reload that moved something else
-  entirely must not spend. A change of the CPU twin alone re-measures the
-  baseline and reloads nothing. Asynchronous because the caller is
+  entirely must not spend. Behind a `:ready` engine, a change of the CPU twin
+  alone re-measures the baseline and reloads nothing; behind a refused or dead
+  one it reloads, as any change does. Asynchronous because the caller is
   `Cairn.Config.Server`, whose own reload must not wait on a model load; the
   work is `configure/3`'s, canary included.
   """
@@ -553,6 +556,7 @@ defmodule Cairn.Native.Host do
 
           # The twin is the baseline's alone, so one that lands after the
           # engine opened — a fetched twin — re-measures and closes nothing.
+          # An engine not `:ready` has nothing to keep, and reloads below.
           state.engine_state == :ready and
               %{config | cpu_twin: state.config.cpu_twin} == state.config ->
             start_baseline(%{state | config: config, cpu_baseline_ms: nil}, config)
@@ -681,7 +685,8 @@ defmodule Cairn.Native.Host do
 
       # From a profile, a fetched twin not in the store yet (naming none is
       # refused at load): its arrival reloads the config, and `swap_model/2`
-      # measures it then. A pinned config can name none at all.
+      # measures it then — without an engine reload only behind a `:ready`
+      # engine. A pinned config can name none at all.
       config.cpu_twin == nil and Profile.cpu_twin?(config.backend) ->
         no_baseline(config, "no CPU twin is in place (a fetched one is measured once it lands)")
         state

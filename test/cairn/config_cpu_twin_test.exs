@@ -163,17 +163,44 @@ defmodule Cairn.ConfigCpuTwinTest do
                Config.native_model_config(config)
     end
 
-    test "not in the store yet, it names the twin: the rung loads, with a warning" do
-      assert {:ok, config, [warning]} =
-               fetched_load(fetched_yaml(), fn _sha256 -> {:missing, nil} end)
+    test "not in the store yet, it names the twin: the rung loads, warned with the store's why" do
+      for {failure, why} <- [
+            {nil, "not downloaded yet: the fetch has not been tried"},
+            {"HTTP 404", "not downloaded yet: the last fetch failed: HTTP 404"}
+          ] do
+        assert {:ok, config, [warning]} =
+                 fetched_load(fetched_yaml(), fn _sha256 -> {:missing, failure} end)
 
-      assert warning ==
-               "profile fetched: CPU twin t.onnx is not downloaded yet — accel will load and " <>
-                 "detect, but its health cannot be judged against the CPU until it is"
+        assert warning ==
+                 "profile fetched: CPU twin t.onnx, #{why} — accel will load and detect, " <>
+                   "but its health cannot be judged against the CPU until it is"
 
-      assert {:ok, native} = Config.native_model_config(config)
-      assert native.model == @accel_file
-      refute Map.has_key?(native, :cpu_twin)
+        assert {:ok, native} = Config.native_model_config(config)
+        assert native.model == @accel_file
+        refute Map.has_key?(native, :cpu_twin)
+      end
+    end
+
+    test "on a single-model profile the keys are unknown, as a top-level sha256: is" do
+      dir =
+        profile_dir("single", """
+        experimental: true
+        backend: accel
+        model:
+          accel: #{@accel_file}
+          onnx: #{@stub}
+        twin_sha256: #{@twin_sha}
+        twin_url: https://h/models/t.onnx
+        model_profile: yolox
+        input_size: 416
+        """)
+
+      assert {:ok, _config, warnings} = Config.from_map(map("single", [dir]))
+
+      assert Enum.sort(warnings) == [
+               ~s(unknown key "twin_sha256" in profile single),
+               ~s(unknown key "twin_url" in profile single)
+             ]
     end
 
     test "malformed, or a second source for the twin, is refused" do
@@ -183,6 +210,11 @@ defmodule Cairn.ConfigCpuTwinTest do
             {String.upcase(@twin_sha), "abc",
              ~s(twin_sha256 must be 64 hex characters, got "abc")},
             {"https://h/models/t", "http://h/models/t", "twin_url must be an https URL"},
+            {"https://h/models/t", "https://u:p@h/models/t", "twin_url must be an https URL"},
+            {"engine_budget: 75",
+             "engine_budget: 75\n    sha256: #{@twin_sha}\n    url: https://h/models/m.accel",
+             "twin_sha256 is its own sha256 — the twin is the FP32 export the CPU runs, " <>
+               "never the rung's accel artifact"},
             {"engine_budget: 75", "engine_budget: 75\n    pack: p",
              "is a pack rung, and a pack is installed by hand"},
             {"accel: #{@accel_file}", "accel: #{@accel_file}\n      onnx: #{@stub}",
@@ -200,7 +232,8 @@ defmodule Cairn.ConfigCpuTwinTest do
 
       assert Enum.any?(
                errors,
-               &(&1 =~ "rung 1 names a file to fetch (twin_sha256:/twin_url:), which only")
+               &(&1 =~ "rung 1 names a file to fetch (twin_sha256:/twin_url:), which only" and
+                   &1 =~ "place the twin file by hand and name its path under model.onnx instead")
              )
     end
 

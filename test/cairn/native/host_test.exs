@@ -838,32 +838,37 @@ defmodule Cairn.Native.HostTest do
       assert log =~ "no CPU baseline for #{@stub_onnx}: no CPU twin is in place"
     end
 
-    # A fetched twin landing after the engine opened: the config reload moves
-    # the twin and nothing else.
-    test "a reload moving only the twin re-measures, and reloads nothing", %{id: id} do
-      Cairn.TwinBoard.attach()
+    # A fetched twin's rung, loaded against a store that has the twin or not:
+    # the config reload the fetcher follows a download with moves the twin and
+    # nothing else.
+    defp twin_config(twin) do
       dir = Path.join(System.tmp_dir!(), "cairn_host_twin_#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf(dir) end)
-      twin = Path.join(dir, "twin.onnx")
-      File.cp!(@stub_onnx, twin)
 
-      profiled = fn twin ->
-        File.write!(Path.join(dir, "accel.yml"), """
-        experimental: true
-        backend: accel
-        model:
-          accel: #{@stub_onnx}
-          onnx: #{twin}
-        model_profile: yolox
-        input_size: 416
-        """)
+      File.write!(Path.join(dir, "fetched.yml"), """
+      tier: 1
+      experimental: true
+      backend: accel
+      model_profile: yolox
+      model_ladder:
+        - model:
+            accel: #{@stub_onnx}
+          twin_sha256: #{String.duplicate("ef", 32)}
+          twin_url: https://h/models/t.onnx
+          input_size: 416
+          engine_budget: 75
+      supported_cameras: 4
+      """)
 
-        {:ok, config, _warnings} =
-          Cairn.Config.from_map(%{
+      Process.put(:release_dir, dir)
+      state = fn _sha256 -> if twin, do: {:ok, twin}, else: {:missing, nil} end
+
+      {:ok, config, _warnings} =
+        Cairn.Config.from_map(
+          %{
             "data_dir" => "tmp/host_test",
-            "profile_dirs" => [dir],
-            "plugins" => %{"det" => %{"profile" => "accel", "allow_experimental" => true}},
+            "plugins" => %{"det" => %{"profile" => "fetched", "allow_experimental" => true}},
             "cameras" => [
               %{
                 "id" => "cam_a",
@@ -872,25 +877,53 @@ defmodule Cairn.Native.HostTest do
                 "plugin" => "det"
               }
             ]
-          })
+          },
+          board: Cairn.TwinBoard,
+          artifact: state
+        )
 
-        config
-      end
+      config
+    end
 
-      first = profiled.(@stub_onnx)
-      host = start_host(config: nil, config_source: fn -> first end)
-      assert_receive {:init, %{model: @stub_onnx, cpu_twin: @stub_onnx}}
-      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, _opts}
-      {:ok, _epoch} = Host.open_stream(host, id, %{})
-      assert_receive {:open_stream, _engine, ^id, _params}
+    test "a twin that lands re-measures and reloads nothing; one that goes is said", %{id: id} do
+      Cairn.TwinBoard.attach()
+      unfetched = twin_config(nil)
 
-      Host.reconfigure(host, profiled.(twin))
+      log =
+        capture_log(fn ->
+          host = start_host(config: nil, config_source: fn -> unfetched end)
+          assert_receive {:init, %{model: @stub_onnx, cpu_twin: nil}}
+          assert GenServer.call(host, :probe).cpu_baseline_ms == nil
+          {:ok, _epoch} = Host.open_stream(host, id, %{})
+          assert_receive {:open_stream, _engine, ^id, _params}
 
-      assert_receive {:cpu_baseline, %{model: ^twin}, 5, _opts}
+          Host.reconfigure(host, twin_config(@stub_onnx))
+          assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, _opts}
+          assert settled_baseline(host) == 45.0
+
+          Host.reconfigure(host, unfetched)
+          assert GenServer.call(host, :probe).cpu_baseline_ms == nil
+          assert Host.status(host).streams == [id]
+        end)
+
       refute_received {:init, _config}
       refute_received {:close_stream, _stream}
-      assert settled_baseline(host) == 45.0
-      assert Host.status(host).streams == [id]
+      refute_received {:cpu_baseline, _config, _passes, _opts}
+      assert log =~ "no CPU baseline for #{@stub_onnx}: no CPU twin is in place"
+    end
+
+    test "behind an engine that is not ready, a twin-only change reloads it" do
+      Cairn.TwinBoard.attach()
+      control(%{init: {:error, {:model_load, "no"}}})
+      unfetched = twin_config(nil)
+      host = start_host(config: nil, config_source: fn -> unfetched end)
+      assert_receive {:init, %{cpu_twin: nil}}
+      assert Host.status(host).engine == {:model_load, "no"}
+
+      control(%{init: nil})
+      Host.reconfigure(host, twin_config(@stub_onnx))
+      assert_receive {:init, %{cpu_twin: @stub_onnx}}
+      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, _opts}
     end
   end
 end

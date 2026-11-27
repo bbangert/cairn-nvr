@@ -419,17 +419,20 @@ defmodule Cairn.Config.Profile do
 
   @doc """
   `rung` with its fetched twin named where a baked one is, once `state`
-  (`Cairn.Artifacts.state/1`) has the file. Unchanged until then, and on a
-  backend that uses no twin, where `model.onnx` can be the rung's own artifact.
+  (`Cairn.Artifacts.state/1`) has the file; until then with what the store
+  said in `twin_state`, for the load's warning. Unchanged on a backend that
+  uses no twin, where `model.onnx` can be the rung's own artifact.
   """
   @spec put_fetched_twin(map(), String.t(), (String.t() -> {:ok, Path.t()} | {:missing, term()})) ::
           map()
   def put_fetched_twin(%{twin_sha256: sha256} = rung, backend, state) when is_binary(sha256) do
-    with true <- cpu_twin?(backend),
-         {:ok, path} <- state.(sha256) do
-      %{rung | model: Map.put(rung.model, @twin_key, path)}
+    if cpu_twin?(backend) do
+      case state.(sha256) do
+        {:ok, path} -> %{rung | model: Map.put(rung.model, @twin_key, path)}
+        missing -> %{rung | twin_state: missing}
+      end
     else
-      _unused_or_missing -> rung
+      rung
     end
   end
 
@@ -501,7 +504,9 @@ defmodule Cairn.Config.Profile do
   names to fetch, twins included, read here because the store starts before
   any config load. A malformed one is skipped, left to the load to report.
   """
-  @spec fetch_entries([Path.t()]) :: [%{name: String.t(), url: String.t(), sha256: String.t()}]
+  @spec fetch_entries([Path.t()]) :: [
+          %{name: String.t(), url: String.t(), sha256: String.t(), twin: boolean()}
+        ]
   def fetch_entries(dirs) do
     for dir <- dirs,
         path <- dir |> Path.join("*.yml") |> Path.wildcard() |> Enum.sort(),
@@ -513,7 +518,12 @@ defmodule Cairn.Config.Profile do
         url = Map.get(rung, url_key),
         sha256?(sha256) and https_url?(url),
         uniq: true,
-        do: %{name: fetch_name(url, sha256), url: url, sha256: String.downcase(sha256)}
+        do: %{
+          name: fetch_name(url, sha256),
+          url: url,
+          sha256: String.downcase(sha256),
+          twin: sha256_key == "twin_sha256"
+        }
   end
 
   @doc "The name a fetched rung's file goes by in diagnostics: the URL's last segment."
@@ -884,7 +894,8 @@ defmodule Cairn.Config.Profile do
   # construction may assume the raw shapes are valid. `model_profile` stays
   # nil where a rung leans on the profile-level family; resolution coalesces.
   # A fetched rung's `model` lacks the backend's artifact, and a fetched
-  # twin's lacks `onnx`, until `Cairn.Config` puts the store's path there.
+  # twin's lacks `onnx`, until `Cairn.Config` puts the store's path there
+  # (`twin_state`, then, holds why it has not).
   defp rungs(nil), do: nil
 
   defp rungs(list) do
@@ -898,7 +909,8 @@ defmodule Cairn.Config.Profile do
         sha256: if(sha256 = Map.get(rung, "sha256"), do: String.downcase(sha256)),
         url: Map.get(rung, "url"),
         twin_sha256: if(sha256 = Map.get(rung, "twin_sha256"), do: String.downcase(sha256)),
-        twin_url: Map.get(rung, "twin_url")
+        twin_url: Map.get(rung, "twin_url"),
+        twin_state: nil
       }
     end)
   end
@@ -1078,14 +1090,7 @@ defmodule Cairn.Config.Profile do
     named = Enum.filter(@fetch_keys, &fetch_named?(rung, &1))
 
     if origin == :operator do
-      Enum.reduce(named, acc, fn {sha256_key, url_key}, acc ->
-        Config.add_error(
-          acc,
-          "#{where} names a file to fetch (#{sha256_key}:/#{url_key}:), which only the " <>
-            "release's own profiles may, and #{path} is not one — place the model file " <>
-            "by hand and name its path under model: instead"
-        )
-      end)
+      Enum.reduce(named, acc, &Config.add_error(&2, operator_fetch(where, path, &1)))
     else
       named
       |> Enum.reduce(acc, fn keys, acc ->
@@ -1097,8 +1102,25 @@ defmodule Cairn.Config.Profile do
         named == [] or Map.get(rung, "pack") == nil,
         "#{where} is a pack rung, and a pack is installed by hand, never fetched"
       )
+      |> Config.check(
+        not same_file?(Map.get(rung, "sha256"), Map.get(rung, "twin_sha256")),
+        "#{where} twin_sha256 is its own sha256 — the twin is the FP32 export the " <>
+          "CPU runs, never the rung's #{backend} artifact"
+      )
     end
   end
+
+  defp operator_fetch(where, path, {sha256_key, url_key}) do
+    {file, under} =
+      if sha256_key == "sha256", do: {"model", "model:"}, else: {"twin", "model.onnx"}
+
+    "#{where} names a file to fetch (#{sha256_key}:/#{url_key}:), which only the " <>
+      "release's own profiles may, and #{path} is not one — place the #{file} file " <>
+      "by hand and name its path under #{under} instead"
+  end
+
+  defp same_file?(a, b),
+    do: is_binary(a) and is_binary(b) and String.downcase(a) == String.downcase(b)
 
   defp fetch_named?(rung, {sha256_key, url_key} \\ {"sha256", "url"}),
     do: Map.get(rung, sha256_key) != nil or Map.get(rung, url_key) != nil

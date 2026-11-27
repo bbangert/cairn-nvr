@@ -2,12 +2,15 @@ defmodule Cairn.Artifacts.Fetcher do
   @moduledoc """
   Downloads what `Cairn.Artifacts` has missing, one at a time, and reloads the
   config after a pass that verified a file: a config refused for want of the
-  file loads once it is there. That reload is owed until one succeeds, as is
+  file loads once it is there. A pass takes CPU twins (`twin: true`) last,
+  with a reload before them, since nothing waits on a twin: a model that
+  arrived is put into use without waiting on a twin's download, which can
+  take minutes. That reload is owed until one succeeds, as is
   the one a restarted store asks for and the one this process starts with
   when it is itself restarted, not knowing what the last one owed; until then
   the pass is retried, and fetches only what is still missing. A failure is
-  recorded on the artifact, for the config error to name, and reloads when
-  its text changed, since only a load refreshes that error — best effort,
+  recorded on the artifact, for the config error (a twin's warning) to name,
+  and reloads when its text changed, since only a load refreshes that — best effort,
   never owed. A pass is retried after a backoff of 5 s doubling to 5 min, for
   as long as the node runs.
 
@@ -112,8 +115,13 @@ defmodule Cairn.Artifacts.Fetcher do
   defp work(state) do
     with {timer, _ref} <- state.retry, do: Process.cancel_timer(timer)
 
-    {results, state} = Enum.map_reduce(Artifacts.missing(state.artifacts), state, &attempt/2)
+    {twins, rest} = Enum.split_with(Artifacts.missing(state.artifacts), & &1.twin)
+    {results, state} = Enum.map_reduce(rest, state, &attempt/2)
     state = settle(state)
+    {twin_results, state} = Enum.map_reduce(twins, state, &attempt/2)
+    # Not without a twin tried: a reload just refused would be retried at once.
+    state = if twins == [], do: state, else: settle(state)
+    results = results ++ twin_results
 
     if state.owed == nil and Enum.all?(results, &(&1 == :ok)) do
       %{state | retry: nil, backoff: state.initial_backoff}

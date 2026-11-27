@@ -8,7 +8,8 @@ defmodule Cairn.Artifacts do
   (`Cairn.Config.Profile.fetch_entries/1`). A rung's entries carry no
   `backend:`: a missing model refuses the groups that run its profile and a
   missing twin costs health its baseline, where a missing library would gate
-  its whole backend.
+  its whole backend. A twin's entry says so (`twin: true`), and the fetcher
+  takes it last.
 
   This process checks what is already on disk — synchronously and without the
   network, so that the config loaded right after it knows what is missing —
@@ -44,6 +45,7 @@ defmodule Cairn.Artifacts do
           sha256: String.t(),
           size: pos_integer() | nil,
           backend: String.t() | nil,
+          twin: boolean(),
           path: Path.t(),
           status: status(),
           failure: String.t() | nil
@@ -266,6 +268,7 @@ defmodule Cairn.Artifacts do
           sha256: sha256,
           size: size,
           backend: Map.get(artifact, :backend),
+          twin: Map.get(artifact, :twin) == true,
           path: path,
           status: :missing,
           failure: nil

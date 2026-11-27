@@ -1502,21 +1502,21 @@ defmodule Cairn.Config do
   end
 
   defp check_twin_file(acc, profile) do
-    case Profile.cpu_twin(profile) do
-      nil when is_map(profile.resolved_rung) and is_binary(profile.resolved_rung.twin_sha256) ->
-        %{twin_sha256: sha256, twin_url: url} = profile.resolved_rung
+    case {Profile.cpu_twin(profile), profile.resolved_rung} do
+      {nil, %{twin_state: {:missing, failure}, twin_sha256: sha256, twin_url: url}} ->
+        name = "CPU twin #{Profile.fetch_name(url, sha256)}"
 
         add_warning(
           acc,
-          "profile #{profile.name}: CPU twin #{Profile.fetch_name(url, sha256)} is not " <>
-            "downloaded yet — #{profile.backend} will load and detect, but its health " <>
-            "cannot be judged against the CPU until it is"
+          "profile #{profile.name}: #{unfetched_reason(%{name: name, failure: failure})} — " <>
+            "#{profile.backend} will load and detect, but its health cannot be judged " <>
+            "against the CPU until it is"
         )
 
-      nil ->
+      {nil, _rung} ->
         acc
 
-      path ->
+      {path, _rung} ->
         if File.regular?(path) do
           acc
         else
